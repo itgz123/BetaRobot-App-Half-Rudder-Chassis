@@ -1,0 +1,23 @@
+# 统一项目行尾符为 LF（与主仓库保持一致）
+# text=auto: 自动检测二进制文件，不进行行尾转换
+# eol=lf:    所有文本文件强制使用 LF 行尾符
+* text=auto eol=lf
+
+# 显式声明二进制文件，防止被 text 处理损坏
+*.a binary
+*.bin binary
+*.docx binary
+*.elf binary
+*.exe binary
+*.gif binary
+*.hex binary
+*.ico binary
+*.jpeg binary
+*.jpg binary
+*.lib binary
+*.o binary
+*.otf binary
+*.pdf binary
+*.png binary
+*.ttf binary
+*.woff2 binary
