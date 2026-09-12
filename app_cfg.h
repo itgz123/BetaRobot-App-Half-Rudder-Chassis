@@ -45,7 +45,7 @@
 #define GENERATE_DISASSEMBLY        // 生成反汇编文件 .lst
 #define GENERATE_READELF            // 生成 readelf 输出文件
 #define DEVELOPMENT_BOARD DM_MC02
-#define HAL_CONFIG_NAME DM_MC02
+#define HAL_CONFIG_NAME DM_MC02_HALF_RUDDER
 
 // UART 选择
 #if DEVELOPMENT_BOARD == DM_MC02

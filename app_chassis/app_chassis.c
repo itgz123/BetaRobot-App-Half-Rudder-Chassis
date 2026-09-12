@@ -7,6 +7,7 @@
 #include "drv_djimotor_broadcast.h"
 #include "drv_lkmotor_broadcast.h"
 //
+#include "bsp_gpio.h"
 #include "bsp_assert.h"
 
 // 实例
@@ -16,6 +17,34 @@ DJIMOTOR_BROADCAST_INSTANCE_DEF(rudder_l_motor);
 DJIMOTOR_BROADCAST_INSTANCE_DEF(rudder_r_motor);
 LKMOTOR_BROADCAST_INSTANCE_DEF(wheel_l_motor);
 LKMOTOR_BROADCAST_INSTANCE_DEF(wheel_r_motor);
+
+/*============================ 光电门（M3508 增量编码器零点标定） ============================*/
+// M3508 为增量编码器，上电无绝对零点，用两个光电门触发 EXTI 记录机械零点。
+// 左舵 PA0 → GPIO_PWM_1，右舵 PA2 → GPIO_PWM_2（DM_MC02 映射）；
+// CubeMX 已配为上升沿触发（GPIO_MODE_IT_RISING）并使能 EXTI0/EXTI2 NVIC。
+// parent 指向对应电机的 MotorBase_s（基类为首成员，可直接强转）。
+GPIO_INSTANCE_DEF(rudder_l_gate_io);
+GPIO_INSTANCE_DEF(rudder_r_gate_io);
+
+/**
+ * @brief 光电门 EXTI 回调（左/右舵共用，通过 gpio_inst->parent 区分）
+ * @note ISR 上下文。触发瞬间把当前反馈位置标定为机械零点：
+ *         position = (position_cnt*2π + position_single + position_offset) * 反馈方向
+ *       令括号内为 0，则该点即零点（结果与反馈方向无关）。
+ * @note TODO 此处读的是任务上次 GetData 的缓存值，存在一个控制周期(2ms)的滞后；
+ *       若标定精度不够，改为在任务中收到触发标志后重新 GetData 再标定。
+ */
+static void RudderPhotogateCallback(GPIOInstance *gpio_inst)
+{
+    MotorBase_s *motor = (MotorBase_s *)gpio_inst->parent;
+    if (motor == NULL)
+    {
+        return;
+    }
+    // 只需要上电执行一次校准，并且校准逻辑之后再写
+    // motor->position_offset = -(float)((double)motor->data_all.position_cnt * M_2PI +
+    //                                   (double)motor->data_all.position_single);
+}
 
 void AppChassisInit(void)
 {
@@ -167,6 +196,23 @@ void AppChassisInit(void)
     MotorEnable(&(rudder_r_motor.base));
     MotorEnable(&(wheel_l_motor.base));
     MotorEnable(&(wheel_r_motor.base));
+
+    // 注册并配置两个光电门（EXTI 上升沿，回调记录零点）
+    rudder_l_gate_io.parent = &(rudder_l_motor.base);
+    rudder_r_gate_io.parent = &(rudder_r_motor.base);
+    BSP_ASSERT_APP_CALL(GPIORegister(&rudder_l_gate_io));
+    BSP_ASSERT_APP_CALL(GPIORegister(&rudder_r_gate_io));
+
+    GPIO_Config_s gate_l_cfg = {
+        .gpio_e = GPIO_PWM_1, // PA0
+        .callback = RudderPhotogateCallback,
+    };
+    GPIO_Config_s gate_r_cfg = {
+        .gpio_e = GPIO_PWM_2, // PA2
+        .callback = RudderPhotogateCallback,
+    };
+    BSP_ASSERT_APP_CALL(GPIOConfig(&rudder_l_gate_io, &gate_l_cfg));
+    BSP_ASSERT_APP_CALL(GPIOConfig(&rudder_r_gate_io, &gate_r_cfg));
 }
 
 ITCM_RAM void AppChassisRun(void)
