@@ -14,22 +14,29 @@ void function_in_main_c(void);
  *   线上帧 = [0xA5][seq][payload N][CRC8][0x5A]，N = sizeof(结构体)）
  *============================================*/
 #pragma pack(push, 1)
-/* 收发暂用同一结构体，先放 1B 占位；两端 app.h 的定义须字节对齐（COMM_DEF 内
- * _Static_assert 校验 sizeof == 约定线长）。 */
+/* 云台→底盘（13B）与底盘→云台（12B）各一结构体；两端 app.h 的定义须字节对齐
+ * （COMM_DEF 内 _Static_assert 校验 sizeof == 约定线长）。 */
+typedef enum : uint8_t
+{
+    g2c_disable = 0,
+    g2c_enable = 1,
+} gimbal2cmd_control_mode_e;
 typedef struct
 {
-    float placeholder;
-} gimbal_chassis_data_t;
+    // 使能
+    gimbal2cmd_control_mode_e mode; // 1:使能;2:失能
+    // 设定速度
+    float vx;
+    float vy;
+    float w;
+} gimbal2chassis_data_t;
 typedef struct
 {
-    float placeholder;
-    float t1;
-    float t2;
-    float t3;
-    float t4;
-    float t5;
-    float t6;
-} chassis_gimbal_data_t;
+    // 反馈速度
+    float vx;
+    float vy;
+    float w;
+} chassis2gimbal_data_t;
 #pragma pack(pop)
 
 #endif // !__APP_H
