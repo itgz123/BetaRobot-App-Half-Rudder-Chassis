@@ -41,14 +41,15 @@ static void RudderPhotogateCallback(GPIOInstance *gpio_inst)
     {
         return;
     }
-    // 只需要上电执行一次校准，并且校准逻辑之后再写
+    // 1. 另外回调只做标定、不解除武装：光电门每圈都会再次触发并重写 position_offset。如果只想在上电标定一次，需要加一个"已标定"标志位或用 GPIOConfig 把回调置空。
+    // 2. 回调里的数据滞后一个控制周期（2ms）：读的是任务上一次 MotorGetData 的缓存值。代码里已用 TODO 标注——上电标定时电机转速低，一般够用；若精度不够，应改成 ISR 只置标志、在 AppChassisRun 里重新MotorGetData 再标定。
     // motor->position_offset = -(float)((double)motor->data_all.position_cnt * M_2PI +
     //                                   (double)motor->data_all.position_single);
 }
 
 void AppChassisInit(void)
 {
-    // 注册 CAN 实例（四个电机共用 CAN_1）
+    // 注册 CAN 实例（四个电机共用 CAN_2）
     BSP_ASSERT_APP_CALL(DJIMotorBroadcastRegister(&rudder_l_motor));
     BSP_ASSERT_APP_CALL(DJIMotorBroadcastRegister(&rudder_r_motor));
     BSP_ASSERT_APP_CALL(LKMotorBroadcastRegister(&wheel_l_motor));
@@ -56,7 +57,7 @@ void AppChassisInit(void)
 
     // 配置 rudder_l（M3508，motor_id=2 → rx 0x202 / tx 0x200）
     DJIMotorBroadcast_Config_s rudder_l_cfg = {
-        .can_e = CAN_1,
+        .can_e = CAN_2,
         .model = DJI_MODEL_M3508,
         .motor_id = 2,
         .speed_lpf_enable = MOTOR_SPEED_LPF_ENABLE,
@@ -89,7 +90,7 @@ void AppChassisInit(void)
 
     // 配置 rudder_r（M3508，motor_id=4 → rx 0x204 / tx 0x200）
     DJIMotorBroadcast_Config_s rudder_r_cfg = {
-        .can_e = CAN_1,
+        .can_e = CAN_2,
         .model = DJI_MODEL_M3508,
         .motor_id = 4,
         .speed_lpf_enable = MOTOR_SPEED_LPF_ENABLE,
@@ -128,7 +129,7 @@ void AppChassisInit(void)
     // iq 分辨率 33/4096 A/LSB 也是 MF 全系列固定值，驱动内常量化，不在此配。
     // ⚠️ TODO 标定：Kt 按手册值，建议台架复核。
     LKMotorBroadcast_Config_s wheel_l_cfg = {
-        .can_e = CAN_1,
+        .can_e = CAN_2,
         .model = LK_MODEL_MF,
         .motor_id = 1,
         .torque_constant = 0.28f, // MF7015-24V-23T
@@ -161,7 +162,7 @@ void AppChassisInit(void)
 
     // 配置 wheel_r（LK MF7015V1-24V-23T，广播模式 motor_id=2 → 槽位 1，回复 ID 0x142）
     LKMotorBroadcast_Config_s wheel_r_cfg = {
-        .can_e = CAN_1,
+        .can_e = CAN_2,
         .model = LK_MODEL_MF,
         .motor_id = 2,
         .torque_constant = 0.28f, // MF7015-24V-23T，同 wheel_l
