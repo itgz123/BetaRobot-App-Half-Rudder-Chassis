@@ -33,6 +33,22 @@ LKMOTOR_BROADCAST_INSTANCE_DEF(wheel_r_motor);
 GPIO_INSTANCE_DEF(rudder_l_gate_io);
 GPIO_INSTANCE_DEF(rudder_r_gate_io);
 
+/*============================ 云台通信 ============================*/
+/* 云台通信对话：CAN1 / IDSEQ / PROTO_CUSTOM（帧 = [0xA5][seq][payload N][CRC8][0x5A]）。
+ * 底盘侧 tx_id=0x110 段、rx_id=0x100 段（云台侧对调）；ID 段与 CAN1 现有占用
+ * （yaw RS05 0x001/0x0FD）及后续 3508 波盘（0x1FF/0x200/0x201~0x208）均不重叠。
+ * 收发 payload 分别为 chassis2gimbal_data_t(12B) / gimbal2chassis_data_t(13B)；
+ * CAN1 上挂有经典 CAN 的 RS05，故 mode 必须 CLASSIC（不可用 FD）。 */
+COMM_DEF(gimbal_comm, MEDIA_CAN_IDSEQ, CUSTOM, CUSTOM, gimbal2chassis_data_t, 13, chassis2gimbal_data_t, 12, UNPACK_IN_ISR);
+
+static gimbal2chassis_data_t gimbal2chassis_data = {0}; // 云台→底盘（on_frame 同步拷贝）
+static chassis2gimbal_data_t chassis2gimbal_data = {0}; // 底盘→云台（业务填写后 CommSend）
+
+// static float rudder_l_motor_setref = 0;
+static float rudder_r_motor_setref = 0;
+// static float wheel_l_motor_setref = 0;
+// static float wheel_r_motor_setref = 0;
+
 /**
  * @brief 光电门 EXTI 回调（左/右舵共用，通过 gpio_inst->parent 区分）
  * @note ISR 上下文。触发瞬间把当前反馈位置标定为机械零点：
@@ -54,21 +70,10 @@ static void RudderPhotogateCallback(GPIOInstance *gpio_inst)
     //                                   (double)motor->data_all.position_single);
 }
 
-/*============================ 云台通信 ============================*/
-/* 云台通信对话：CAN1 / IDSEQ / PROTO_CUSTOM（帧 = [0xA5][seq][payload N][CRC8][0x5A]）。
- * 底盘侧 tx_id=0x110 段、rx_id=0x100 段（云台侧对调）；ID 段与 CAN1 现有占用
- * （yaw RS05 0x001/0x0FD）及后续 3508 波盘（0x1FF/0x200/0x201~0x208）均不重叠。
- * 收发 payload 分别为 chassis2gimbal_data_t(12B) / gimbal2chassis_data_t(13B)；
- * CAN1 上挂有经典 CAN 的 RS05，故 mode 必须 CLASSIC（不可用 FD）。 */
-COMM_DEF(gimbal_comm, MEDIA_CAN_IDSEQ, CUSTOM, CUSTOM, gimbal2chassis_data_t, 13, chassis2gimbal_data_t, 12, UNPACK_IN_ISR);
-
-static gimbal2chassis_data_t gimbal_rx_data = {0}; // 云台→底盘（on_frame 同步拷贝）
-static chassis2gimbal_data_t gimbal_tx_data = {0}; // 底盘→云台（业务填写后 CommSend）
-
 /* 云台接收出帧回调（UNPACK_IN_ISR：payload 指向接收缓冲，回调返回后即被覆盖，须同步拷贝） */
 static void GimbalRecvOnFrame(const uint8_t *payload)
 {
-    memcpy(&gimbal_rx_data, payload, sizeof(gimbal_rx_data));
+    memcpy(&gimbal2chassis_data, payload, sizeof(gimbal2chassis_data));
 }
 
 void AppChassisInit(void)
@@ -89,12 +94,12 @@ void AppChassisInit(void)
         .position_offset = 0,
         .torque_constant = 1, // M3508 电流→力矩系数，待标定
         .controller_setting = {
-            .loop_type = MOTOR_LOOP_OPEN,                 // TODO: 后续改为位置/速度环
+            .loop_type = MOTOR_LOOP_SPEED,                // TODO: 后续改为位置/速度环
             .feedback_direction = MOTOR_DIRECTION_NORMAL, // 反馈方向
             .motor_direction = MOTOR_DIRECTION_NORMAL,    // 输出方向
-            .position_mode = MOTOR_POSITION_CONTINUOUS,   // 开环占位，不用位置环
-            .angle_limit_max = 0,
-            .angle_limit_min = 0,
+            .position_mode = MOTOR_POSITION_WRAP,         // 开环占位，不用位置环
+            .angle_limit_max = M_PI_2,
+            .angle_limit_min = -M_PI_2,
             .speed_feedforward_src = MOTOR_FEEDFORWARD_DISABLE,    // 速度前馈来源
             .position_feedforward_src = MOTOR_FEEDFORWARD_DISABLE, // 位置前馈来源
             .speed_feedforward_ptr = NULL,                         // 速度前馈指针
@@ -104,8 +109,43 @@ void AppChassisInit(void)
             .angle_external_ptr = NULL,                            // 外部角度反馈指针
             .speed_external_ptr = NULL,                            // 外部速度反馈指针
         },
+        // 速度环整定依据 ignore/vofa+.csv（20s，0/30/60 rad/s 阶跃，2ms 周期，kp=0.12/ki=0.15 采得）：
+        //   实测超调 30~38%，0→30 后还残留约 1rad/s 的慢摆（整定 1.2~4.8s）。
+        //   由该数据辨识被控对象：Kt/J≈495 rad/s²/A、B/J≈3 /s、恒值负载≈1.2A、回路延迟≈6ms，
+        //   叠加 20ms 速度低通（speed_lpf_rc）；闭环复现超调 33%，与实测一致。
+        //   根因是"20ms 低通 + 6ms 延迟"的相位滞后——纯 PI 只能靠降 kp 压超调，代价是变慢
+        //   （kp≤0.06 才压到 12%，且负载/模型一漂就回到 25%+）。
+        //   故改用微分先行（仅对反馈微分，不受目标阶跃冲击）补阻尼，并小幅提高 ki 加快积分收敛：
+        //   kp 0.12→0.10、ki 0.15→0.20、kd 0→0.002、微分滤波 rc=0.004。
+        //   辨识模型仿真：平均超调 33.8%→0.8%，平均整定 441ms→178ms；在负载 0.85~1.8A、
+        //   Kt/J 400~640、B/J 2~4.5、延迟 4~10ms 的全范围内，最坏超调仍 <4%。
+        //   kd 量纲：d_out = kd*(last_measure-measure)/dt，kd=0.002 即"每 2ms 速度变化 1rad/s 给 1A 阻尼"；
+        //   实测速度噪声仅 ~0.045rad/s，经 4ms 微分滤波后噪声电流 <0.03A，可忽略。
+        //   ⚠️ 积分语义：lib_pid 已修正为 i_out += ki*error*dt，ki 单位是"每秒"，不随调用频率变。
+        .pid_speed_setting = {
+            .kp = 0.10,                                      // 比例系数（0.12→0.10，让位给微分阻尼）
+            .ki = 0.20,                                      // 积分系数 [1/s]（0.15→0.20，加快慢摆收敛）
+            .kd = 0.002,                                     // 微分系数（配合微分先行补相位裕度）
+            .integral_limit = 2.5,                           // 积分限幅阈值（实测峰值 i_out≈1.47，负载 +50% 仍有余量）
+            .coef_a = 20,                                    // 变速积分参数 A (0 = 禁用)
+            .coef_b = 20,                                    // 变速积分参数 B
+            .d_lpf_rc = 0.004,                               // 微分滤波时间常数 RC (0 = 禁用)
+            .out_lpf_rc = 0,                                 // 输出滤波时间常数 RC (0 = 禁用)
+            .deadband = 0,                                   // 死区范围 (0 = 禁用)
+            .error_normalize_range = 0,                      // 误差归一化范围 (0 = 禁用, 需要 PID_ENABLE_ERROR_NORMALIZE)
+            .out_max = 0,                                    // 输出上限 (需要 PID_ENABLE_OUTPUT_LIMIT)
+            .out_min = 0,                                    // 输出下限 (需要 PID_ENABLE_OUTPUT_LIMIT)
+            .config_mask = PID_ENABLE_TRAPEZOID_INTEGRAL |   // 梯形积分
+                           PID_ENABLE_INTEGRAL_LIMIT |       // 积分限幅
+                           PID_ENABLE_CHANGING_INTEGRATION | // 变速积分
+                           PID_ENABLE_DERIVATIVE_ON_MEAS |   // 微分先行（避免目标阶跃的微分冲击）
+                           PID_ENABLE_DERIVATIVE_FILTER,     // 微分滤波
+
+            //  PID_ENABLE_PROPORTIONAL_ON_MEAS = 0x10, // 启用比例先行
+            //  PID_ENABLE_OUTPUT_FILTER = 0x40,        // 启用输出滤波
+            //  PID_ENABLE_ERROR_NORMALIZE = 0x200,     // 启用误差归一化
+        },
         .pid_angle_setting = {},
-        .pid_speed_setting = {},
         .reload_count = 100,
         .fault_action = DAEMON_FAULT_NONE,
         .timeout_ms = 1, // CAN 发送超时(ms)
@@ -122,12 +162,12 @@ void AppChassisInit(void)
         .position_offset = 0,
         .torque_constant = 1, // M3508 电流→力矩系数，待标定
         .controller_setting = {
-            .loop_type = MOTOR_LOOP_OPEN,                 // TODO: 后续改为位置/速度环
+            .loop_type = MOTOR_LOOP_SPEED,                // TODO: 后续改为位置/速度环
             .feedback_direction = MOTOR_DIRECTION_NORMAL, // 反馈方向
             .motor_direction = MOTOR_DIRECTION_NORMAL,    // 输出方向
-            .position_mode = MOTOR_POSITION_CONTINUOUS,   // 开环占位，不用位置环
-            .angle_limit_max = 0,
-            .angle_limit_min = 0,
+            .position_mode = MOTOR_POSITION_WRAP,         // 开环占位，不用位置环
+            .angle_limit_max = M_PI_2,
+            .angle_limit_min = -M_PI_2,
             .speed_feedforward_src = MOTOR_FEEDFORWARD_DISABLE,    // 速度前馈来源
             .position_feedforward_src = MOTOR_FEEDFORWARD_DISABLE, // 位置前馈来源
             .speed_feedforward_ptr = NULL,                         // 速度前馈指针
@@ -135,10 +175,45 @@ void AppChassisInit(void)
             .angle_src = MOTOR_FEEDBACK_MOTOR,                     // 角度反馈来源
             .speed_src = MOTOR_FEEDBACK_MOTOR,                     // 速度反馈来源
             .angle_external_ptr = NULL,                            // 外部角度反馈指针
-            .speed_external_ptr = NULL,                            // 外部速度反馈指针1
+            .speed_external_ptr = NULL,                            // 外部速度反馈指针
+        },
+        // 速度环整定依据 ignore/vofa+.csv（20s，0/30/60 rad/s 阶跃，2ms 周期，kp=0.12/ki=0.15 采得）：
+        //   实测超调 30~38%，0→30 后还残留约 1rad/s 的慢摆（整定 1.2~4.8s）。
+        //   由该数据辨识被控对象：Kt/J≈495 rad/s²/A、B/J≈3 /s、恒值负载≈1.2A、回路延迟≈6ms，
+        //   叠加 20ms 速度低通（speed_lpf_rc）；闭环复现超调 33%，与实测一致。
+        //   根因是"20ms 低通 + 6ms 延迟"的相位滞后——纯 PI 只能靠降 kp 压超调，代价是变慢
+        //   （kp≤0.06 才压到 12%，且负载/模型一漂就回到 25%+）。
+        //   故改用微分先行（仅对反馈微分，不受目标阶跃冲击）补阻尼，并小幅提高 ki 加快积分收敛：
+        //   kp 0.12→0.10、ki 0.15→0.20、kd 0→0.002、微分滤波 rc=0.004。
+        //   辨识模型仿真：平均超调 33.8%→0.8%，平均整定 441ms→178ms；在负载 0.85~1.8A、
+        //   Kt/J 400~640、B/J 2~4.5、延迟 4~10ms 的全范围内，最坏超调仍 <4%。
+        //   kd 量纲：d_out = kd*(last_measure-measure)/dt，kd=0.002 即"每 2ms 速度变化 1rad/s 给 1A 阻尼"；
+        //   实测速度噪声仅 ~0.045rad/s，经 4ms 微分滤波后噪声电流 <0.03A，可忽略。
+        //   ⚠️ 积分语义：lib_pid 已修正为 i_out += ki*error*dt，ki 单位是"每秒"，不随调用频率变。
+        .pid_speed_setting = {
+            .kp = 0.10,                                      // 比例系数（0.12→0.10，让位给微分阻尼）
+            .ki = 0.20,                                      // 积分系数 [1/s]（0.15→0.20，加快慢摆收敛）
+            .kd = 0.002,                                     // 微分系数（配合微分先行补相位裕度）
+            .integral_limit = 2.5,                           // 积分限幅阈值（实测峰值 i_out≈1.47，负载 +50% 仍有余量）
+            .coef_a = 20,                                    // 变速积分参数 A (0 = 禁用)
+            .coef_b = 20,                                    // 变速积分参数 B
+            .d_lpf_rc = 0.004,                               // 微分滤波时间常数 RC (0 = 禁用)
+            .out_lpf_rc = 0,                                 // 输出滤波时间常数 RC (0 = 禁用)
+            .deadband = 0,                                   // 死区范围 (0 = 禁用)
+            .error_normalize_range = 0,                      // 误差归一化范围 (0 = 禁用, 需要 PID_ENABLE_ERROR_NORMALIZE)
+            .out_max = 0,                                    // 输出上限 (需要 PID_ENABLE_OUTPUT_LIMIT)
+            .out_min = 0,                                    // 输出下限 (需要 PID_ENABLE_OUTPUT_LIMIT)
+            .config_mask = PID_ENABLE_TRAPEZOID_INTEGRAL |   // 梯形积分
+                           PID_ENABLE_INTEGRAL_LIMIT |       // 积分限幅
+                           PID_ENABLE_CHANGING_INTEGRATION | // 变速积分
+                           PID_ENABLE_DERIVATIVE_ON_MEAS |   // 微分先行（避免目标阶跃的微分冲击）
+                           PID_ENABLE_DERIVATIVE_FILTER,     // 微分滤波
+
+            //  PID_ENABLE_PROPORTIONAL_ON_MEAS = 0x10, // 启用比例先行
+            //  PID_ENABLE_OUTPUT_FILTER = 0x40,        // 启用输出滤波
+            //  PID_ENABLE_ERROR_NORMALIZE = 0x200,     // 启用误差归一化
         },
         .pid_angle_setting = {},
-        .pid_speed_setting = {},
         .reload_count = 100,
         .fault_action = DAEMON_FAULT_NONE,
         .timeout_ms = 1, // CAN 发送超时(ms)
@@ -255,29 +330,72 @@ void AppChassisInit(void)
         .daemon_fault = DAEMON_FAULT_NONE,
         .daemon_reload = 10, /* 对端每 2ms 发一帧，超 10ms 判离线 */
     };
-    CommRegister(&gimbal_comm);
-    CommConfig(&gimbal_comm, &gimbal_comm_cfg);
+    BSP_ASSERT_APP_CALL(CommRegister(&gimbal_comm));
+    BSP_ASSERT_APP_CALL(CommConfig(&gimbal_comm, &gimbal_comm_cfg));
 }
 
 ITCM_RAM void AppChassisRun(void)
 {
-    /* 收发骨架：ref 先给 0（开环=0 扭矩，安全）。
-     * 必须每周期 SetRef + Send，原因有二：
-     *   1) 驱动只在 Send→Calculate→GetData 里解析反馈并写入 data_all.data，
-     *      不调用 GetData 则 data_all.data 恒为全 0（调试器看到的“全 0”即此）；
-     *   2) C620 / LK 电机都要先收到控制帧才会回传反馈（LK 广播发 0x280 才回状态2）。
-     * TODO: 后续接入轮速环 / 舵向位置环，替换下面的 ref 来源。 */
+
+    // 判断
+    if (gimbal2chassis_data.mode == g2c_stop)
+    {
+        MotorDisable(&(rudder_l_motor.base));
+        MotorDisable(&(rudder_r_motor.base));
+        MotorDisable(&(wheel_l_motor.base));
+        MotorDisable(&(wheel_r_motor.base));
+    }
+    else if (gimbal2chassis_data.mode == g2c_normal)
+    {
+        MotorEnable(&(rudder_l_motor.base));
+        MotorEnable(&(rudder_r_motor.base));
+        MotorEnable(&(wheel_l_motor.base));
+        MotorEnable(&(wheel_r_motor.base));
+        rudder_r_motor_setref = 0;
+    }
+    else if (gimbal2chassis_data.mode == g2c_gyro)
+    {
+        MotorEnable(&(rudder_l_motor.base));
+        MotorEnable(&(rudder_r_motor.base));
+        MotorEnable(&(wheel_l_motor.base));
+        MotorEnable(&(wheel_r_motor.base));
+        rudder_r_motor_setref = 80;
+    }
+    else if (gimbal2chassis_data.mode == g2c_hole)
+    {
+        MotorEnable(&(rudder_l_motor.base));
+        MotorEnable(&(rudder_r_motor.base));
+        MotorEnable(&(wheel_l_motor.base));
+        MotorEnable(&(wheel_r_motor.base));
+        rudder_r_motor_setref = -80;
+    }
+
+    // 设置
     MotorSetRef(&(rudder_l_motor.base), 0.0f);
-    MotorSetRef(&(rudder_r_motor.base), 0.0f);
+    MotorSetRef(&(rudder_r_motor.base), rudder_r_motor_setref);
     MotorSetRef(&(wheel_l_motor.base), 0.0f);
     MotorSetRef(&(wheel_r_motor.base), 0.0f);
-
-    /* 组发送：同一组每周期只需调用一次，否则 0x200/0x280 重复占用总线。
-     *   - DJI 舵向组（CAN_1，rx 0x202/0x204）共用 tx 0x200 一帧；
-     *   - LK 广播组（CAN_1，槽位 0/1）共用 0x280 一帧。 */
     MotorSend(&(rudder_l_motor.base));
     MotorSend(&(wheel_l_motor.base));
 
-    // 云台通信：每周期发一帧（接收已由 CAN 中断写入 gimbal_rx_data）
-    CommSend(&gimbal_comm, (uint8_t *)&gimbal_tx_data);
+    // 发送
+    // rudder_r 速度环观测通道（ch1~8 沿用旧布局，便于复用已存的 VOFA+ 配置）：
+    //   1 位置  2 速度  3 力矩  4 积分项 i_out  5 比例项 p_out  6 PID 总输出
+    //   7 积分限幅(常量)  8 目标速度 setref
+    // ch9~12 为本次整定补充：整定是否到位可直接看 9/12，若后续加微分再看 10。
+    VofaSetChannel(1, rudder_r_motor.base.data_all.data.position);
+    VofaSetChannel(2, rudder_r_motor.base.data_all.data.speed);
+    VofaSetChannel(3, rudder_r_motor.base.data_all.data.torque);
+    VofaSetChannel(4, rudder_r_motor.base.controller.pid_speed.i_out);
+    VofaSetChannel(5, rudder_r_motor.base.controller.pid_speed.p_out);
+    VofaSetChannel(6, rudder_r_motor.base.controller.pid_speed.output);
+    VofaSetChannel(7, rudder_r_motor.base.controller.pid_speed.integral_limit);
+    VofaSetChannel(8, rudder_r_motor_setref);
+    VofaSetChannel(9, rudder_r_motor.base.controller.pid_speed.error);    // 误差 ref-measure
+    VofaSetChannel(10, rudder_r_motor.base.controller.pid_speed.d_out);   // 微分项（kd=0 时应恒 0）
+    VofaSetChannel(11, rudder_r_motor.base.controller.pid_speed.measure); // PID 实际用的反馈速度
+    VofaSetChannel(12, rudder_r_motor.base.controller.output);            // 最终电流/力矩命令（已含方向与量纲换算）
+    VofaSend();
+
+    CommSend(&gimbal_comm, (uint8_t *)&chassis2gimbal_data); // 云台通信：每周期发一帧（接收已由 CAN 中断写入 gimbal_rx_data）
 }

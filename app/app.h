@@ -18,13 +18,14 @@ void function_in_main_c(void);
  * （COMM_DEF 内 _Static_assert 校验 sizeof == 约定线长）。 */
 typedef enum : uint8_t
 {
-    g2c_disable = 0,
-    g2c_enable = 1,
+    g2c_stop = 0,   // 急停
+    g2c_normal = 1, // 普通模式
+    g2c_gyro = 2,   // 小陀螺模式
+    g2c_hole = 3,   // 过洞模式
 } gimbal2cmd_control_mode_e;
 typedef struct
 {
-    // 使能
-    gimbal2cmd_control_mode_e mode; // 1:使能;2:失能
+    gimbal2cmd_control_mode_e mode; // 模式
     // 设定速度
     float vx;
     float vy;
