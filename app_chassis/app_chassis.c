@@ -37,6 +37,8 @@ LKMOTOR_BROADCAST_INSTANCE_DEF(wheel_r_motor);
 // 左舵 PA0 → GPIO_PWM_1，右舵 PA2 → GPIO_PWM_2（DM_MC02 映射）；
 // CubeMX 已配为上升沿触发（GPIO_MODE_IT_RISING）并使能 EXTI0/EXTI2 NVIC。
 // parent 指向对应电机的 MotorBase_s（基类为首成员，可直接强转）。
+// 触发沿在回调里直接把 position_offset 写好（见 RudderPhotogate_*_Callback），
+// 所以不再往任务里传"待标定"标志。
 GPIO_INSTANCE_DEF(rudder_l_gate_io);
 GPIO_INSTANCE_DEF(rudder_r_gate_io);
 
@@ -56,70 +58,6 @@ static float rudder_r_motor_setref = 0;
 // static float wheel_l_motor_setref = 0;
 // static float wheel_r_motor_setref = 0;
 
-uint8_t chassis_rudder_l_offset_inited_flag = 0; // 底盘舵向左偏置初始化标志。
-uint8_t chassis_rudder_r_offset_inited_flag = 0; // 底盘舵向右边偏置初始化标志。
-
-static volatile uint8_t rudder_l_gate_pending = 0; // 左舵光电门已触发，待任务标定
-static volatile uint8_t rudder_r_gate_pending = 0; // 右舵光电门已触发，待任务标定
-
-/* 函数 */
-/**
- * @brief 用光电门触发点标定舵角零点（在 AppChassisRun 里调用，任务上下文）
- * @param motor 待标定的舵向电机
- * @note  反馈位置 = (position_cnt*2π + position_single + position_offset) * feedback_direction
- *        （见 DJIMotorBroadcast_GetData 的"累加-偏置-方向-归一化"）。
- *        令括号为 0 则该点即零点，故取 offset = -(position_cnt*2π + position_single)：
- *        整个括号被置零，乘方向后仍是 0，所以与 feedback_direction、WRAP 限幅都无关。
- *        ⚠️ 不要写成 offset = -MotorGetAngle()：那个 position 已经①乘过 feedback_direction、
- *        ②被 WRAP 折到 ±4π，只有"方向为正且没折过"时才碰巧对。
- * @note  position_offset 是 float 而 position_cnt 会一直累加。上电首次标定时 cnt 很小、
- *        精度足够；若将来改成运行中反复标定，要注意大角度下 float 的分辨率
- *        （cnt=10000 即约 6.3e4 rad 时分辨率约 0.004 电机rad）。
- * @note  用 GetData 拿的是最近一帧 CAN 的解析结果（data_valid=1 时直接返回缓存），
- *        相对触发沿最多滞后一个 CAN 周期；标定时舵向转速低，角度误差可忽略。
- */
-static void RudderCalibrateOffset(MotorBase_s *motor)
-{
-    MotorGetData(motor); // 刷新反馈（走缓存时不重复解析）
-    motor->position_offset = -(float)((double)motor->data_all.position_cnt * M_2PI +
-                                      (double)motor->data_all.position_single);
-    /* 这个点按定义就是 0。偏置改了、但 data_all.data.position 是刚才用旧偏置算出来并缓存的
-     * （data_valid 命中时甚至会一直用到下一帧），不对齐的话位置环会白挨一记 =旧偏置 的阶跃。
-     * 只改 position：position_cnt/position_single 是原始量，与偏置无关。 */
-    motor->data_all.data.position = 0.0;
-}
-
-/**
- * @brief 光电门 EXTI 回调（左舵）
- * @note ISR 上下文：只置"待标定"标志，真正的标定放到 AppChassisRun 里做。原因：
- *       1. position_cnt(int64)/position_single(float) 是任务在 GetData 里写的，
- *          ISR 里读会撕裂（可能读到跨帧拼接的值）；
- *       2. ISR 读到的同样是一个控制周期前的快照，并不比任务里读更准。
- *        置标志则没有这两个问题。
- * @note 只标定一次：标定完成后（inited 标志置位）不再响应。否则舵向每次转到光电门处
- *       都会把位置重写成 0，多圈基准就丢了。
- */
-static void RudderPhotogate_l_Callback(GPIOInstance *gpio_inst)
-{
-    (void)gpio_inst;
-    if (!chassis_rudder_l_offset_inited_flag)
-    {
-        rudder_l_gate_pending = 1;
-    }
-}
-
-/**
- * @brief 光电门 EXTI 回调（右舵），与左舵同构
- * @note 见 RudderPhotogate_l_Callback 的说明。
- */
-static void RudderPhotogate_r_Callback(GPIOInstance *gpio_inst)
-{
-    (void)gpio_inst;
-    if (!chassis_rudder_r_offset_inited_flag)
-    {
-        rudder_r_gate_pending = 1;
-    }
-}
 /* 云台接收出帧回调（UNPACK_IN_ISR：payload 指向接收缓冲，回调返回后即被覆盖，须同步拷贝） */
 static void GimbalRecvOnFrame(const uint8_t *payload)
 {
@@ -144,12 +82,12 @@ void AppChassisInit(void)
         .position_offset = 0,
         .torque_constant = 1, // M3508 电流→力矩系数，待标定
         .controller_setting = {
-            .loop_type = MOTOR_LOOP_SPEED,                // TODO: 后续改为位置/速度环
-            .feedback_direction = MOTOR_DIRECTION_NORMAL, // 反馈方向
-            .motor_direction = MOTOR_DIRECTION_NORMAL,    // 输出方向
-            .position_mode = MOTOR_POSITION_WRAP,         // 开环占位，不用位置环
-            .angle_limit_max = M_PI_2,
-            .angle_limit_min = -M_PI_2,
+            .loop_type = MOTOR_LOOP_ANGLE | MOTOR_LOOP_SPEED, // TODO: 后续改为位置/速度环
+            .feedback_direction = MOTOR_DIRECTION_NORMAL,     // 反馈方向
+            .motor_direction = MOTOR_DIRECTION_NORMAL,        // 输出方向
+            .position_mode = MOTOR_POSITION_WRAP,             // 开环占位，不用位置环
+            .angle_limit_max = M_PI * STEER_GEAR_RATIO,
+            .angle_limit_min = -M_PI * STEER_GEAR_RATIO,
             .speed_feedforward_src = MOTOR_FEEDFORWARD_DISABLE,    // 速度前馈来源
             .position_feedforward_src = MOTOR_FEEDFORWARD_DISABLE, // 位置前馈来源
             .speed_feedforward_ptr = NULL,                         // 速度前馈指针
@@ -190,12 +128,23 @@ void AppChassisInit(void)
                            PID_ENABLE_CHANGING_INTEGRATION | // 变速积分
                            PID_ENABLE_DERIVATIVE_ON_MEAS |   // 微分先行（避免目标阶跃的微分冲击）
                            PID_ENABLE_DERIVATIVE_FILTER,     // 微分滤波
-
-            //  PID_ENABLE_PROPORTIONAL_ON_MEAS = 0x10, // 启用比例先行
-            //  PID_ENABLE_OUTPUT_FILTER = 0x40,        // 启用输出滤波
-            //  PID_ENABLE_ERROR_NORMALIZE = 0x200,     // 启用误差归一化
         },
-        .pid_angle_setting = {},
+        .pid_angle_setting = {
+            .kp = 50,                                  // 比例系数（0.12→0.10，让位给微分阻尼）
+            .ki = 0,                                   // 积分系数 [1/s]（0.15→0.20，加快慢摆收敛）
+            .kd = 0.3,                                 // 微分系数（配合微分先行补相位裕度）
+            .integral_limit = 0,                       // 积分限幅阈值（实测峰值 i_out≈1.47，负载 +50% 仍有余量）
+            .coef_a = 0,                               // 变速积分参数 A (0 = 禁用)
+            .coef_b = 0,                               // 变速积分参数 B
+            .d_lpf_rc = 0,                             // 微分滤波时间常数 RC (0 = 禁用)
+            .out_lpf_rc = 0,                           // 输出滤波时间常数 RC (0 = 禁用)
+            .deadband = 0,                             // 死区范围 (0 = 禁用)
+            .error_normalize_range = 0,                // 误差归一化范围 (0 = 禁用, 需要 PID_ENABLE_ERROR_NORMALIZE)
+            .out_max = 0,                              // 输出上限 (需要 PID_ENABLE_OUTPUT_LIMIT)
+            .out_min = 0,                              // 输出下限 (需要 PID_ENABLE_OUTPUT_LIMIT)
+            .config_mask = PID_ENABLE_ERROR_NORMALIZE, // 启用误差归一化
+
+        },
         .reload_count = 100,
         .fault_action = DAEMON_FAULT_NONE,
         .timeout_ms = 1, // CAN 发送超时(ms)
@@ -258,10 +207,6 @@ void AppChassisInit(void)
                            PID_ENABLE_CHANGING_INTEGRATION | // 变速积分
                            PID_ENABLE_DERIVATIVE_ON_MEAS |   // 微分先行（避免目标阶跃的微分冲击）
                            PID_ENABLE_DERIVATIVE_FILTER,     // 微分滤波
-
-            //  PID_ENABLE_PROPORTIONAL_ON_MEAS = 0x10, // 启用比例先行
-            //  PID_ENABLE_OUTPUT_FILTER = 0x40,        // 启用输出滤波
-            //  PID_ENABLE_ERROR_NORMALIZE = 0x200,     // 启用误差归一化
         },
         .pid_angle_setting = {
             .kp = 50,                                  // 比例系数（0.12→0.10，让位给微分阻尼）
@@ -362,9 +307,9 @@ void AppChassisInit(void)
     MotorEnable(&(wheel_l_motor.base));
     MotorEnable(&(wheel_r_motor.base));
 
-    // 注册并配置两个光电门（EXTI 上升沿，回调置标定标志）
-    /* ⚠️ 侧别↔引脚：实机标定测试（转右舵只进 RudderPhotogate_l_Callback）表明
-     *    右舵门在 PA2(GPIO_PWM_2)、左舵门在 PA0(GPIO_PWM_1)。故按下面的对应填；
+    // 注册并配置两个光电门（EXTI 上升沿，回调触发即写偏置）
+    /* ⚠️ 侧别↔引脚：实机曾出现"转右舵只进 RudderPhotogate_l_Callback"，而当时 l 回调
+     *    绑的是 PA2(GPIO_PWM_2)，说明右舵门在 PA2、左舵门在 PA0，故按下面填；
      *    改线后把这两行的 gpio_e 对调即可（实例名/回调/被标定电机三者保持同侧）。 */
     rudder_l_gate_io.parent = &(rudder_l_motor.base);
     rudder_r_gate_io.parent = &(rudder_r_motor.base);
@@ -373,11 +318,11 @@ void AppChassisInit(void)
 
     GPIO_Config_s gate_l_cfg = {
         .gpio_e = GPIO_PWM_1, // PA0 —— 左舵光电门
-        .callback = RudderPhotogate_l_Callback,
+        .callback = NULL,
     };
     GPIO_Config_s gate_r_cfg = {
         .gpio_e = GPIO_PWM_2, // PA2 —— 右舵光电门
-        .callback = RudderPhotogate_r_Callback,
+        .callback = NULL,
     };
     BSP_ASSERT_APP_CALL(GPIOConfig(&rudder_l_gate_io, &gate_l_cfg));
     BSP_ASSERT_APP_CALL(GPIOConfig(&rudder_r_gate_io, &gate_r_cfg));
@@ -400,13 +345,10 @@ void AppChassisInit(void)
     };
     BSP_ASSERT_APP_CALL(CommRegister(&gimbal_comm));
     BSP_ASSERT_APP_CALL(CommConfig(&gimbal_comm, &gimbal_comm_cfg));
-
-    // 进行光电门校准
 }
 
 ITCM_RAM void AppChassisRun(void)
 {
-
     // 判断
     if (gimbal2chassis_data.mode == g2c_stop)
     {
@@ -440,20 +382,6 @@ ITCM_RAM void AppChassisRun(void)
         rudder_r_motor_setref = 6;
     }
 
-    // 光电门零位标定：ISR 置标志、这里做（必须在 MotorSend 之前，让本周期 GetData 就用上新偏置）
-    if (rudder_l_gate_pending)
-    {
-        chassis_rudder_l_offset_inited_flag = 1; // 先关闭后续触发，再清标志/标定
-        rudder_l_gate_pending = 0;
-        RudderCalibrateOffset(&(rudder_l_motor.base));
-    }
-    if (rudder_r_gate_pending)
-    {
-        chassis_rudder_r_offset_inited_flag = 1;
-        rudder_r_gate_pending = 0;
-        RudderCalibrateOffset(&(rudder_r_motor.base));
-    }
-
     // 设置
     MotorSetRef(&(rudder_l_motor.base), 0.0f);
     MotorSetRef(&(rudder_r_motor.base), rudder_r_motor_setref);
@@ -465,7 +393,7 @@ ITCM_RAM void AppChassisRun(void)
     // 发送
     // rudder_r 速度环观测通道（ch1~8 沿用旧布局，便于复用已存的 VOFA+ 配置）：
     //   1 位置  2 速度  3 力矩  4 积分项 i_out  5 比例项 p_out  6 PID 总输出
-    //   7 积分限幅(常量)  8 目标速度 setref
+    //   7 积分限幅(常量)  8 实际 ref（正常=setref，寻零期间=扫描速度给定）
     // ch9~12 为本次整定补充：整定是否到位可直接看 9/12，若后续加微分再看 10。
     VofaSetChannel(1, rudder_r_motor.base.data_all.data.position);
     VofaSetChannel(2, rudder_r_motor.base.data_all.data.speed);
@@ -474,7 +402,7 @@ ITCM_RAM void AppChassisRun(void)
     VofaSetChannel(5, rudder_r_motor.base.controller.pid_speed.p_out);
     VofaSetChannel(6, rudder_r_motor.base.controller.pid_speed.output);
     VofaSetChannel(7, rudder_r_motor.base.controller.pid_speed.integral_limit);
-    VofaSetChannel(8, rudder_r_motor_setref);
+    VofaSetChannel(8, rudder_r_motor.base.controller.ref);                // 驱动实际用的 ref（寻零时是扫描给定）
     VofaSetChannel(9, rudder_r_motor.base.controller.pid_speed.error);    // 误差 ref-measure
     VofaSetChannel(10, rudder_r_motor.base.controller.pid_speed.d_out);   // 微分项（kd=0 时应恒 0）
     VofaSetChannel(11, rudder_r_motor.base.controller.pid_speed.measure); // PID 实际用的反馈速度
