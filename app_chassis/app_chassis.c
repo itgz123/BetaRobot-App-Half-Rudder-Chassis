@@ -22,6 +22,8 @@
 /* 宏 */
 #define STEER_GEAR_RATIO 8.0f       // 减速比：电机 8 圈 = 舵轮 1 圈
 #define STEER_GEAR_RATIO_INV 0.125f // 减速比：电机 8 圈 = 舵轮 1 圈
+// 校准光电门
+#define jiaozhun_speed 8.0f
 
 /* 变量 */
 // 实例
@@ -33,12 +35,13 @@ LKMOTOR_BROADCAST_INSTANCE_DEF(wheel_l_motor);
 LKMOTOR_BROADCAST_INSTANCE_DEF(wheel_r_motor);
 
 /*============================ 光电门（M3508 增量编码器零点标定） ============================*/
-// M3508 为增量编码器，上电无绝对零点，用两个光电门触发 EXTI 记录机械零点。
-// 左舵 PA0 → GPIO_PWM_1，右舵 PA2 → GPIO_PWM_2（DM_MC02 映射）；
-// CubeMX 已配为上升沿触发（GPIO_MODE_IT_RISING）并使能 EXTI0/EXTI2 NVIC。
-// parent 指向对应电机的 MotorBase_s（基类为首成员，可直接强转）。
-// 触发沿在回调里直接把 position_offset 写好（见 RudderPhotogate_*_Callback），
-// 所以不再往任务里传"待标定"标志。
+// M3508 为增量编码器，上电无绝对零点，用两个光电门在转动中找机械零点。
+// 左舵 PA0 → GPIO_PWM_1，右舵 PA2 → GPIO_PWM_2（DM_MC02 映射）。
+// 遮光片是半遮半透的圆环：电机每转一圈，光电门电平"低→高→低"各变化一次，
+// 取其中一个跳变（上升沿）当零点即可——每圈有且仅有一个，且与电机旋向无关
+// （左右舵若镜像安装、旋向相反，同一个判据照样成立）。
+// CubeMX 里这两个脚仍配着上升沿 EXTI，但本方案改为在控制任务里轮询：
+// 回调置 NULL（不占 EXTI 分发），EXTI 触发时 BSP 层判空后直接返回，不影响轮询。
 GPIO_INSTANCE_DEF(rudder_l_gate_io);
 GPIO_INSTANCE_DEF(rudder_r_gate_io);
 
@@ -53,11 +56,80 @@ COMM_DEF(gimbal_comm, MEDIA_CAN_IDSEQ, CUSTOM, CUSTOM, gimbal2chassis_data_t, 13
 static gimbal2chassis_data_t gimbal2chassis_data = {0}; // 云台→底盘（on_frame 同步拷贝）
 static chassis2gimbal_data_t chassis2gimbal_data = {0}; // 底盘→云台（业务填写后 CommSend）
 
-// static float rudder_l_motor_setref = 0;
+static float rudder_l_motor_setref = 0;
 static float rudder_r_motor_setref = 0;
 // static float wheel_l_motor_setref = 0;
 // static float wheel_r_motor_setref = 0;
 
+static uint8_t rudder_l_state = 0;
+static uint8_t rudder_r_state = 0;
+static uint8_t rudder_l_inited = 0;
+static uint8_t rudder_r_inited = 0;
+
+/* 位置反馈是"电机侧 rad"（舵轮 1 圈 = 电机 STEER_GEAR_RATIO 圈），
+ * 而机械偏置按舵轮角度标定，故换算到电机侧要乘减速比。 */
+#define STEER_WHEEL_DEG_TO_MOTOR_RAD(deg) ((deg) * (M_PI / 180.0f) * STEER_GEAR_RATIO)
+
+/**
+ * @brief 光电门跳变沿处重标定零点：把当前读数改成"正前方 + 机械偏置"对应的位置
+ * @param rudder 舵向电机（M3508，增量编码器，上电无绝对零点）
+ * @param offset_deg 跳变沿 → 正前方 的舵轮角度偏置（°，见 robot_def.h）
+ * @note 位置由驱动算出：position = wrap((多圈累加 + position_offset) * feedback_direction)，
+ *       即 position_offset 每加 Δ，读数就沿 feedback_direction 方向变 Δ，
+ *       故要让读数等于 target，增量须除以 feedback_direction。
+ * @note 跳变沿由控制任务（2ms）轮询得到，采样滞后最多 2ms；标定转速 8rad/s（电机侧）
+ *       对应最大零点误差 0.016rad(电机侧) ≈ 0.115°(舵轮)，可忽略，不做补偿。
+ */
+static void RudderCalibrateOffset(MotorBase_s *rudder, float offset_deg)
+{
+    float position_now = (float)MotorGetData(rudder).position; // 触发瞬间读数（rad，电机侧）
+    float target = STEER_WHEEL_DEG_TO_MOTOR_RAD(offset_deg);   // 正前方应有的读数
+    rudder->position_offset += (target - position_now) / (float)rudder->setting.feedback_direction;
+}
+
+static void RudderCalibrateOffset_l()
+{
+    RudderCalibrateOffset(&(rudder_l_motor.base), RUDDER_ZERO_OFFSET_L_DEG);
+    rudder_l_inited = 1;
+}
+static void RudderCalibrateOffset_r()
+{
+    RudderCalibrateOffset(&(rudder_r_motor.base), RUDDER_ZERO_OFFSET_R_DEG);
+    rudder_r_inited = 1;
+}
+static uint8_t lunxunjioazhun()
+{
+    if (rudder_l_inited && rudder_r_inited)
+    {
+        rudder_l_motor.base.setting.loop_type = MOTOR_LOOP_SPEED | MOTOR_LOOP_ANGLE;
+        rudder_r_motor.base.setting.loop_type = MOTOR_LOOP_SPEED | MOTOR_LOOP_ANGLE;
+        return 1;
+    }
+
+    // 控制旋转
+    rudder_l_motor.base.setting.loop_type = MOTOR_LOOP_SPEED;
+    rudder_r_motor.base.setting.loop_type = MOTOR_LOOP_SPEED;
+    MotorEnable(&(rudder_l_motor.base));
+    MotorEnable(&(rudder_r_motor.base));
+    MotorSetRef(&(rudder_l_motor.base), jiaozhun_speed);
+    MotorSetRef(&(rudder_r_motor.base), jiaozhun_speed);
+
+    // 判断是否结束
+    if ((rudder_l_state == 1) && (0 == GPIORead(&rudder_l_gate_io)))
+    {
+        RudderCalibrateOffset_l();
+    }
+    if ((rudder_r_state == 1) && (0 == GPIORead(&rudder_r_gate_io)))
+    {
+        RudderCalibrateOffset_r();
+    }
+
+    // 记录上次状态
+    rudder_l_state = GPIORead(&rudder_l_gate_io);
+    rudder_r_state = GPIORead(&rudder_r_gate_io);
+
+    return 0;
+}
 /* 云台接收出帧回调（UNPACK_IN_ISR：payload 指向接收缓冲，回调返回后即被覆盖，须同步拷贝） */
 static void GimbalRecvOnFrame(const uint8_t *payload)
 {
@@ -350,43 +422,51 @@ void AppChassisInit(void)
 ITCM_RAM void AppChassisRun(void)
 {
     // 判断
-    if (gimbal2chassis_data.mode == g2c_stop)
+    if (lunxunjioazhun()) // 轮询校准
     {
-        MotorDisable(&(rudder_l_motor.base));
-        MotorDisable(&(rudder_r_motor.base));
-        MotorDisable(&(wheel_l_motor.base));
-        MotorDisable(&(wheel_r_motor.base));
-    }
-    else if (gimbal2chassis_data.mode == g2c_normal)
-    {
-        MotorEnable(&(rudder_l_motor.base));
-        MotorEnable(&(rudder_r_motor.base));
-        MotorEnable(&(wheel_l_motor.base));
-        MotorEnable(&(wheel_r_motor.base));
-        rudder_r_motor_setref = 0;
-    }
-    else if (gimbal2chassis_data.mode == g2c_gyro)
-    {
-        MotorEnable(&(rudder_l_motor.base));
-        MotorEnable(&(rudder_r_motor.base));
-        MotorEnable(&(wheel_l_motor.base));
-        MotorEnable(&(wheel_r_motor.base));
-        rudder_r_motor_setref = -6;
-    }
-    else if (gimbal2chassis_data.mode == g2c_hole)
-    {
-        MotorEnable(&(rudder_l_motor.base));
-        MotorEnable(&(rudder_r_motor.base));
-        MotorEnable(&(wheel_l_motor.base));
-        MotorEnable(&(wheel_r_motor.base));
-        rudder_r_motor_setref = 6;
+        if (gimbal2chassis_data.mode == g2c_stop)
+        {
+            MotorDisable(&(rudder_l_motor.base));
+            MotorDisable(&(rudder_r_motor.base));
+            MotorDisable(&(wheel_l_motor.base));
+            MotorDisable(&(wheel_r_motor.base));
+        }
+        else if (gimbal2chassis_data.mode == g2c_normal)
+        {
+            MotorEnable(&(rudder_l_motor.base));
+            MotorEnable(&(rudder_r_motor.base));
+            MotorEnable(&(wheel_l_motor.base));
+            MotorEnable(&(wheel_r_motor.base));
+            rudder_r_motor_setref = 0;
+            rudder_l_motor_setref = 0;
+        }
+        else if (gimbal2chassis_data.mode == g2c_gyro)
+        {
+            MotorEnable(&(rudder_l_motor.base));
+            MotorEnable(&(rudder_r_motor.base));
+            MotorEnable(&(wheel_l_motor.base));
+            MotorEnable(&(wheel_r_motor.base));
+            rudder_r_motor_setref = -6;
+            rudder_l_motor_setref = -6;
+        }
+        else if (gimbal2chassis_data.mode == g2c_hole)
+        {
+            MotorEnable(&(rudder_l_motor.base));
+            MotorEnable(&(rudder_r_motor.base));
+            MotorEnable(&(wheel_l_motor.base));
+            MotorEnable(&(wheel_r_motor.base));
+            rudder_r_motor_setref = 6;
+            rudder_l_motor_setref = 6;
+        }
+
+        // 设置
+        MotorSetRef(&(rudder_l_motor.base), rudder_l_motor_setref);
+        MotorSetRef(&(rudder_r_motor.base), rudder_r_motor_setref);
+        MotorSetRef(&(wheel_l_motor.base), 0.0f);
+        MotorSetRef(&(wheel_r_motor.base), 0.0f);
     }
 
-    // 设置
-    MotorSetRef(&(rudder_l_motor.base), 0.0f);
-    MotorSetRef(&(rudder_r_motor.base), rudder_r_motor_setref);
-    MotorSetRef(&(wheel_l_motor.base), 0.0f);
-    MotorSetRef(&(wheel_r_motor.base), 0.0f);
+    // 电机发送
     MotorSend(&(rudder_l_motor.base));
     MotorSend(&(wheel_l_motor.base));
 
