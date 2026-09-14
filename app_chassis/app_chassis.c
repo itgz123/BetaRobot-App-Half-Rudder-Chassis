@@ -58,8 +58,8 @@ static chassis2gimbal_data_t chassis2gimbal_data = {0}; // 底盘→云台（业
 
 static float rudder_l_motor_setref = 0;
 static float rudder_r_motor_setref = 0;
-// static float wheel_l_motor_setref = 0;
-// static float wheel_r_motor_setref = 0;
+static float wheel_l_motor_setref = 0;
+static float wheel_r_motor_setref = 0;
 
 static uint8_t rudder_l_state = 0;
 static uint8_t rudder_r_state = 0;
@@ -302,6 +302,7 @@ void AppChassisInit(void)
     };
     BSP_ASSERT_APP_CALL(DJIMotorBroadcastConfig(&rudder_r_motor, &rudder_r_cfg));
 
+    // 避震方向看过去逆时针转动为正方向
     // 配置 wheel_l（LK MF7015V1-24V-23T，广播模式 motor_id=1 → 槽位 0，回复 ID 0x141）
     // 型号据旧工程 scj(likong) 分支注释确认：Kt = 0.28 Nm/A（直驱无减速比），
     // 详见 drv/drv_motor/drv_lkmotor/lkmotor参数.md。
@@ -318,7 +319,7 @@ void AppChassisInit(void)
         .speed_lpf_rc = 0.004f,
         .position_offset = 0,
         .controller_setting = {
-            .loop_type = MOTOR_LOOP_OPEN,                 // TODO: 后续改为速度/位置环
+            .loop_type = MOTOR_LOOP_SPEED,                // TODO: 后续改为速度/位置环
             .feedback_direction = MOTOR_DIRECTION_NORMAL, // 反馈方向
             .motor_direction = MOTOR_DIRECTION_NORMAL,    // 输出方向
             .position_mode = MOTOR_POSITION_CONTINUOUS,   // 开环占位，不用位置环
@@ -334,13 +335,59 @@ void AppChassisInit(void)
             .speed_external_ptr = NULL,                            // 外部速度反馈指针
         },
         .pid_angle_setting = {},
-        .pid_speed_setting = {},
+        // 速度环整定依据 ignore/vofa+.csv（20s，给定恒 40rad/s，中途手动加摩擦，2ms 周期）——
+        // 该 csv 是旧参数（kp=0.1/ki=1e-4/kd=1e-4/integral_limit=0/coef_a=coef_b=0）采得的，
+        // 现场现象即"给定 40 一转手动摩擦就掉速、且松手也回不到 40"。
+        //   ① 根因是积分被两处同时清零，i_out 全程恒 0：
+        //      integral_limit=0 时 lib_pid 的 f_Integral_Limit 把任何积分增量截成 0；
+        //      变速积分 coef_a=coef_b=0 时 f_Changing_Integration_Rate 在 error*i_out>0 时
+        //      又把 i_term 置 0。于是速度环退化成纯 P：摩擦力矩 T 只能靠误差换，
+        //      稳态误差 = T/kp。实测摩擦 1.04Nm 段误差 10.6rad/s（转速掉到 29.4rad/s），
+        //      与 T/kp=10.4 完全吻合；实车摩擦大于手加的值，误差只会更大。
+        //   ② 由闭环数据辨识被控对象（台架空载，无粘性阻尼，是"纯积分"）：
+        //      w' = a*(u - T_load)，a≈975 rad/s²/Nm，回路延时≈3ms，再叠加 4ms 速度低通
+        //      （speed_lpf_rc）。用该模型跑旧参数，掉速段误差 10.43 vs 实测 10.56，可信。
+        //   ③ 整定：
+        //      kp 0.10 保持——闭环辨识给出穿越 14.6Hz、相位裕度 54°，本来就不慢；
+        //        kp=0.12 起动命令 4.84Nm 已超驱动限幅 4.51Nm（16.1A×0.28），kp=0.15 直接发散。
+        //      ki 1e-4→1.0 [1/s]——唯一真正缺的东西。稳态误差 10.4→0.01rad/s，
+        //        摩擦突加后约 0.2s 回到 ±1rad/s；相位裕度只从 54° 降到 48°。
+        //      kd 保持 0——对象是纯积分，微分先行(对测量微分)在此等效于降低回路增益，
+        //        仿真里 kd>0 反而掉速更深（与舵向 M3508 那个带阻尼的对象不同，别照搬）。
+        //      integral_limit 0→4.0 [Nm]——必须大于摩擦力矩，否则积分饱和在限幅值上、
+        //        误差无法归零；4.0Nm 已接近 MF7015-23T 峰值 3.8Nm，再大也没意义。
+        //      coef_a/coef_b 0→20/20——|err|≤20 全积分、20~40 递减、≥40 不积分，
+        //        兼作起动大误差(40rad/s)时的抗饱和，比关掉变速积分(超调 32%)好(27%)。
+        //   ④ 回放实机记录的真实摩擦曲线验证：旧参数 48% 时间低于 39rad/s、30% 低于 35rad/s、
+        //      最重摩擦段平均误差 10.43rad/s；新参数 10% 低于 39（且只在摩擦突加的瞬态）、
+        //      4% 低于 35、最重摩擦段平均误差 -0.09rad/s。起动 u 峰值 4.04Nm（未触限幅）。
+        //      裕度：a 700~1600、延时 2~5ms 范围内相位裕度 >35°、增益裕度 >7dB。
+        .pid_speed_setting = {
+            .kp = 0.10,                                      // 比例系数（闭环辨识复核：穿越 14.6Hz / 相位裕度 54°，保持）
+            .ki = 1.0,                                       // 积分系数 [1/s]（1e-4→1.0，消除摩擦掉速，见上②③）
+            .kd = 0,                                         // 微分系数（纯积分对象，微分先行只会等效降增益）
+            .integral_limit = 4.0,                           // 积分限幅阈值 [Nm]（0→4.0；必须 > 摩擦力矩，否则掉速归不了零）
+            .coef_a = 20,                                    // 变速积分参数 A（0→20，20~40rad/s 误差区间递减积分）
+            .coef_b = 20,                                    // 变速积分参数 B（0→20，兼作起动抗饱和）
+            .d_lpf_rc = 0,                                   // 微分滤波时间常数 RC (0 = 禁用)
+            .out_lpf_rc = 0,                                 // 输出滤波时间常数 RC (0 = 禁用)
+            .deadband = 0,                                   // 死区范围 (0 = 禁用)
+            .error_normalize_range = 0,                      // 误差归一化范围 (0 = 禁用, 需要 PID_ENABLE_ERROR_NORMALIZE)
+            .out_max = 0,                                    // 输出上限 (需要 PID_ENABLE_OUTPUT_LIMIT)
+            .out_min = 0,                                    // 输出下限 (需要 PID_ENABLE_OUTPUT_LIMIT)
+            .config_mask = PID_ENABLE_TRAPEZOID_INTEGRAL |   // 梯形积分
+                           PID_ENABLE_INTEGRAL_LIMIT |       // 积分限幅
+                           PID_ENABLE_CHANGING_INTEGRATION | // 变速积分
+                           PID_ENABLE_DERIVATIVE_ON_MEAS |   // 微分先行（kd=0，暂不生效，留作扩展）
+                           PID_ENABLE_DERIVATIVE_FILTER,     // 微分滤波
+        },
         .reload_count = 100,
         .fault_action = DAEMON_FAULT_NONE,
         .timeout_ms = 1, // CAN 发送超时(ms)
     };
     BSP_ASSERT_APP_CALL(LKMotorBroadcastConfig(&wheel_l_motor, &wheel_l_cfg));
 
+    // 避震方向看过去逆时针转动为正方向
     // 配置 wheel_r（LK MF7015V1-24V-23T，广播模式 motor_id=2 → 槽位 1，回复 ID 0x142）
     LKMotorBroadcast_Config_s wheel_r_cfg = {
         .can_e = CAN_2,
@@ -351,7 +398,7 @@ void AppChassisInit(void)
         .speed_lpf_rc = 0.004f,
         .position_offset = 0,
         .controller_setting = {
-            .loop_type = MOTOR_LOOP_OPEN,                 // TODO: 后续改为速度/位置环
+            .loop_type = MOTOR_LOOP_SPEED,                // TODO: 后续改为速度/位置环
             .feedback_direction = MOTOR_DIRECTION_NORMAL, // 反馈方向
             .motor_direction = MOTOR_DIRECTION_NORMAL,    // 输出方向
             .position_mode = MOTOR_POSITION_CONTINUOUS,   // 开环占位，不用位置环
@@ -367,7 +414,52 @@ void AppChassisInit(void)
             .speed_external_ptr = NULL,                            // 外部速度反馈指针
         },
         .pid_angle_setting = {},
-        .pid_speed_setting = {},
+        // 速度环整定依据 ignore/vofa+.csv（20s，给定恒 40rad/s，中途手动加摩擦，2ms 周期）——
+        // 该 csv 是旧参数（kp=0.1/ki=1e-4/kd=1e-4/integral_limit=0/coef_a=coef_b=0）采得的，
+        // 现场现象即"给定 40 一转手动摩擦就掉速、且松手也回不到 40"。
+        //   ① 根因是积分被两处同时清零，i_out 全程恒 0：
+        //      integral_limit=0 时 lib_pid 的 f_Integral_Limit 把任何积分增量截成 0；
+        //      变速积分 coef_a=coef_b=0 时 f_Changing_Integration_Rate 在 error*i_out>0 时
+        //      又把 i_term 置 0。于是速度环退化成纯 P：摩擦力矩 T 只能靠误差换，
+        //      稳态误差 = T/kp。实测摩擦 1.04Nm 段误差 10.6rad/s（转速掉到 29.4rad/s），
+        //      与 T/kp=10.4 完全吻合；实车摩擦大于手加的值，误差只会更大。
+        //   ② 由闭环数据辨识被控对象（台架空载，无粘性阻尼，是"纯积分"）：
+        //      w' = a*(u - T_load)，a≈975 rad/s²/Nm，回路延时≈3ms，再叠加 4ms 速度低通
+        //      （speed_lpf_rc）。用该模型跑旧参数，掉速段误差 10.43 vs 实测 10.56，可信。
+        //   ③ 整定：
+        //      kp 0.10 保持——闭环辨识给出穿越 14.6Hz、相位裕度 54°，本来就不慢；
+        //        kp=0.12 起动命令 4.84Nm 已超驱动限幅 4.51Nm（16.1A×0.28），kp=0.15 直接发散。
+        //      ki 1e-4→1.0 [1/s]——唯一真正缺的东西。稳态误差 10.4→0.01rad/s，
+        //        摩擦突加后约 0.2s 回到 ±1rad/s；相位裕度只从 54° 降到 48°。
+        //      kd 保持 0——对象是纯积分，微分先行(对测量微分)在此等效于降低回路增益，
+        //        仿真里 kd>0 反而掉速更深（与舵向 M3508 那个带阻尼的对象不同，别照搬）。
+        //      integral_limit 0→4.0 [Nm]——必须大于摩擦力矩，否则积分饱和在限幅值上、
+        //        误差无法归零；4.0Nm 已接近 MF7015-23T 峰值 3.8Nm，再大也没意义。
+        //      coef_a/coef_b 0→20/20——|err|≤20 全积分、20~40 递减、≥40 不积分，
+        //        兼作起动大误差(40rad/s)时的抗饱和，比关掉变速积分(超调 32%)好(27%)。
+        //   ④ 回放实机记录的真实摩擦曲线验证：旧参数 48% 时间低于 39rad/s、30% 低于 35rad/s、
+        //      最重摩擦段平均误差 10.43rad/s；新参数 10% 低于 39（且只在摩擦突加的瞬态）、
+        //      4% 低于 35、最重摩擦段平均误差 -0.09rad/s。起动 u 峰值 4.04Nm（未触限幅）。
+        //      裕度：a 700~1600、延时 2~5ms 范围内相位裕度 >35°、增益裕度 >7dB。
+        .pid_speed_setting = {
+            .kp = 0.10,                                      // 比例系数（闭环辨识复核：穿越 14.6Hz / 相位裕度 54°，保持）
+            .ki = 1.0,                                       // 积分系数 [1/s]（1e-4→1.0，消除摩擦掉速，见上②③）
+            .kd = 0,                                         // 微分系数（纯积分对象，微分先行只会等效降增益）
+            .integral_limit = 4.0,                           // 积分限幅阈值 [Nm]（0→4.0；必须 > 摩擦力矩，否则掉速归不了零）
+            .coef_a = 20,                                    // 变速积分参数 A（0→20，20~40rad/s 误差区间递减积分）
+            .coef_b = 20,                                    // 变速积分参数 B（0→20，兼作起动抗饱和）
+            .d_lpf_rc = 0,                                   // 微分滤波时间常数 RC (0 = 禁用)
+            .out_lpf_rc = 0,                                 // 输出滤波时间常数 RC (0 = 禁用)
+            .deadband = 0,                                   // 死区范围 (0 = 禁用)
+            .error_normalize_range = 0,                      // 误差归一化范围 (0 = 禁用, 需要 PID_ENABLE_ERROR_NORMALIZE)
+            .out_max = 0,                                    // 输出上限 (需要 PID_ENABLE_OUTPUT_LIMIT)
+            .out_min = 0,                                    // 输出下限 (需要 PID_ENABLE_OUTPUT_LIMIT)
+            .config_mask = PID_ENABLE_TRAPEZOID_INTEGRAL |   // 梯形积分
+                           PID_ENABLE_INTEGRAL_LIMIT |       // 积分限幅
+                           PID_ENABLE_CHANGING_INTEGRATION | // 变速积分
+                           PID_ENABLE_DERIVATIVE_ON_MEAS |   // 微分先行（kd=0，暂不生效，留作扩展）
+                           PID_ENABLE_DERIVATIVE_FILTER,     // 微分滤波
+        },
         .reload_count = 100,
         .fault_action = DAEMON_FAULT_NONE,
         .timeout_ms = 1, // CAN 发送超时(ms)
@@ -439,6 +531,8 @@ ITCM_RAM void AppChassisRun(void)
             MotorEnable(&(wheel_r_motor.base));
             rudder_r_motor_setref = 0;
             rudder_l_motor_setref = 0;
+            wheel_l_motor_setref = 0;
+            wheel_r_motor_setref = 0;
         }
         else if (gimbal2chassis_data.mode == g2c_gyro)
         {
@@ -446,8 +540,9 @@ ITCM_RAM void AppChassisRun(void)
             MotorEnable(&(rudder_r_motor.base));
             MotorEnable(&(wheel_l_motor.base));
             MotorEnable(&(wheel_r_motor.base));
-            rudder_r_motor_setref = -6;
-            rudder_l_motor_setref = -6;
+            rudder_r_motor_setref = 0;
+            rudder_l_motor_setref = 0;
+            wheel_r_motor_setref = 20;
         }
         else if (gimbal2chassis_data.mode == g2c_hole)
         {
@@ -455,15 +550,16 @@ ITCM_RAM void AppChassisRun(void)
             MotorEnable(&(rudder_r_motor.base));
             MotorEnable(&(wheel_l_motor.base));
             MotorEnable(&(wheel_r_motor.base));
-            rudder_r_motor_setref = 6;
-            rudder_l_motor_setref = 6;
+            rudder_r_motor_setref = 0;
+            rudder_l_motor_setref = 0;
+            wheel_r_motor_setref = 40;
         }
 
         // 设置
         MotorSetRef(&(rudder_l_motor.base), rudder_l_motor_setref);
         MotorSetRef(&(rudder_r_motor.base), rudder_r_motor_setref);
-        MotorSetRef(&(wheel_l_motor.base), 0.0f);
-        MotorSetRef(&(wheel_r_motor.base), 0.0f);
+        MotorSetRef(&(wheel_l_motor.base), wheel_l_motor_setref);
+        MotorSetRef(&(wheel_r_motor.base), wheel_r_motor_setref);
     }
 
     // 电机发送
@@ -475,20 +571,20 @@ ITCM_RAM void AppChassisRun(void)
     //   1 位置  2 速度  3 力矩  4 积分项 i_out  5 比例项 p_out  6 PID 总输出
     //   7 积分限幅(常量)  8 实际 ref（正常=setref，寻零期间=扫描速度给定）
     // ch9~12 为本次整定补充：整定是否到位可直接看 9/12，若后续加微分再看 10。
-    VofaSetChannel(1, rudder_r_motor.base.data_all.data.position);
-    VofaSetChannel(2, rudder_r_motor.base.data_all.data.speed);
-    VofaSetChannel(3, rudder_r_motor.base.data_all.data.torque);
-    VofaSetChannel(4, rudder_r_motor.base.controller.pid_speed.i_out);
-    VofaSetChannel(5, rudder_r_motor.base.controller.pid_speed.p_out);
-    VofaSetChannel(6, rudder_r_motor.base.controller.pid_speed.output);
-    VofaSetChannel(7, rudder_r_motor.base.controller.pid_speed.integral_limit);
-    VofaSetChannel(8, rudder_r_motor.base.controller.ref);                // 驱动实际用的 ref（寻零时是扫描给定）
-    VofaSetChannel(9, rudder_r_motor.base.controller.pid_speed.error);    // 误差 ref-measure
-    VofaSetChannel(10, rudder_r_motor.base.controller.pid_speed.d_out);   // 微分项（kd=0 时应恒 0）
-    VofaSetChannel(11, rudder_r_motor.base.controller.pid_speed.measure); // PID 实际用的反馈速度
-    VofaSetChannel(12, rudder_r_motor.base.controller.output);            // 最终电流/力矩命令（已含方向与量纲换算）
-    VofaSetChannel(13, rudder_r_motor.base.controller.pid_angle.error);
-    VofaSetChannel(14, rudder_r_motor.base.controller.pid_angle.output);
+    VofaSetChannel(1, wheel_r_motor.base.data_all.data.position);
+    VofaSetChannel(2, wheel_r_motor.base.data_all.data.speed);
+    VofaSetChannel(3, wheel_r_motor.base.data_all.data.torque);
+    VofaSetChannel(4, wheel_r_motor.base.controller.pid_speed.i_out);
+    VofaSetChannel(5, wheel_r_motor.base.controller.pid_speed.p_out);
+    VofaSetChannel(6, wheel_r_motor.base.controller.pid_speed.output);
+    VofaSetChannel(7, wheel_r_motor.base.controller.pid_speed.integral_limit);
+    VofaSetChannel(8, wheel_r_motor.base.controller.ref);                // 驱动实际用的 ref（寻零时是扫描给定）
+    VofaSetChannel(9, wheel_r_motor.base.controller.pid_speed.error);    // 误差 ref-measure
+    VofaSetChannel(10, wheel_r_motor.base.controller.pid_speed.d_out);   // 微分项（kd=0 时应恒 0）
+    VofaSetChannel(11, wheel_r_motor.base.controller.pid_speed.measure); // PID 实际用的反馈速度
+    VofaSetChannel(12, wheel_r_motor.base.controller.output);            // 最终电流/力矩命令（已含方向与量纲换算）
+    VofaSetChannel(13, wheel_r_motor.base.controller.pid_angle.error);
+    VofaSetChannel(14, wheel_r_motor.base.controller.pid_angle.output);
     VofaSend();
 
     CommSend(&gimbal_comm, (uint8_t *)&chassis2gimbal_data); // 云台通信：每周期发一帧（接收已由 CAN 中断写入 gimbal_rx_data）
