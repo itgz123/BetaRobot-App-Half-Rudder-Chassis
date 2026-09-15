@@ -36,8 +36,8 @@
 #define DRV_LKMOTOR_BROADCAST_USED                 // LK 广播模式驱动（一拖四 V2.35，0x280）
 #define DRV_AXIS_MIT_LITE_USED                     // 单轴 MIT 关节控制
 #define DRV_CHASSIS_LITE_POSITION_OMNI_USED        // 全向/麦轮底盘运动学（lite 纯计算）
-#define DRV_CHASSIS_LITE_POSITION_HALF_RUDDER_USED // 半舵底盘运动学（2 组舵轮）
 #define DRV_CHASSIS_LITE_POSITION_ALL_RUDDER_USED  // 全舵底盘运动学（4 组舵轮，当前车未用）
+// 半舵运动学不在这里开：解算写在 app_chassis.c 本地（含"反向解归一化"等 app 专属策略）
 #define DAEMON_USED                                // Daemon 看门狗
 #define VOFA_USED                                  // VOFA+ JustFloat 遥测
 #define LIB_CRC_USED                               // 软件 CRC 计算（Direct/GenTable/TableCalc）

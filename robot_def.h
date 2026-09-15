@@ -13,4 +13,19 @@
 #define RUDDER_ZERO_OFFSET_L_DEG (0.0f)
 #define RUDDER_ZERO_OFFSET_R_DEG (60.0f)
 
+/*============================ 半舵底盘 运动学参数 ============================*/
+/* 坐标系：x+ 向前，y+ 向左，w+ 逆时针（俯视）。
+ * 以下参数供 app_chassis.c 里的半舵正/逆解使用，单位统一为 m / rad。 */
+
+// 驱动轮：LK MF7015 直驱，无减速箱（减速比 1），故驱动速度 = 接触点线速度 / 轮半径
+#define CHASSIS_WHEEL_RADIUS (0.06f)   // 驱动轮半径 (m) ⚠️ TODO 实测（当前按 120mm 轮径估值）
+#define CHASSIS_DRIVE_REDUCTION (1.0f) // 驱动电机减速比（MF7015 直驱 = 1）
+
+// 舵轮组回转中心在车体系中的位置 (m)。解算槽位 [0]=左舵、[1]=右舵。
+// 两组前后位置相同（都装在中线附近）时 x 填同一个值，y 为 ±半轮距。
+#define CHASSIS_RUDDER_L_POS_X (0.0f)   // 左舵回转中心 x（前+）⚠️ TODO 实测
+#define CHASSIS_RUDDER_L_POS_Y (0.18f)  // 左舵回转中心 y（左+）⚠️ TODO 实测（半轮距）
+#define CHASSIS_RUDDER_R_POS_X (0.0f)   // 右舵回转中心 x（前+）⚠️ TODO 实测
+#define CHASSIS_RUDDER_R_POS_Y (-0.18f) // 右舵回转中心 y（左+）⚠️ TODO 实测（负半轮距）
+
 #endif // !__ROBOT_DEF_H
