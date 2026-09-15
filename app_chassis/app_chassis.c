@@ -382,7 +382,7 @@ void AppChassisInit(void)
                            PID_ENABLE_DERIVATIVE_FILTER,     // 微分滤波
         },
         .pid_angle_setting = {
-            .kp = 50,                                  // 比例系数（0.12→0.10，让位给微分阻尼）
+            .kp = 10,                                  // 比例系数（0.12→0.10，让位给微分阻尼）
             .ki = 0,                                   // 积分系数 [1/s]（0.15→0.20，加快慢摆收敛）
             .kd = 0.3,                                 // 微分系数（配合微分先行补相位裕度）
             .integral_limit = 0,                       // 积分限幅阈值（实测峰值 i_out≈1.47，负载 +50% 仍有余量）
@@ -461,7 +461,7 @@ void AppChassisInit(void)
                            PID_ENABLE_DERIVATIVE_FILTER,     // 微分滤波
         },
         .pid_angle_setting = {
-            .kp = 50,                                  // 比例系数（0.12→0.10，让位给微分阻尼）
+            .kp = 10,                                  // 比例系数（0.12→0.10，让位给微分阻尼）
             .ki = 0,                                   // 积分系数 [1/s]（0.15→0.20，加快慢摆收敛）
             .kd = 0.3,                                 // 微分系数（配合微分先行补相位裕度）
             .integral_limit = 0,                       // 积分限幅阈值（实测峰值 i_out≈1.47，负载 +50% 仍有余量）
