@@ -516,14 +516,14 @@ ITCM_RAM void AppChassisRun(void)
     // 判断
     if (lunxunjioazhun()) // 轮询校准
     {
-        if (gimbal2chassis_data.mode == g2c_stop)
+        if (gimbal2chassis_data.enabled == 0)
         {
             MotorDisable(&(rudder_l_motor.base));
             MotorDisable(&(rudder_r_motor.base));
             MotorDisable(&(wheel_l_motor.base));
             MotorDisable(&(wheel_r_motor.base));
         }
-        else if (gimbal2chassis_data.mode == g2c_normal)
+        else
         {
             MotorEnable(&(rudder_l_motor.base));
             MotorEnable(&(rudder_r_motor.base));
@@ -533,26 +533,6 @@ ITCM_RAM void AppChassisRun(void)
             rudder_l_motor_setref = 0;
             wheel_l_motor_setref = 0;
             wheel_r_motor_setref = 0;
-        }
-        else if (gimbal2chassis_data.mode == g2c_gyro)
-        {
-            MotorEnable(&(rudder_l_motor.base));
-            MotorEnable(&(rudder_r_motor.base));
-            MotorEnable(&(wheel_l_motor.base));
-            MotorEnable(&(wheel_r_motor.base));
-            rudder_r_motor_setref = 0;
-            rudder_l_motor_setref = 0;
-            wheel_r_motor_setref = 20;
-        }
-        else if (gimbal2chassis_data.mode == g2c_hole)
-        {
-            MotorEnable(&(rudder_l_motor.base));
-            MotorEnable(&(rudder_r_motor.base));
-            MotorEnable(&(wheel_l_motor.base));
-            MotorEnable(&(wheel_r_motor.base));
-            rudder_r_motor_setref = 0;
-            rudder_l_motor_setref = 0;
-            wheel_r_motor_setref = 40;
         }
 
         // 设置
