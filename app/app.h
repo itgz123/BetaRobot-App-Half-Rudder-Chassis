@@ -16,9 +16,16 @@ void function_in_main_c(void);
 #pragma pack(push, 1)
 /* 云台→底盘（13B）与底盘→云台（12B）各一结构体；两端 app.h 的定义须字节对齐
  * （COMM_DEF 内 _Static_assert 校验 sizeof == 约定线长）。 */
+typedef enum : uint8_t
+{
+    robot_mode_stop = 0,
+    robot_mode_normal = 1,
+    robot_mode_gyro = 2,
+    robot_mode_hole = 3,
+} robot_mode; // 状态机 参考`app/half_rudder_gimbal/README.md`
 typedef struct
 {
-    uint8_t enabled; // 0：失能，1：使能
+    robot_mode enabled;
     // 设定速度
     float vx;
     float vy;

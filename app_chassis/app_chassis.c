@@ -696,7 +696,7 @@ ITCM_RAM void AppChassisRun(void)
     // 判断
     if (lunxunjioazhun()) // 轮询校准；校准期间由该函数自行给扫描速度，此处不解算
     {
-        if (gimbal2chassis_data.enabled == 0)
+        if (gimbal2chassis_data.enabled == robot_mode_stop)
         {
             MotorDisable(&(rudder_l_motor.base));
             MotorDisable(&(rudder_r_motor.base));
