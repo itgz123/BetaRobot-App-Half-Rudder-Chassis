@@ -13,7 +13,7 @@
 #include "app_chassis.h"
 
 /* 日志实例定义 */
-LOG_INSTANCE_DEF(g_app_log, "app", 0); // app 层日志实例
+LOG_INSTANCE_DEF(g_app_log, "app", 255); // app 层日志实例
 
 // 任务STACK大小
 #define CHASSIS_STACK_SIZE 1024
