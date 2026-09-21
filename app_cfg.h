@@ -18,6 +18,7 @@
 #define LIB_MATH_TRIG_LUT_SPEED 1                 // LUT 速度：0=四分之一表(省flash/象限映射) 1=2π全周期表(无象限映射/更快)
 #define LIB_MATH_TRIG_LUT_PREC 3                  // LUT 精度：0=低 1=中 2=高 3=满精度(误差<ε=2^-23)
 #define BSP_FREERTOS_USED                         // FreeRTOS 静态创建封装
+#define BSP_FREERTOS_STATUS_USED                  // FreeRTOS 运行状态（钩子 + 空闲任务状态快照，调试器读 bsp_freertos_status）
 #define BSP_SPI_USED                              // SPI (BMI088 / LCD)
 #define BSP_TIM_USED                              // 定时器 (PWM / 编码器)
 #define BSP_USART_USED                            // 串口 (SBUS / VOFA / RS485)
@@ -42,6 +43,7 @@
 #define VOFA_USED            // VOFA+ JustFloat 遥测
 #define LIB_CRC_USED         // 软件 CRC 计算（Direct/GenTable/TableCalc）
 #define LIB_CRC_TABLES_USED  // 软件 CRC 常用算法 Flash 表（lib_crc_tables.c）
+#define LIB_HAMMING_USED     // 汉明码纠错（标准 / 扩展缩短 SECDED，任意 bit 长度）
 #define DRV_COMM_USED        //
 #define LIB_FORMAT_USED      // 快速格式化（零除法整数转换，bsp_log 依赖）
 #define BSP_LOG_USED         // 日志输出

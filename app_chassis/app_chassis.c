@@ -10,7 +10,7 @@
 //
 #include "drv_comm.h"
 #include "comm_media_can_idseq.h"
-#include "comm_proto_custom.h"
+#include "comm_proto_ext.h"
 //
 #include "lib_math.h"
 //
@@ -46,12 +46,18 @@ GPIO_INSTANCE_DEF(rudder_l_gate_io);
 GPIO_INSTANCE_DEF(rudder_r_gate_io);
 
 /*============================ 云台通信 ============================*/
-/* 云台通信对话：CAN1 / IDSEQ / PROTO_CUSTOM（帧 = [0xA5][seq][payload N][CRC8][0x5A]）。
+/* 云台通信对话：CAN1 / IDSEQ / PROTO_EXT（帧 = [0xA5][seq][汉明编码区 E][CRC8][0x5A]）。
+ * 在 CUSTOM 的定界 + CRC 之上先过一级扩展缩短汉明码（SECDED，m=7）：每块纠 1 位、检 2 位，
+ * CAN 差分对上的偶发位翻转不再直接丢掉这一拍控制帧；CRC 仍保留，用来复核汉明的纠错结果
+ * （见 comm_proto_ext.h）。分块与帧长全在编译期定死，运行期只按已算好的 cfg 逐块编解码。
+ * 云台侧须同用 PROTO_EXT（PROTO_EXT 的帧格式与 PROTO_CUSTOM 不同，两端协议名必须一致）。
  * 底盘侧 tx_id=0x110 段、rx_id=0x100 段（云台侧对调）；ID 段与 CAN1 现有占用
  * （yaw RS05 0x001/0x0FD）及后续 3508 波盘（0x1FF/0x200/0x201~0x208）均不重叠。
- * 收发 payload 分别为 chassis2gimbal_data_t(12B) / gimbal2chassis_data_t(13B)；
+ * 收发 payload 分别为 gimbal2chassis_data_t(13B) / chassis2gimbal_data_t(12B)：
+ *   13B → 1 块 × 14B 编码区，整帧 18B（3 个 CAN 包）
+ *   12B → 1 块 × 13B 编码区，整帧 17B（3 个 CAN 包）
  * CAN1 上挂有经典 CAN 的 RS05，故 mode 必须 CLASSIC（不可用 FD）。 */
-COMM_DEF(gimbal_comm, MEDIA_CAN_IDSEQ, CUSTOM, CUSTOM, gimbal2chassis_data_t, 13, chassis2gimbal_data_t, 12, UNPACK_IN_ISR);
+COMM_DEF(gimbal_comm, MEDIA_CAN_IDSEQ, EXT, EXT, gimbal2chassis_data_t, 13, chassis2gimbal_data_t, 12, UNPACK_IN_ISR);
 
 static gimbal2chassis_data_t gimbal2chassis_data = {0}; // 云台→底盘（on_frame 同步拷贝）
 static chassis2gimbal_data_t chassis2gimbal_data = {0}; // 底盘→云台（业务填写后 CommSend）
