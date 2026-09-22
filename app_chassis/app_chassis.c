@@ -322,6 +322,23 @@ static void GimbalRecvOnFrame(const uint8_t *payload)
     memcpy(&gimbal2chassis_data, payload, sizeof(gimbal2chassis_data));
 }
 
+/**
+ * @brief 云台链路是否在线
+ * @retval 1 在线（daemon_reload ms 内收到过完整合法帧）；0 掉线
+ * @note 看门狗实例内嵌在 media 基类里（见 comm_media.h），收帧时由 comm 层统一喂狗，
+ *       阈值为 CommConfig.daemon_reload（本实例 10ms，对端每 2ms 发一帧）。
+ *       未登记看门狗（daemon == NULL）按"在线"处理：不监控就不该拦控制。
+ * @note DaemonIsOnline 判的是 temp_count > 0；DaemonConfig 把 temp_count 初始化成
+ *       reload_count，故上电后前 10 个 daemon 周期（10ms）报在线、之后落回离线。
+ *       这段窗口由 gimbal2chassis_data.enabled 的初值（robot_mode_stop）兜底，
+ *       不会出现"没收到任何帧却带速起步"。
+ */
+static uint8_t GimbalCommIsOnline(void)
+{
+    CommMedia *media = (CommMedia *)gimbal_comm.media; // 首成员即 CommMedia 基类，直接转
+    return (media != NULL && media->daemon != NULL) ? DaemonIsOnline(media->daemon) : 1;
+}
+
 void AppChassisInit(void)
 {
     // 注册 CAN 实例（四个电机共用 CAN_2）
@@ -702,7 +719,12 @@ ITCM_RAM void AppChassisRun(void)
     // 判断
     if (lunxunjioazhun()) // 轮询校准；校准期间由该函数自行给扫描速度，此处不解算
     {
-        if (gimbal2chassis_data.enabled == robot_mode_stop)
+        /* 云台链路看门狗：掉线与云台主动失能走同一条停车路径（四个给定清零 + 四电机失能）。
+         * 判据放在最前：掉线时最后一帧下的无论是"使能 + 速度"还是别的，一律不予执行——
+         * 否则车会捧着几秒前的那帧速度指令一直跑下去。
+         * 注：只拦控制，不拦上面的轮询校准——标定时云台常未上电，若一并拦掉，
+         *     底盘会永远停在"未标定"状态起不了步。 */
+        if ((!GimbalCommIsOnline()) || (gimbal2chassis_data.enabled == robot_mode_stop))
         {
             MotorDisable(&(rudder_l_motor.base));
             MotorDisable(&(rudder_r_motor.base));
@@ -713,6 +735,14 @@ ITCM_RAM void AppChassisRun(void)
             rudder_r_motor_setref = 0;
             wheel_l_motor_setref = 0;
             wheel_r_motor_setref = 0;
+            /* 收到的指令也一并作废，防止"链路刚恢复"那一拍：喂狗（置在线）与解包写
+             * gimbal2chassis_data 之间有微秒级窗口——本任务若正好插在中间，会拿着掉线
+             * 前的旧帧当新帧执行。清零后该窗口最多执行一拍"停车"，失效方向是安全的
+             * （若插空失败、读到的是 ISR 刚写好的新帧，那本就是一帧可用指令）。 */
+            gimbal2chassis_data.enabled = robot_mode_stop;
+            gimbal2chassis_data.vx = 0;
+            gimbal2chassis_data.vy = 0;
+            gimbal2chassis_data.w = 0;
         }
         else
         {
