@@ -329,7 +329,7 @@ static void GimbalRecvOnFrame(const uint8_t *payload)
  *       阈值为 CommConfig.daemon_reload（本实例 10ms，对端每 2ms 发一帧）。
  *       未登记看门狗（daemon == NULL）按"在线"处理：不监控就不该拦控制。
  * @note DaemonIsOnline 判的是 temp_count > 0；DaemonConfig 把 temp_count 初始化成
- *       reload_count，故上电后前 10 个 daemon 周期（10ms）报在线、之后落回离线。
+ *       reload_count，故上电后前 10ms 报在线、之后（仍未收到帧）落回离线。
  *       这段窗口由 gimbal2chassis_data.enabled 的初值（robot_mode_stop）兜底，
  *       不会出现"没收到任何帧却带速起步"。
  */

@@ -54,8 +54,8 @@
 
 // UART 选择
 #if DEVELOPMENT_BOARD == DM_MC02
-#define VOFA_UART UART_7
-// #define LOG_UART UART_7
+// #define VOFA_UART UART_7
+#define LOG_UART UART_7
 #elif DEVELOPMENT_BOARD == DJI_C // UART_1:4pin,UART_6:3pin
 // #define VOFA_UART
 #define LOG_UART UART_6
