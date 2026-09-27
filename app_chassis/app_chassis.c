@@ -356,22 +356,23 @@ void AppChassisInit(void)
         .speed_lpf_rc = 0.02f,
         .position_offset = 0,
         .torque_constant = 1, // M3508 电流→力矩系数，待标定
-        .controller_setting = {
-            .loop_type = MOTOR_LOOP_ANGLE | MOTOR_LOOP_SPEED, // TODO: 后续改为位置/速度环
-            .feedback_direction = MOTOR_DIRECTION_NORMAL,     // 反馈方向
-            .motor_direction = MOTOR_DIRECTION_NORMAL,        // 输出方向
-            .position_mode = MOTOR_POSITION_WRAP,             // 开环占位，不用位置环
-            .angle_limit_max = M_PI * STEER_GEAR_RATIO,
-            .angle_limit_min = -M_PI * STEER_GEAR_RATIO,
-            .speed_feedforward_src = MOTOR_FEEDFORWARD_DISABLE,    // 速度前馈来源
-            .position_feedforward_src = MOTOR_FEEDFORWARD_DISABLE, // 位置前馈来源
-            .speed_feedforward_ptr = NULL,                         // 速度前馈指针
-            .position_feedforward_ptr = NULL,                      // 位置前馈指针
-            .angle_src = MOTOR_FEEDBACK_MOTOR,                     // 角度反馈来源
-            .speed_src = MOTOR_FEEDBACK_MOTOR,                     // 速度反馈来源
-            .angle_external_ptr = NULL,                            // 外部角度反馈指针
-            .speed_external_ptr = NULL,                            // 外部速度反馈指针
-        },
+        .controller_setting =
+            {
+                .loop_type = MOTOR_LOOP_ANGLE | MOTOR_LOOP_SPEED, // TODO: 后续改为位置/速度环
+                .feedback_direction = MOTOR_DIRECTION_NORMAL,     // 反馈方向
+                .motor_direction = MOTOR_DIRECTION_NORMAL,        // 输出方向
+                .position_mode = MOTOR_POSITION_WRAP,             // 开环占位，不用位置环
+                .angle_limit_max = M_PI * STEER_GEAR_RATIO,
+                .angle_limit_min = -M_PI * STEER_GEAR_RATIO,
+                .speed_feedforward_src = MOTOR_FEEDFORWARD_DISABLE,    // 速度前馈来源
+                .position_feedforward_src = MOTOR_FEEDFORWARD_DISABLE, // 位置前馈来源
+                .speed_feedforward_ptr = NULL,                         // 速度前馈指针
+                .position_feedforward_ptr = NULL,                      // 位置前馈指针
+                .angle_src = MOTOR_FEEDBACK_MOTOR,                     // 角度反馈来源
+                .speed_src = MOTOR_FEEDBACK_MOTOR,                     // 速度反馈来源
+                .angle_external_ptr = NULL,                            // 外部角度反馈指针
+                .speed_external_ptr = NULL,                            // 外部速度反馈指针
+            },
         // 速度环整定依据 ignore/vofa+.csv（20s，0/30/60 rad/s 阶跃，2ms 周期，kp=0.12/ki=0.15 采得）：
         //   实测超调 30~38%，0→30 后还残留约 1rad/s 的慢摆（整定 1.2~4.8s）。
         //   由该数据辨识被控对象：Kt/J≈495 rad/s²/A、B/J≈3 /s、恒值负载≈1.2A、回路延迟≈6ms，
@@ -385,41 +386,43 @@ void AppChassisInit(void)
         //   kd 量纲：d_out = kd*(last_measure-measure)/dt，kd=0.002 即"每 2ms 速度变化 1rad/s 给 1A 阻尼"；
         //   实测速度噪声仅 ~0.045rad/s，经 4ms 微分滤波后噪声电流 <0.03A，可忽略。
         //   ⚠️ 积分语义：lib_pid 已修正为 i_out += ki*error*dt，ki 单位是"每秒"，不随调用频率变。
-        .pid_speed_setting = {
-            .kp = 0.10,                                      // 比例系数（0.12→0.10，让位给微分阻尼）
-            .ki = 0.20,                                      // 积分系数 [1/s]（0.15→0.20，加快慢摆收敛）
-            .kd = 0.002,                                     // 微分系数（配合微分先行补相位裕度）
-            .integral_limit = 2.5,                           // 积分限幅阈值（实测峰值 i_out≈1.47，负载 +50% 仍有余量）
-            .coef_a = 20,                                    // 变速积分参数 A (0 = 禁用)
-            .coef_b = 20,                                    // 变速积分参数 B
-            .d_lpf_rc = 0.004,                               // 微分滤波时间常数 RC (0 = 禁用)
-            .out_lpf_rc = 0,                                 // 输出滤波时间常数 RC (0 = 禁用)
-            .deadband = 0,                                   // 死区范围 (0 = 禁用)
-            .error_normalize_range = 0,                      // 误差归一化范围 (0 = 禁用, 需要 PID_ENABLE_ERROR_NORMALIZE)
-            .out_max = 0,                                    // 输出上限 (需要 PID_ENABLE_OUTPUT_LIMIT)
-            .out_min = 0,                                    // 输出下限 (需要 PID_ENABLE_OUTPUT_LIMIT)
-            .config_mask = PID_ENABLE_TRAPEZOID_INTEGRAL |   // 梯形积分
-                           PID_ENABLE_INTEGRAL_LIMIT |       // 积分限幅
-                           PID_ENABLE_CHANGING_INTEGRATION | // 变速积分
-                           PID_ENABLE_DERIVATIVE_ON_MEAS |   // 微分先行（避免目标阶跃的微分冲击）
-                           PID_ENABLE_DERIVATIVE_FILTER,     // 微分滤波
-        },
-        .pid_angle_setting = {
-            .kp = 10,                                  // 比例系数（0.12→0.10，让位给微分阻尼）
-            .ki = 0,                                   // 积分系数 [1/s]（0.15→0.20，加快慢摆收敛）
-            .kd = 0.3,                                 // 微分系数（配合微分先行补相位裕度）
-            .integral_limit = 0,                       // 积分限幅阈值（实测峰值 i_out≈1.47，负载 +50% 仍有余量）
-            .coef_a = 0,                               // 变速积分参数 A (0 = 禁用)
-            .coef_b = 0,                               // 变速积分参数 B
-            .d_lpf_rc = 0,                             // 微分滤波时间常数 RC (0 = 禁用)
-            .out_lpf_rc = 0,                           // 输出滤波时间常数 RC (0 = 禁用)
-            .deadband = 0,                             // 死区范围 (0 = 禁用)
-            .error_normalize_range = 0,                // 误差归一化范围 (0 = 禁用, 需要 PID_ENABLE_ERROR_NORMALIZE)
-            .out_max = 0,                              // 输出上限 (需要 PID_ENABLE_OUTPUT_LIMIT)
-            .out_min = 0,                              // 输出下限 (需要 PID_ENABLE_OUTPUT_LIMIT)
-            .config_mask = PID_ENABLE_ERROR_NORMALIZE, // 启用误差归一化
+        .pid_speed_setting =
+            {
+                .kp = 0.10,                 // 比例系数（0.12→0.10，让位给微分阻尼）
+                .ki = 0.20,                 // 积分系数 [1/s]（0.15→0.20，加快慢摆收敛）
+                .kd = 0.002,                // 微分系数（配合微分先行补相位裕度）
+                .integral_limit = 2.5,      // 积分限幅阈值（实测峰值 i_out≈1.47，负载 +50% 仍有余量）
+                .coef_a = 20,               // 变速积分参数 A (0 = 禁用)
+                .coef_b = 20,               // 变速积分参数 B
+                .d_lpf_rc = 0.004,          // 微分滤波时间常数 RC (0 = 禁用)
+                .out_lpf_rc = 0,            // 输出滤波时间常数 RC (0 = 禁用)
+                .deadband = 0,              // 死区范围 (0 = 禁用)
+                .error_normalize_range = 0, // 误差归一化范围 (0 = 禁用, 需要 PID_ENABLE_ERROR_NORMALIZE)
+                .out_max = 0,               // 输出上限 (需要 PID_ENABLE_OUTPUT_LIMIT)
+                .out_min = 0,               // 输出下限 (需要 PID_ENABLE_OUTPUT_LIMIT)
+                .config_mask = PID_ENABLE_TRAPEZOID_INTEGRAL |   // 梯形积分
+                               PID_ENABLE_INTEGRAL_LIMIT |       // 积分限幅
+                               PID_ENABLE_CHANGING_INTEGRATION | // 变速积分
+                               PID_ENABLE_DERIVATIVE_ON_MEAS |   // 微分先行（避免目标阶跃的微分冲击）
+                               PID_ENABLE_DERIVATIVE_FILTER,     // 微分滤波
+            },
+        .pid_angle_setting =
+            {
+                .kp = 10,                                  // 比例系数（0.12→0.10，让位给微分阻尼）
+                .ki = 0,                                   // 积分系数 [1/s]（0.15→0.20，加快慢摆收敛）
+                .kd = 0.3,                                 // 微分系数（配合微分先行补相位裕度）
+                .integral_limit = 0,                       // 积分限幅阈值（实测峰值 i_out≈1.47，负载 +50% 仍有余量）
+                .coef_a = 0,                               // 变速积分参数 A (0 = 禁用)
+                .coef_b = 0,                               // 变速积分参数 B
+                .d_lpf_rc = 0,                             // 微分滤波时间常数 RC (0 = 禁用)
+                .out_lpf_rc = 0,                           // 输出滤波时间常数 RC (0 = 禁用)
+                .deadband = 0,                             // 死区范围 (0 = 禁用)
+                .error_normalize_range = 0,                // 误差归一化范围 (0 = 禁用, 需要 PID_ENABLE_ERROR_NORMALIZE)
+                .out_max = 0,                              // 输出上限 (需要 PID_ENABLE_OUTPUT_LIMIT)
+                .out_min = 0,                              // 输出下限 (需要 PID_ENABLE_OUTPUT_LIMIT)
+                .config_mask = PID_ENABLE_ERROR_NORMALIZE, // 启用误差归一化
 
-        },
+            },
         .reload_count = 100,
         .fault_action = DAEMON_FAULT_NONE,
         .timeout_ms = 1, // CAN 发送超时(ms)
@@ -435,22 +438,23 @@ void AppChassisInit(void)
         .speed_lpf_rc = 0.02f,
         .position_offset = 0,
         .torque_constant = 1, // M3508 电流→力矩系数，待标定
-        .controller_setting = {
-            .loop_type = MOTOR_LOOP_ANGLE | MOTOR_LOOP_SPEED, // TODO: 后续改为位置/速度环
-            .feedback_direction = MOTOR_DIRECTION_NORMAL,     // 反馈方向
-            .motor_direction = MOTOR_DIRECTION_NORMAL,        // 输出方向
-            .position_mode = MOTOR_POSITION_WRAP,             // 开环占位，不用位置环
-            .angle_limit_max = M_PI * STEER_GEAR_RATIO,
-            .angle_limit_min = -M_PI * STEER_GEAR_RATIO,
-            .speed_feedforward_src = MOTOR_FEEDFORWARD_DISABLE,    // 速度前馈来源
-            .position_feedforward_src = MOTOR_FEEDFORWARD_DISABLE, // 位置前馈来源
-            .speed_feedforward_ptr = NULL,                         // 速度前馈指针
-            .position_feedforward_ptr = NULL,                      // 位置前馈指针
-            .angle_src = MOTOR_FEEDBACK_MOTOR,                     // 角度反馈来源
-            .speed_src = MOTOR_FEEDBACK_MOTOR,                     // 速度反馈来源
-            .angle_external_ptr = NULL,                            // 外部角度反馈指针
-            .speed_external_ptr = NULL,                            // 外部速度反馈指针
-        },
+        .controller_setting =
+            {
+                .loop_type = MOTOR_LOOP_ANGLE | MOTOR_LOOP_SPEED, // TODO: 后续改为位置/速度环
+                .feedback_direction = MOTOR_DIRECTION_NORMAL,     // 反馈方向
+                .motor_direction = MOTOR_DIRECTION_NORMAL,        // 输出方向
+                .position_mode = MOTOR_POSITION_WRAP,             // 开环占位，不用位置环
+                .angle_limit_max = M_PI * STEER_GEAR_RATIO,
+                .angle_limit_min = -M_PI * STEER_GEAR_RATIO,
+                .speed_feedforward_src = MOTOR_FEEDFORWARD_DISABLE,    // 速度前馈来源
+                .position_feedforward_src = MOTOR_FEEDFORWARD_DISABLE, // 位置前馈来源
+                .speed_feedforward_ptr = NULL,                         // 速度前馈指针
+                .position_feedforward_ptr = NULL,                      // 位置前馈指针
+                .angle_src = MOTOR_FEEDBACK_MOTOR,                     // 角度反馈来源
+                .speed_src = MOTOR_FEEDBACK_MOTOR,                     // 速度反馈来源
+                .angle_external_ptr = NULL,                            // 外部角度反馈指针
+                .speed_external_ptr = NULL,                            // 外部速度反馈指针
+            },
         // 速度环整定依据 ignore/vofa+.csv（20s，0/30/60 rad/s 阶跃，2ms 周期，kp=0.12/ki=0.15 采得）：
         //   实测超调 30~38%，0→30 后还残留约 1rad/s 的慢摆（整定 1.2~4.8s）。
         //   由该数据辨识被控对象：Kt/J≈495 rad/s²/A、B/J≈3 /s、恒值负载≈1.2A、回路延迟≈6ms，
@@ -464,41 +468,43 @@ void AppChassisInit(void)
         //   kd 量纲：d_out = kd*(last_measure-measure)/dt，kd=0.002 即"每 2ms 速度变化 1rad/s 给 1A 阻尼"；
         //   实测速度噪声仅 ~0.045rad/s，经 4ms 微分滤波后噪声电流 <0.03A，可忽略。
         //   ⚠️ 积分语义：lib_pid 已修正为 i_out += ki*error*dt，ki 单位是"每秒"，不随调用频率变。
-        .pid_speed_setting = {
-            .kp = 0.10,                                      // 比例系数（0.12→0.10，让位给微分阻尼）
-            .ki = 0.20,                                      // 积分系数 [1/s]（0.15→0.20，加快慢摆收敛）
-            .kd = 0.002,                                     // 微分系数（配合微分先行补相位裕度）
-            .integral_limit = 2.5,                           // 积分限幅阈值（实测峰值 i_out≈1.47，负载 +50% 仍有余量）
-            .coef_a = 20,                                    // 变速积分参数 A (0 = 禁用)
-            .coef_b = 20,                                    // 变速积分参数 B
-            .d_lpf_rc = 0.004,                               // 微分滤波时间常数 RC (0 = 禁用)
-            .out_lpf_rc = 0,                                 // 输出滤波时间常数 RC (0 = 禁用)
-            .deadband = 0,                                   // 死区范围 (0 = 禁用)
-            .error_normalize_range = 0,                      // 误差归一化范围 (0 = 禁用, 需要 PID_ENABLE_ERROR_NORMALIZE)
-            .out_max = 0,                                    // 输出上限 (需要 PID_ENABLE_OUTPUT_LIMIT)
-            .out_min = 0,                                    // 输出下限 (需要 PID_ENABLE_OUTPUT_LIMIT)
-            .config_mask = PID_ENABLE_TRAPEZOID_INTEGRAL |   // 梯形积分
-                           PID_ENABLE_INTEGRAL_LIMIT |       // 积分限幅
-                           PID_ENABLE_CHANGING_INTEGRATION | // 变速积分
-                           PID_ENABLE_DERIVATIVE_ON_MEAS |   // 微分先行（避免目标阶跃的微分冲击）
-                           PID_ENABLE_DERIVATIVE_FILTER,     // 微分滤波
-        },
-        .pid_angle_setting = {
-            .kp = 10,                                  // 比例系数（0.12→0.10，让位给微分阻尼）
-            .ki = 0,                                   // 积分系数 [1/s]（0.15→0.20，加快慢摆收敛）
-            .kd = 0.3,                                 // 微分系数（配合微分先行补相位裕度）
-            .integral_limit = 0,                       // 积分限幅阈值（实测峰值 i_out≈1.47，负载 +50% 仍有余量）
-            .coef_a = 0,                               // 变速积分参数 A (0 = 禁用)
-            .coef_b = 0,                               // 变速积分参数 B
-            .d_lpf_rc = 0,                             // 微分滤波时间常数 RC (0 = 禁用)
-            .out_lpf_rc = 0,                           // 输出滤波时间常数 RC (0 = 禁用)
-            .deadband = 0,                             // 死区范围 (0 = 禁用)
-            .error_normalize_range = 0,                // 误差归一化范围 (0 = 禁用, 需要 PID_ENABLE_ERROR_NORMALIZE)
-            .out_max = 0,                              // 输出上限 (需要 PID_ENABLE_OUTPUT_LIMIT)
-            .out_min = 0,                              // 输出下限 (需要 PID_ENABLE_OUTPUT_LIMIT)
-            .config_mask = PID_ENABLE_ERROR_NORMALIZE, // 启用误差归一化
+        .pid_speed_setting =
+            {
+                .kp = 0.10,                 // 比例系数（0.12→0.10，让位给微分阻尼）
+                .ki = 0.20,                 // 积分系数 [1/s]（0.15→0.20，加快慢摆收敛）
+                .kd = 0.002,                // 微分系数（配合微分先行补相位裕度）
+                .integral_limit = 2.5,      // 积分限幅阈值（实测峰值 i_out≈1.47，负载 +50% 仍有余量）
+                .coef_a = 20,               // 变速积分参数 A (0 = 禁用)
+                .coef_b = 20,               // 变速积分参数 B
+                .d_lpf_rc = 0.004,          // 微分滤波时间常数 RC (0 = 禁用)
+                .out_lpf_rc = 0,            // 输出滤波时间常数 RC (0 = 禁用)
+                .deadband = 0,              // 死区范围 (0 = 禁用)
+                .error_normalize_range = 0, // 误差归一化范围 (0 = 禁用, 需要 PID_ENABLE_ERROR_NORMALIZE)
+                .out_max = 0,               // 输出上限 (需要 PID_ENABLE_OUTPUT_LIMIT)
+                .out_min = 0,               // 输出下限 (需要 PID_ENABLE_OUTPUT_LIMIT)
+                .config_mask = PID_ENABLE_TRAPEZOID_INTEGRAL |   // 梯形积分
+                               PID_ENABLE_INTEGRAL_LIMIT |       // 积分限幅
+                               PID_ENABLE_CHANGING_INTEGRATION | // 变速积分
+                               PID_ENABLE_DERIVATIVE_ON_MEAS |   // 微分先行（避免目标阶跃的微分冲击）
+                               PID_ENABLE_DERIVATIVE_FILTER,     // 微分滤波
+            },
+        .pid_angle_setting =
+            {
+                .kp = 10,                                  // 比例系数（0.12→0.10，让位给微分阻尼）
+                .ki = 0,                                   // 积分系数 [1/s]（0.15→0.20，加快慢摆收敛）
+                .kd = 0.3,                                 // 微分系数（配合微分先行补相位裕度）
+                .integral_limit = 0,                       // 积分限幅阈值（实测峰值 i_out≈1.47，负载 +50% 仍有余量）
+                .coef_a = 0,                               // 变速积分参数 A (0 = 禁用)
+                .coef_b = 0,                               // 变速积分参数 B
+                .d_lpf_rc = 0,                             // 微分滤波时间常数 RC (0 = 禁用)
+                .out_lpf_rc = 0,                           // 输出滤波时间常数 RC (0 = 禁用)
+                .deadband = 0,                             // 死区范围 (0 = 禁用)
+                .error_normalize_range = 0,                // 误差归一化范围 (0 = 禁用, 需要 PID_ENABLE_ERROR_NORMALIZE)
+                .out_max = 0,                              // 输出上限 (需要 PID_ENABLE_OUTPUT_LIMIT)
+                .out_min = 0,                              // 输出下限 (需要 PID_ENABLE_OUTPUT_LIMIT)
+                .config_mask = PID_ENABLE_ERROR_NORMALIZE, // 启用误差归一化
 
-        },
+            },
         .reload_count = 100,
         .fault_action = DAEMON_FAULT_NONE,
         .timeout_ms = 1, // CAN 发送超时(ms)
@@ -521,22 +527,23 @@ void AppChassisInit(void)
         .speed_lpf_enable = MOTOR_SPEED_LPF_ENABLE,
         .speed_lpf_rc = 0.004f,
         .position_offset = 0,
-        .controller_setting = {
-            .loop_type = MOTOR_LOOP_SPEED,                 // TODO: 后续改为速度/位置环
-            .feedback_direction = MOTOR_DIRECTION_REVERSE, // 反馈方向
-            .motor_direction = MOTOR_DIRECTION_REVERSE,    // 输出方向
-            .position_mode = MOTOR_POSITION_CONTINUOUS,    // 开环占位，不用位置环
-            .angle_limit_max = 0,
-            .angle_limit_min = 0,
-            .speed_feedforward_src = MOTOR_FEEDFORWARD_DISABLE,    // 速度前馈来源
-            .position_feedforward_src = MOTOR_FEEDFORWARD_DISABLE, // 位置前馈来源
-            .speed_feedforward_ptr = NULL,                         // 速度前馈指针
-            .position_feedforward_ptr = NULL,                      // 位置前馈指针
-            .angle_src = MOTOR_FEEDBACK_MOTOR,                     // 角度反馈来源
-            .speed_src = MOTOR_FEEDBACK_MOTOR,                     // 速度反馈来源
-            .angle_external_ptr = NULL,                            // 外部角度反馈指针
-            .speed_external_ptr = NULL,                            // 外部速度反馈指针
-        },
+        .controller_setting =
+            {
+                .loop_type = MOTOR_LOOP_SPEED,                 // TODO: 后续改为速度/位置环
+                .feedback_direction = MOTOR_DIRECTION_REVERSE, // 反馈方向
+                .motor_direction = MOTOR_DIRECTION_REVERSE,    // 输出方向
+                .position_mode = MOTOR_POSITION_CONTINUOUS,    // 开环占位，不用位置环
+                .angle_limit_max = 0,
+                .angle_limit_min = 0,
+                .speed_feedforward_src = MOTOR_FEEDFORWARD_DISABLE,    // 速度前馈来源
+                .position_feedforward_src = MOTOR_FEEDFORWARD_DISABLE, // 位置前馈来源
+                .speed_feedforward_ptr = NULL,                         // 速度前馈指针
+                .position_feedforward_ptr = NULL,                      // 位置前馈指针
+                .angle_src = MOTOR_FEEDBACK_MOTOR,                     // 角度反馈来源
+                .speed_src = MOTOR_FEEDBACK_MOTOR,                     // 速度反馈来源
+                .angle_external_ptr = NULL,                            // 外部角度反馈指针
+                .speed_external_ptr = NULL,                            // 外部速度反馈指针
+            },
         .pid_angle_setting = {},
         // 速度环整定依据 ignore/vofa+.csv（20s，给定恒 40rad/s，中途手动加摩擦，2ms 周期）——
         // 该 csv 是旧参数（kp=0.1/ki=1e-4/kd=1e-4/integral_limit=0/coef_a=coef_b=0）采得的，
@@ -565,25 +572,26 @@ void AppChassisInit(void)
         //      最重摩擦段平均误差 10.43rad/s；新参数 10% 低于 39（且只在摩擦突加的瞬态）、
         //      4% 低于 35、最重摩擦段平均误差 -0.09rad/s。起动 u 峰值 4.04Nm（未触限幅）。
         //      裕度：a 700~1600、延时 2~5ms 范围内相位裕度 >35°、增益裕度 >7dB。
-        .pid_speed_setting = {
-            .kp = 0.10,                                      // 比例系数（闭环辨识复核：穿越 14.6Hz / 相位裕度 54°，保持）
-            .ki = 1.0,                                       // 积分系数 [1/s]（1e-4→1.0，消除摩擦掉速，见上②③）
-            .kd = 0,                                         // 微分系数（纯积分对象，微分先行只会等效降增益）
-            .integral_limit = 4.0,                           // 积分限幅阈值 [Nm]（0→4.0；必须 > 摩擦力矩，否则掉速归不了零）
-            .coef_a = 20,                                    // 变速积分参数 A（0→20，20~40rad/s 误差区间递减积分）
-            .coef_b = 20,                                    // 变速积分参数 B（0→20，兼作起动抗饱和）
-            .d_lpf_rc = 0,                                   // 微分滤波时间常数 RC (0 = 禁用)
-            .out_lpf_rc = 0,                                 // 输出滤波时间常数 RC (0 = 禁用)
-            .deadband = 0,                                   // 死区范围 (0 = 禁用)
-            .error_normalize_range = 0,                      // 误差归一化范围 (0 = 禁用, 需要 PID_ENABLE_ERROR_NORMALIZE)
-            .out_max = 0,                                    // 输出上限 (需要 PID_ENABLE_OUTPUT_LIMIT)
-            .out_min = 0,                                    // 输出下限 (需要 PID_ENABLE_OUTPUT_LIMIT)
-            .config_mask = PID_ENABLE_TRAPEZOID_INTEGRAL |   // 梯形积分
-                           PID_ENABLE_INTEGRAL_LIMIT |       // 积分限幅
-                           PID_ENABLE_CHANGING_INTEGRATION | // 变速积分
-                           PID_ENABLE_DERIVATIVE_ON_MEAS |   // 微分先行（kd=0，暂不生效，留作扩展）
-                           PID_ENABLE_DERIVATIVE_FILTER,     // 微分滤波
-        },
+        .pid_speed_setting =
+            {
+                .kp = 0.10,                 // 比例系数（闭环辨识复核：穿越 14.6Hz / 相位裕度 54°，保持）
+                .ki = 1.0,                  // 积分系数 [1/s]（1e-4→1.0，消除摩擦掉速，见上②③）
+                .kd = 0,                    // 微分系数（纯积分对象，微分先行只会等效降增益）
+                .integral_limit = 4.0,      // 积分限幅阈值 [Nm]（0→4.0；必须 > 摩擦力矩，否则掉速归不了零）
+                .coef_a = 20,               // 变速积分参数 A（0→20，20~40rad/s 误差区间递减积分）
+                .coef_b = 20,               // 变速积分参数 B（0→20，兼作起动抗饱和）
+                .d_lpf_rc = 0,              // 微分滤波时间常数 RC (0 = 禁用)
+                .out_lpf_rc = 0,            // 输出滤波时间常数 RC (0 = 禁用)
+                .deadband = 0,              // 死区范围 (0 = 禁用)
+                .error_normalize_range = 0, // 误差归一化范围 (0 = 禁用, 需要 PID_ENABLE_ERROR_NORMALIZE)
+                .out_max = 0,               // 输出上限 (需要 PID_ENABLE_OUTPUT_LIMIT)
+                .out_min = 0,               // 输出下限 (需要 PID_ENABLE_OUTPUT_LIMIT)
+                .config_mask = PID_ENABLE_TRAPEZOID_INTEGRAL |   // 梯形积分
+                               PID_ENABLE_INTEGRAL_LIMIT |       // 积分限幅
+                               PID_ENABLE_CHANGING_INTEGRATION | // 变速积分
+                               PID_ENABLE_DERIVATIVE_ON_MEAS |   // 微分先行（kd=0，暂不生效，留作扩展）
+                               PID_ENABLE_DERIVATIVE_FILTER,     // 微分滤波
+            },
         .reload_count = 100,
         .fault_action = DAEMON_FAULT_NONE,
         .timeout_ms = 1, // CAN 发送超时(ms)
@@ -600,22 +608,23 @@ void AppChassisInit(void)
         .speed_lpf_enable = MOTOR_SPEED_LPF_ENABLE,
         .speed_lpf_rc = 0.004f,
         .position_offset = 0,
-        .controller_setting = {
-            .loop_type = MOTOR_LOOP_SPEED,                // TODO: 后续改为速度/位置环
-            .feedback_direction = MOTOR_DIRECTION_NORMAL, // 反馈方向
-            .motor_direction = MOTOR_DIRECTION_NORMAL,    // 输出方向
-            .position_mode = MOTOR_POSITION_CONTINUOUS,   // 开环占位，不用位置环
-            .angle_limit_max = 0,
-            .angle_limit_min = 0,
-            .speed_feedforward_src = MOTOR_FEEDFORWARD_DISABLE,    // 速度前馈来源
-            .position_feedforward_src = MOTOR_FEEDFORWARD_DISABLE, // 位置前馈来源
-            .speed_feedforward_ptr = NULL,                         // 速度前馈指针
-            .position_feedforward_ptr = NULL,                      // 位置前馈指针
-            .angle_src = MOTOR_FEEDBACK_MOTOR,                     // 角度反馈来源
-            .speed_src = MOTOR_FEEDBACK_MOTOR,                     // 速度反馈来源
-            .angle_external_ptr = NULL,                            // 外部角度反馈指针
-            .speed_external_ptr = NULL,                            // 外部速度反馈指针
-        },
+        .controller_setting =
+            {
+                .loop_type = MOTOR_LOOP_SPEED,                // TODO: 后续改为速度/位置环
+                .feedback_direction = MOTOR_DIRECTION_NORMAL, // 反馈方向
+                .motor_direction = MOTOR_DIRECTION_NORMAL,    // 输出方向
+                .position_mode = MOTOR_POSITION_CONTINUOUS,   // 开环占位，不用位置环
+                .angle_limit_max = 0,
+                .angle_limit_min = 0,
+                .speed_feedforward_src = MOTOR_FEEDFORWARD_DISABLE,    // 速度前馈来源
+                .position_feedforward_src = MOTOR_FEEDFORWARD_DISABLE, // 位置前馈来源
+                .speed_feedforward_ptr = NULL,                         // 速度前馈指针
+                .position_feedforward_ptr = NULL,                      // 位置前馈指针
+                .angle_src = MOTOR_FEEDBACK_MOTOR,                     // 角度反馈来源
+                .speed_src = MOTOR_FEEDBACK_MOTOR,                     // 速度反馈来源
+                .angle_external_ptr = NULL,                            // 外部角度反馈指针
+                .speed_external_ptr = NULL,                            // 外部速度反馈指针
+            },
         .pid_angle_setting = {},
         // 速度环整定依据 ignore/vofa+.csv（20s，给定恒 40rad/s，中途手动加摩擦，2ms 周期）——
         // 该 csv 是旧参数（kp=0.1/ki=1e-4/kd=1e-4/integral_limit=0/coef_a=coef_b=0）采得的，
@@ -644,25 +653,26 @@ void AppChassisInit(void)
         //      最重摩擦段平均误差 10.43rad/s；新参数 10% 低于 39（且只在摩擦突加的瞬态）、
         //      4% 低于 35、最重摩擦段平均误差 -0.09rad/s。起动 u 峰值 4.04Nm（未触限幅）。
         //      裕度：a 700~1600、延时 2~5ms 范围内相位裕度 >35°、增益裕度 >7dB。
-        .pid_speed_setting = {
-            .kp = 0.10,                                      // 比例系数（闭环辨识复核：穿越 14.6Hz / 相位裕度 54°，保持）
-            .ki = 1.0,                                       // 积分系数 [1/s]（1e-4→1.0，消除摩擦掉速，见上②③）
-            .kd = 0,                                         // 微分系数（纯积分对象，微分先行只会等效降增益）
-            .integral_limit = 4.0,                           // 积分限幅阈值 [Nm]（0→4.0；必须 > 摩擦力矩，否则掉速归不了零）
-            .coef_a = 20,                                    // 变速积分参数 A（0→20，20~40rad/s 误差区间递减积分）
-            .coef_b = 20,                                    // 变速积分参数 B（0→20，兼作起动抗饱和）
-            .d_lpf_rc = 0,                                   // 微分滤波时间常数 RC (0 = 禁用)
-            .out_lpf_rc = 0,                                 // 输出滤波时间常数 RC (0 = 禁用)
-            .deadband = 0,                                   // 死区范围 (0 = 禁用)
-            .error_normalize_range = 0,                      // 误差归一化范围 (0 = 禁用, 需要 PID_ENABLE_ERROR_NORMALIZE)
-            .out_max = 0,                                    // 输出上限 (需要 PID_ENABLE_OUTPUT_LIMIT)
-            .out_min = 0,                                    // 输出下限 (需要 PID_ENABLE_OUTPUT_LIMIT)
-            .config_mask = PID_ENABLE_TRAPEZOID_INTEGRAL |   // 梯形积分
-                           PID_ENABLE_INTEGRAL_LIMIT |       // 积分限幅
-                           PID_ENABLE_CHANGING_INTEGRATION | // 变速积分
-                           PID_ENABLE_DERIVATIVE_ON_MEAS |   // 微分先行（kd=0，暂不生效，留作扩展）
-                           PID_ENABLE_DERIVATIVE_FILTER,     // 微分滤波
-        },
+        .pid_speed_setting =
+            {
+                .kp = 0.10,                 // 比例系数（闭环辨识复核：穿越 14.6Hz / 相位裕度 54°，保持）
+                .ki = 1.0,                  // 积分系数 [1/s]（1e-4→1.0，消除摩擦掉速，见上②③）
+                .kd = 0,                    // 微分系数（纯积分对象，微分先行只会等效降增益）
+                .integral_limit = 4.0,      // 积分限幅阈值 [Nm]（0→4.0；必须 > 摩擦力矩，否则掉速归不了零）
+                .coef_a = 20,               // 变速积分参数 A（0→20，20~40rad/s 误差区间递减积分）
+                .coef_b = 20,               // 变速积分参数 B（0→20，兼作起动抗饱和）
+                .d_lpf_rc = 0,              // 微分滤波时间常数 RC (0 = 禁用)
+                .out_lpf_rc = 0,            // 输出滤波时间常数 RC (0 = 禁用)
+                .deadband = 0,              // 死区范围 (0 = 禁用)
+                .error_normalize_range = 0, // 误差归一化范围 (0 = 禁用, 需要 PID_ENABLE_ERROR_NORMALIZE)
+                .out_max = 0,               // 输出上限 (需要 PID_ENABLE_OUTPUT_LIMIT)
+                .out_min = 0,               // 输出下限 (需要 PID_ENABLE_OUTPUT_LIMIT)
+                .config_mask = PID_ENABLE_TRAPEZOID_INTEGRAL |   // 梯形积分
+                               PID_ENABLE_INTEGRAL_LIMIT |       // 积分限幅
+                               PID_ENABLE_CHANGING_INTEGRATION | // 变速积分
+                               PID_ENABLE_DERIVATIVE_ON_MEAS |   // 微分先行（kd=0，暂不生效，留作扩展）
+                               PID_ENABLE_DERIVATIVE_FILTER,     // 微分滤波
+            },
         .reload_count = 100,
         .fault_action = DAEMON_FAULT_NONE,
         .timeout_ms = 1, // CAN 发送超时(ms)
@@ -714,8 +724,10 @@ void AppChassisInit(void)
     BSP_ASSERT_APP_CALL(CommConfig(&gimbal_comm, &gimbal_comm_cfg));
 }
 
-ITCM_RAM void AppChassisRun(void)
+ITCM_RAM void AppChassisRun(float dt, uint64_t time_stamp)
 {
+    (void)dt;
+    (void)time_stamp;
     // 判断
     if (lunxunjioazhun()) // 轮询校准；校准期间由该函数自行给扫描速度，此处不解算
     {
@@ -785,13 +797,14 @@ ITCM_RAM void AppChassisRun(void)
     VofaSetChannel(14, wheel_r_motor.base.controller.pid_angle.output);
     // ch15~20 半舵解算观测：舵角看"目标 vs 实际"是否重合（不重合查符号/减速比），
     // 驱动看给定速度（拖动轮子时 17/20 应随实际转速变化方向一致）。
-    VofaSetChannel(15, rudder_l_motor_setref * STEER_GEAR_RATIO_INV);                             // 左舵目标舵角（舵轮侧 rad）
+    VofaSetChannel(15, rudder_l_motor_setref * STEER_GEAR_RATIO_INV); // 左舵目标舵角（舵轮侧 rad）
     VofaSetChannel(16, (float)rudder_l_motor.base.data_all.data.position * STEER_GEAR_RATIO_INV); // 左舵实际
-    VofaSetChannel(17, wheel_l_motor_setref);                                                     // 左驱动给定（电机侧 rad/s）
-    VofaSetChannel(18, rudder_r_motor_setref * STEER_GEAR_RATIO_INV);                             // 右舵目标舵角
+    VofaSetChannel(17, wheel_l_motor_setref);                         // 左驱动给定（电机侧 rad/s）
+    VofaSetChannel(18, rudder_r_motor_setref * STEER_GEAR_RATIO_INV); // 右舵目标舵角
     VofaSetChannel(19, (float)rudder_r_motor.base.data_all.data.position * STEER_GEAR_RATIO_INV); // 右舵实际
     VofaSetChannel(20, wheel_r_motor_setref);                                                     // 右驱动给定
     VofaSend();
 
-    CommSend(&gimbal_comm, (uint8_t *)&chassis2gimbal_data); // 云台通信：每周期发一帧（接收已由 CAN 中断写入 gimbal_rx_data）
+    CommSend(&gimbal_comm,
+             (uint8_t *)&chassis2gimbal_data); // 云台通信：每周期发一帧（接收已由 CAN 中断写入 gimbal_rx_data）
 }
