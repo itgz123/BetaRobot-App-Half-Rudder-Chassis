@@ -15,7 +15,8 @@
 
 /*============================ 半舵底盘 运动学参数 ============================*/
 /* 坐标系：x+ 向前，y+ 向左，w+ 逆时针（俯视）。
- * 以下参数供 app_chassis.c 里的半舵正/逆解使用，单位统一为 m / rad。 */
+ * 以下参数由 app_chassis.c 读入，用来配置 lib_chassis 的半舵内核（LibChassisHalfRudderInit）；
+ * 正/逆解本身在 lib_chassis 里，不在本工程。单位统一为 m / rad。 */
 
 // 驱动轮：LK MF7015 直驱，无减速箱（减速比 1），故驱动速度 = 接触点线速度 / 轮半径
 #define CHASSIS_WHEEL_RADIUS (0.05025f) // 驱动轮半径 (m)

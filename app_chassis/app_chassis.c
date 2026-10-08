@@ -13,6 +13,7 @@
 #include "comm_proto_ext.h"
 //
 #include "lib_math.h"
+#include "lib_chassis_half_rudder.h"
 //
 #include "bsp_gpio.h"
 #include "bsp_sys_status.h"
@@ -136,14 +137,15 @@ static uint8_t lunxunjioazhun()
 
     return 0;
 }
-/*============================ 半舵运动学（本地实现） ============================*/
-/* 坐标系：x+ 向前，y+ 向左，w+ 逆时针（俯视）。
- * 半舵 = 2 组舵轮（左/右），每组 1 个舵向电机 + 1 个驱动电机。
- *   逆解：底盘速度 (vx,vy,w) → 各组 {目标舵角, 驱动速度}
- *   正解：各组 {驱动速度, 当前舵角} → 底盘速度（里程计）
+/*============================ 半舵运动学（lib_chassis 内核） ============================*/
+/* 几何与解算全部交给 lib/lib_chassis 的 chassis_half_rudder 封装，本文件只做
+ * "电机侧 ↔ 轮侧"的单位换算与槽位映射，不再自带任何闭式解。
+ *   逆解：底盘速度 (vx,vy,w) → 2 组 {目标舵角, 驱动速度}
+ *   正解：2 组 {驱动速度, 当前舵角} → 底盘速度（里程计：2 组舵轮给 4 个方程解 3 个未知量）
  *
- * 单位：舵角用"舵轮侧 rad"（0 = 正前方，即光电门标定后的零点），到电机侧 × STEER_GEAR_RATIO；
- *       驱动速度进出都是"电机侧 rad/s"（已含减速比与轮径），可直接下发/读反馈。
+ * 约定（与内核一致）：舵角用"舵轮侧 rad"（0 = 正前方，即光电门标定后的零点），
+ *   车体系 x+ 前、y+ 左、w+ 逆时针；驱动速度在文件里进出都是"电机侧 rad/s"
+ *   （可直接下发/读反馈），只在跨内核接口时换算一次（见下面两个宏）。
  * 本层只做几何解算：舵向位置环（含积分）与驱动换向的执行都在电机驱动里。
  *
  * ⚠️ 符号约定（首次上车务必台架核对；错了就改对应电机的 motor_direction/feedback_direction）：
@@ -151,148 +153,32 @@ static uint8_t lunxunjioazhun()
  *   ② 轮向：驱动速度为正 == 沿当前舵角方向推动车体（不是"俯视逆时针"），
  *      故左右轮安装镜像时，两者所需的 motor_direction 往往相反。
  */
-#define HALF_RUDDER_NUM 2             // 舵轮组数：[0]=左, [1]=右
-#define HALF_RUDDER_SPEED_EPS (1e-4f) // 回转中心速度低于此值 [m/s] 视为"不需要转向"：保持当前朝向、驱动停转
+static LibChassisInstance_s s_chassis; // 内核实例：几何在 AppChassisInit 里一次性配好
 
-// 各组回转中心在车体系中的位置 (m)，见 robot_def.h
-static const float s_rudder_pos_x[HALF_RUDDER_NUM] = {CHASSIS_RUDDER_L_POS_X, CHASSIS_RUDDER_R_POS_X};
-static const float s_rudder_pos_y[HALF_RUDDER_NUM] = {CHASSIS_RUDDER_L_POS_Y, CHASSIS_RUDDER_R_POS_Y};
-
-typedef struct
-{
-    float steer_angle[HALF_RUDDER_NUM]; // 当前舵角 [rad]，舵轮侧
-    float drive_speed[HALF_RUDDER_NUM]; // 当前驱动速度 [rad/s]，电机侧
-} HalfRudderState_s;
-
-typedef struct
-{
-    float steer_target[HALF_RUDDER_NUM]; // 目标舵角 [rad]，舵轮侧
-    float drive_speed[HALF_RUDDER_NUM];  // 目标驱动速度 [rad/s]，电机侧
-} HalfRudderRef_s;
+/* 单位换算：内核的 wheel_speed 是"轮缘角速度 [rad/s]"，与电机侧差一个减速比。
+ * MF7015 直驱（减速比 1）时两式都是恒等，但保留成宏——换带减速箱的轮子时语义不用改。 */
+#define MOTOR_RADPS_TO_WHEEL_RADPS(v) ((v) / CHASSIS_DRIVE_REDUCTION)
+#define WHEEL_RADPS_TO_MOTOR_RADPS(v) ((v) * CHASSIS_DRIVE_REDUCTION)
 
 /**
- * @brief 舵向特殊归一化：在"φ"与"φ+180° 并反转驱动"两个等价解中，选离当前舵角最近的那个
- * @param phi_des 期望轮向 [rad]（atan2 结果，任意值）
- * @param phi_cur 当前舵角 [rad]（舵轮侧）
- * @param reverse 输出：1 = 选了反向解，驱动轮需反转；0 = 不反转。可为 NULL
- * @return 目标舵角 [rad] = phi_cur + 最近角差，|角差| ≤ 90°
- *
- * @note 这是"前进中突然要倒退时，舵向不用转、只把轮子反转"的关键：
- *       轮子朝 φ 正转 与 朝 φ+180° 反转 推车体是同一个运动，两种表示完全等价。
- *       不做归一化的话，vx 由正变负会让舵角目标直接跳 180°，舵轮要原地转半圈
- *       （M3508 经 8:1 减速转 180° 需数百 ms，这段时间车体运动完全失控）；
- *       归一化后目标始终是当前的 90° 内邻居，前进↔后退这种最常见的反向角差就是 0——
- *       舵向纹丝不动，只把驱动速度取反。
- */
-static float HalfRudderSteerNearest(float phi_des, float phi_cur, int8_t *reverse)
-{
-    float e = Lib_Math_WrapAngleNegPIToPI(phi_des - phi_cur); // (-π, π]
-    int8_t rev = 0;
-
-    if (FABS(e) > M_PI_2)
-    {
-        e -= (e > 0.0f) ? M_PI : -M_PI; // 改用反向解，角差缩到 90° 内
-        rev = 1;
-    }
-
-    if (reverse != NULL)
-        *reverse = rev;
-
-    return phi_cur + e;
-}
-
-/**
- * @brief 半舵逆解：底盘速度指令 → 2 组 {目标舵角, 驱动速度}
- * @param vx/vy 车体速度 [m/s]（x 前+，y 左+）
- * @param w     车体角速度 [rad/s]（逆时针+）
- * @param fb    当前反馈（用 steer_angle）
- * @param out   解算结果
- * @note  回转中心速度≈0 时该组保持当前朝向、驱动停转（避免原地抖动时舵轮来回找角）
- */
-static void HalfRudderInverse(float vx, float vy, float w, const HalfRudderState_s *fb, HalfRudderRef_s *out)
-{
-    // 线速度 [m/s] → 驱动电机侧角速度 [rad/s]
-    const float k = CHASSIS_DRIVE_REDUCTION / CHASSIS_WHEEL_RADIUS;
-
-    for (uint8_t i = 0; i < HALF_RUDDER_NUM; i++)
-    {
-        // 组 i 回转中心的期望速度：v_i = v_center + w × r_i
-        float vx_i = vx - w * s_rudder_pos_y[i];
-        float vy_i = vy + w * s_rudder_pos_x[i];
-        float speed = Lib_Math_Sqrt(vx_i * vx_i + vy_i * vy_i); // 该组轮子该走多快 [m/s]
-
-        if (speed < HALF_RUDDER_SPEED_EPS)
-        {
-            out->steer_target[i] = fb->steer_angle[i];
-            out->drive_speed[i] = 0.0f;
-            continue;
-        }
-
-        int8_t reverse = 0;
-        float phi_des = Lib_Math_Atan2(vy_i, vx_i); // 轮子该朝哪 [rad]
-        out->steer_target[i] = HalfRudderSteerNearest(phi_des, fb->steer_angle[i], &reverse);
-        out->drive_speed[i] = (reverse ? -speed : speed) * k;
-    }
-}
-
-/**
- * @brief 半舵正解（里程计）：2 组 {驱动速度, 当前舵角} → 底盘速度
- * @param fb   当前反馈（用 steer_angle 与 drive_speed）
- * @param vx/vy/w 输出：估算的车体速度 [m/s] / 角速度 [rad/s]
- *
- * @note 每组给出接触点速度 v_i = s_i·(cosφ_i, sinφ_i)，与运动学 v_i = (vx - w·y_i, vy + w·x_i)
- *       构成 4 个方程、3 个未知量（超定），取最小二乘解。
- *       法方程为 3x3，det = n·(n·Σr² - (Σx)² - (Σy)²)；两组回转中心重合时位置退化，输出 0。
- * @note 用"实际舵角 + 带符号驱动速度"计算，故轮子处于反向解（朝 φ、反转）时结果同样正确。
- */
-static void HalfRudderForward(const HalfRudderState_s *fb, float *vx, float *vy, float *w)
-{
-    float Sx = 0.0f, Sy = 0.0f, Srr = 0.0f;                          // Σx, Σy, Σ(x²+y²)
-    float Sc = 0.0f, Sd = 0.0f, Sb = 0.0f;                           // Σc, Σd, Σ(d·x - c·y)
-    const float kr = CHASSIS_WHEEL_RADIUS / CHASSIS_DRIVE_REDUCTION; // 电机侧角速度 → 线速度
-
-    for (uint8_t i = 0; i < HALF_RUDDER_NUM; i++)
-    {
-        float s = fb->drive_speed[i] * kr; // 接触点线速度 [m/s]，带符号
-        float c = s * Lib_Math_Cos(fb->steer_angle[i]);
-        float d = s * Lib_Math_Sin(fb->steer_angle[i]);
-
-        Sx += s_rudder_pos_x[i];
-        Sy += s_rudder_pos_y[i];
-        Srr += s_rudder_pos_x[i] * s_rudder_pos_x[i] + s_rudder_pos_y[i] * s_rudder_pos_y[i];
-        Sc += c;
-        Sd += d;
-        Sb += d * s_rudder_pos_x[i] - c * s_rudder_pos_y[i];
-    }
-
-    float N = (float)HALF_RUDDER_NUM;
-    float det = N * (N * Srr - Sx * Sx - Sy * Sy);
-    if (FABS(det) < 1e-9f) // 回转中心重合 → 位置退化，无法反推
-    {
-        *vx = 0.0f;
-        *vy = 0.0f;
-        *w = 0.0f;
-        return;
-    }
-
-    *vx = (Sc * (N * Srr - Sx * Sx) - Sy * Sd * Sx + N * Sy * Sb) / det;
-    *vy = (N * (Sd * Srr - Sx * Sb) - Sc * Sx * Sy - Sd * Sy * Sy) / det;
-    *w = (N * Sb - Sd * Sx + Sc * Sy) / (N * Srr - Sx * Sx - Sy * Sy);
-}
-
-/**
- * @brief 采集两组舵轮的当前反馈
+ * @brief 采集两组舵轮的当前反馈，填成内核状态
+ * @param st 输出：内核状态（舵角 + 轮缘角速度）
  * @note 舵角：电机侧 rad → 舵轮侧 rad。舵向电机是 MOTOR_POSITION_WRAP，读数被归一化在 ±π，
- *       不是严格连续值——解算只用它做"±180° 取最近解"的选择，对 2π 取模等价；
+ *       不是严格连续值——内核只用它做"±180° 取最近解"的选择，对 2π 取模等价；
  *       解出的目标是"当前角 + 最近角差"，可以超出 ±π，驱动侧 setpoint 与 PID 误差都会做归一化，
  *       实际误差仍是最短角差，故这里直接当连续角用没有问题。
+ * @note 轮速：电机侧 rad/s → 轮缘角速度 rad/s。只有正解用它做里程计，逆解不看这个量。
  */
-static void HalfRudderReadState(HalfRudderState_s *fb)
+static void ChassisReadState(LibChassisState_s *st)
 {
-    fb->steer_angle[0] = (float)MotorGetData(&(rudder_l_motor.base)).position * STEER_GEAR_RATIO_INV;
-    fb->steer_angle[1] = (float)MotorGetData(&(rudder_r_motor.base)).position * STEER_GEAR_RATIO_INV;
-    fb->drive_speed[0] = (float)MotorGetData(&(wheel_l_motor.base)).speed; // 已是电机侧 rad/s
-    fb->drive_speed[1] = (float)MotorGetData(&(wheel_r_motor.base)).speed;
+    st->steer_angle[LIB_CHASSIS_HALF_RUDDER_L] =
+        (float)MotorGetData(&(rudder_l_motor.base)).position * STEER_GEAR_RATIO_INV;
+    st->steer_angle[LIB_CHASSIS_HALF_RUDDER_R] =
+        (float)MotorGetData(&(rudder_r_motor.base)).position * STEER_GEAR_RATIO_INV;
+    st->wheel_speed[LIB_CHASSIS_HALF_RUDDER_L] =
+        MOTOR_RADPS_TO_WHEEL_RADPS((float)MotorGetData(&(wheel_l_motor.base)).speed);
+    st->wheel_speed[LIB_CHASSIS_HALF_RUDDER_R] =
+        MOTOR_RADPS_TO_WHEEL_RADPS((float)MotorGetData(&(wheel_r_motor.base)).speed);
 }
 
 /**
@@ -301,19 +187,27 @@ static void HalfRudderReadState(HalfRudderState_s *fb)
  */
 static void HalfRudderSolve(const gimbal2chassis_data_t *cmd)
 {
-    HalfRudderState_s fb;
-    HalfRudderReadState(&fb);
+    LibChassisState_s st;
+    ChassisReadState(&st);
 
-    // 逆解 → 四个电机给定
-    HalfRudderRef_s ref;
-    HalfRudderInverse(cmd->vx, cmd->vy, cmd->w, &fb, &ref);
-    rudder_l_motor_setref = ref.steer_target[0] * STEER_GEAR_RATIO; // 舵轮侧 → 电机侧
-    rudder_r_motor_setref = ref.steer_target[1] * STEER_GEAR_RATIO;
-    wheel_l_motor_setref = ref.drive_speed[0];
-    wheel_r_motor_setref = ref.drive_speed[1];
+    // 逆解 → 四个电机给定（内核给的是轮侧量：舵角 + 轮缘角速度，跨接口时换回电机侧）
+    LibChassisRef_s ref;
+    vector3_t twist = {.x = cmd->vx, .y = cmd->vy, .z = cmd->w};
+    LibChassisInverse(&s_chassis, &st, twist, &ref);
+    rudder_l_motor_setref = ref.steer_target[LIB_CHASSIS_HALF_RUDDER_L] * STEER_GEAR_RATIO; // 舵轮侧 → 电机侧
+    rudder_r_motor_setref = ref.steer_target[LIB_CHASSIS_HALF_RUDDER_R] * STEER_GEAR_RATIO;
+    wheel_l_motor_setref = WHEEL_RADPS_TO_MOTOR_RADPS(ref.wheel_speed[LIB_CHASSIS_HALF_RUDDER_L]);
+    wheel_r_motor_setref = WHEEL_RADPS_TO_MOTOR_RADPS(ref.wheel_speed[LIB_CHASSIS_HALF_RUDDER_R]);
 
     // 正解 → 速度反馈（随 CommSend 回传云台）
-    HalfRudderForward(&fb, &chassis2gimbal_data.vx, &chassis2gimbal_data.vy, &chassis2gimbal_data.w);
+    // 用"实际舵角 + 实际驱动速度"，故轮子处于反向解（朝 φ、反转）时结果同样正确。
+    // 两组回转中心重合时 JᵀJ 奇异，内核返回 -1 且输出已清零（车体方位不可分辨）。
+    vector3_t odom;
+    if (LibChassisForward(&s_chassis, &st, &odom) != 0)
+        odom = (vector3_t){0};
+    chassis2gimbal_data.vx = odom.x;
+    chassis2gimbal_data.vy = odom.y;
+    chassis2gimbal_data.w = odom.z;
 }
 
 /* 云台接收出帧回调（UNPACK_IN_ISR：payload 指向接收缓冲，回调返回后即被覆盖，须同步拷贝） */
@@ -341,6 +235,17 @@ static uint8_t GimbalCommIsOnline(void)
 
 void AppChassisInit(void)
 {
+    // 半舵运动学内核：几何尺寸全部来自 robot_def.h（两组回转中心位置 + 驱动轮半径）。
+    // 内侧按"每组 1 个舵轮 2 行约束"组装，2 组共 4 行 3 未知量，正解即最小二乘里程计。
+    LibChassisHalfRudderGeom_s chassis_geom = {
+        .l_pos_x = CHASSIS_RUDDER_L_POS_X,
+        .l_pos_y = CHASSIS_RUDDER_L_POS_Y,
+        .r_pos_x = CHASSIS_RUDDER_R_POS_X,
+        .r_pos_y = CHASSIS_RUDDER_R_POS_Y,
+        .radius = CHASSIS_WHEEL_RADIUS,
+    };
+    BSP_ASSERT_APP_CALL(LibChassisHalfRudderInit(&s_chassis, &chassis_geom));
+
     // 注册 CAN 实例（四个电机共用 CAN_2）
     BSP_ASSERT_APP_CALL(DJIMotorBroadcastRegister(&rudder_l_motor));
     BSP_ASSERT_APP_CALL(DJIMotorBroadcastRegister(&rudder_r_motor));
