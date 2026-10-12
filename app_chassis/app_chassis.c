@@ -188,7 +188,7 @@ static void HalfRudderSolve(const gimbal2chassis_data_t *cmd)
 
     // 逆解 → 四个电机给定（内核给的是轮侧量：舵角 + 轮缘角速度，跨接口时换回电机侧）
     LibChassisRef_s ref;
-    vector3_t twist = {.x = cmd->vx, .y = cmd->vy, .z = cmd->w};
+    vector3_t twist = {.x = -cmd->vx, .y = -cmd->vy, .z = cmd->w};
     LibChassisInverse(&s_chassis, &st, twist, &ref);
     rudder_l_motor_setref = ref.steer_target[LIB_CHASSIS_HALF_RUDDER_L] * STEER_GEAR_RATIO; // 舵轮侧 → 电机侧
     rudder_r_motor_setref = ref.steer_target[LIB_CHASSIS_HALF_RUDDER_R] * STEER_GEAR_RATIO;
