@@ -171,14 +171,10 @@ static LibChassisInstance_s s_chassis; // 内核实例：几何在 AppChassisIni
  */
 static void ChassisReadState(LibChassisState_s *st)
 {
-    st->steer_angle[LIB_CHASSIS_HALF_RUDDER_L] =
-        (float)MotorGetData(&(rudder_l_motor.base)).position * STEER_GEAR_RATIO_INV;
-    st->steer_angle[LIB_CHASSIS_HALF_RUDDER_R] =
-        (float)MotorGetData(&(rudder_r_motor.base)).position * STEER_GEAR_RATIO_INV;
-    st->wheel_speed[LIB_CHASSIS_HALF_RUDDER_L] =
-        MOTOR_RADPS_TO_WHEEL_RADPS((float)MotorGetData(&(wheel_l_motor.base)).speed);
-    st->wheel_speed[LIB_CHASSIS_HALF_RUDDER_R] =
-        MOTOR_RADPS_TO_WHEEL_RADPS((float)MotorGetData(&(wheel_r_motor.base)).speed);
+    st->steer_angle[LIB_CHASSIS_HALF_RUDDER_L] = (float)MotorGetData(&(rudder_l_motor.base)).position * STEER_GEAR_RATIO_INV;
+    st->steer_angle[LIB_CHASSIS_HALF_RUDDER_R] = (float)MotorGetData(&(rudder_r_motor.base)).position * STEER_GEAR_RATIO_INV;
+    st->wheel_speed[LIB_CHASSIS_HALF_RUDDER_L] = MOTOR_RADPS_TO_WHEEL_RADPS((float)MotorGetData(&(wheel_l_motor.base)).speed);
+    st->wheel_speed[LIB_CHASSIS_HALF_RUDDER_R] = MOTOR_RADPS_TO_WHEEL_RADPS((float)MotorGetData(&(wheel_r_motor.base)).speed);
 }
 
 /**
@@ -293,18 +289,18 @@ void AppChassisInit(void)
         //   ⚠️ 积分语义：lib_pid 已修正为 i_out += ki*error*dt，ki 单位是"每秒"，不随调用频率变。
         .pid_speed_setting =
             {
-                .kp = 0.10,                 // 比例系数（0.12→0.10，让位给微分阻尼）
-                .ki = 0.20,                 // 积分系数 [1/s]（0.15→0.20，加快慢摆收敛）
-                .kd = 0.002,                // 微分系数（配合微分先行补相位裕度）
-                .integral_limit = 2.5,      // 积分限幅阈值（实测峰值 i_out≈1.47，负载 +50% 仍有余量）
-                .coef_a = 20,               // 变速积分参数 A (0 = 禁用)
-                .coef_b = 20,               // 变速积分参数 B
-                .d_lpf_rc = 0.004,          // 微分滤波时间常数 RC (0 = 禁用)
-                .out_lpf_rc = 0,            // 输出滤波时间常数 RC (0 = 禁用)
-                .deadband = 0,              // 死区范围 (0 = 禁用)
-                .error_normalize_range = 0, // 误差归一化范围 (0 = 禁用, 需要 PID_ENABLE_ERROR_NORMALIZE)
-                .out_max = 0,               // 输出上限 (需要 PID_ENABLE_OUTPUT_LIMIT)
-                .out_min = 0,               // 输出下限 (需要 PID_ENABLE_OUTPUT_LIMIT)
+                .kp = 0.10f,                                     // 比例系数（0.12→0.10，让位给微分阻尼）
+                .ki = 0.20f,                                     // 积分系数 [1/s]（0.15→0.20，加快慢摆收敛）
+                .kd = 0.002f,                                    // 微分系数（配合微分先行补相位裕度）
+                .integral_limit = 2.5,                           // 积分限幅阈值（实测峰值 i_out≈1.47，负载 +50% 仍有余量）
+                .coef_a = 20,                                    // 变速积分参数 A (0 = 禁用)
+                .coef_b = 20,                                    // 变速积分参数 B
+                .d_lpf_rc = 0.004f,                              // 微分滤波时间常数 RC (0 = 禁用)
+                .out_lpf_rc = 0,                                 // 输出滤波时间常数 RC (0 = 禁用)
+                .deadband = 0,                                   // 死区范围 (0 = 禁用)
+                .error_normalize_range = 0,                      // 误差归一化范围 (0 = 禁用, 需要 PID_ENABLE_ERROR_NORMALIZE)
+                .out_max = 0,                                    // 输出上限 (需要 PID_ENABLE_OUTPUT_LIMIT)
+                .out_min = 0,                                    // 输出下限 (需要 PID_ENABLE_OUTPUT_LIMIT)
                 .config_mask = PID_ENABLE_TRAPEZOID_INTEGRAL |   // 梯形积分
                                PID_ENABLE_INTEGRAL_LIMIT |       // 积分限幅
                                PID_ENABLE_CHANGING_INTEGRATION | // 变速积分
@@ -315,7 +311,7 @@ void AppChassisInit(void)
             {
                 .kp = 10,                                  // 比例系数（0.12→0.10，让位给微分阻尼）
                 .ki = 0,                                   // 积分系数 [1/s]（0.15→0.20，加快慢摆收敛）
-                .kd = 0.3,                                 // 微分系数（配合微分先行补相位裕度）
+                .kd = 0.3f,                                // 微分系数（配合微分先行补相位裕度）
                 .integral_limit = 0,                       // 积分限幅阈值（实测峰值 i_out≈1.47，负载 +50% 仍有余量）
                 .coef_a = 0,                               // 变速积分参数 A (0 = 禁用)
                 .coef_b = 0,                               // 变速积分参数 B
@@ -375,18 +371,18 @@ void AppChassisInit(void)
         //   ⚠️ 积分语义：lib_pid 已修正为 i_out += ki*error*dt，ki 单位是"每秒"，不随调用频率变。
         .pid_speed_setting =
             {
-                .kp = 0.10,                 // 比例系数（0.12→0.10，让位给微分阻尼）
-                .ki = 0.20,                 // 积分系数 [1/s]（0.15→0.20，加快慢摆收敛）
-                .kd = 0.002,                // 微分系数（配合微分先行补相位裕度）
-                .integral_limit = 2.5,      // 积分限幅阈值（实测峰值 i_out≈1.47，负载 +50% 仍有余量）
-                .coef_a = 20,               // 变速积分参数 A (0 = 禁用)
-                .coef_b = 20,               // 变速积分参数 B
-                .d_lpf_rc = 0.004,          // 微分滤波时间常数 RC (0 = 禁用)
-                .out_lpf_rc = 0,            // 输出滤波时间常数 RC (0 = 禁用)
-                .deadband = 0,              // 死区范围 (0 = 禁用)
-                .error_normalize_range = 0, // 误差归一化范围 (0 = 禁用, 需要 PID_ENABLE_ERROR_NORMALIZE)
-                .out_max = 0,               // 输出上限 (需要 PID_ENABLE_OUTPUT_LIMIT)
-                .out_min = 0,               // 输出下限 (需要 PID_ENABLE_OUTPUT_LIMIT)
+                .kp = 0.10f,                                     // 比例系数（0.12→0.10，让位给微分阻尼）
+                .ki = 0.20f,                                     // 积分系数 [1/s]（0.15→0.20，加快慢摆收敛）
+                .kd = 0.002f,                                    // 微分系数（配合微分先行补相位裕度）
+                .integral_limit = 2.5,                           // 积分限幅阈值（实测峰值 i_out≈1.47，负载 +50% 仍有余量）
+                .coef_a = 20,                                    // 变速积分参数 A (0 = 禁用)
+                .coef_b = 20,                                    // 变速积分参数 B
+                .d_lpf_rc = 0.004f,                              // 微分滤波时间常数 RC (0 = 禁用)
+                .out_lpf_rc = 0,                                 // 输出滤波时间常数 RC (0 = 禁用)
+                .deadband = 0,                                   // 死区范围 (0 = 禁用)
+                .error_normalize_range = 0,                      // 误差归一化范围 (0 = 禁用, 需要 PID_ENABLE_ERROR_NORMALIZE)
+                .out_max = 0,                                    // 输出上限 (需要 PID_ENABLE_OUTPUT_LIMIT)
+                .out_min = 0,                                    // 输出下限 (需要 PID_ENABLE_OUTPUT_LIMIT)
                 .config_mask = PID_ENABLE_TRAPEZOID_INTEGRAL |   // 梯形积分
                                PID_ENABLE_INTEGRAL_LIMIT |       // 积分限幅
                                PID_ENABLE_CHANGING_INTEGRATION | // 变速积分
@@ -397,7 +393,7 @@ void AppChassisInit(void)
             {
                 .kp = 10,                                  // 比例系数（0.12→0.10，让位给微分阻尼）
                 .ki = 0,                                   // 积分系数 [1/s]（0.15→0.20，加快慢摆收敛）
-                .kd = 0.3,                                 // 微分系数（配合微分先行补相位裕度）
+                .kd = 0.3f,                                // 微分系数（配合微分先行补相位裕度）
                 .integral_limit = 0,                       // 积分限幅阈值（实测峰值 i_out≈1.47，负载 +50% 仍有余量）
                 .coef_a = 0,                               // 变速积分参数 A (0 = 禁用)
                 .coef_b = 0,                               // 变速积分参数 B
@@ -479,18 +475,18 @@ void AppChassisInit(void)
         //      裕度：a 700~1600、延时 2~5ms 范围内相位裕度 >35°、增益裕度 >7dB。
         .pid_speed_setting =
             {
-                .kp = 0.10,                 // 比例系数（闭环辨识复核：穿越 14.6Hz / 相位裕度 54°，保持）
-                .ki = 1.0,                  // 积分系数 [1/s]（1e-4→1.0，消除摩擦掉速，见上②③）
-                .kd = 0,                    // 微分系数（纯积分对象，微分先行只会等效降增益）
-                .integral_limit = 4.0,      // 积分限幅阈值 [Nm]（0→4.0；必须 > 摩擦力矩，否则掉速归不了零）
-                .coef_a = 20,               // 变速积分参数 A（0→20，20~40rad/s 误差区间递减积分）
-                .coef_b = 20,               // 变速积分参数 B（0→20，兼作起动抗饱和）
-                .d_lpf_rc = 0,              // 微分滤波时间常数 RC (0 = 禁用)
-                .out_lpf_rc = 0,            // 输出滤波时间常数 RC (0 = 禁用)
-                .deadband = 0,              // 死区范围 (0 = 禁用)
-                .error_normalize_range = 0, // 误差归一化范围 (0 = 禁用, 需要 PID_ENABLE_ERROR_NORMALIZE)
-                .out_max = 0,               // 输出上限 (需要 PID_ENABLE_OUTPUT_LIMIT)
-                .out_min = 0,               // 输出下限 (需要 PID_ENABLE_OUTPUT_LIMIT)
+                .kp = 0.10f,                                     // 比例系数（闭环辨识复核：穿越 14.6Hz / 相位裕度 54°，保持）
+                .ki = 1.0,                                       // 积分系数 [1/s]（1e-4→1.0，消除摩擦掉速，见上②③）
+                .kd = 0,                                         // 微分系数（纯积分对象，微分先行只会等效降增益）
+                .integral_limit = 4.0,                           // 积分限幅阈值 [Nm]（0→4.0；必须 > 摩擦力矩，否则掉速归不了零）
+                .coef_a = 20,                                    // 变速积分参数 A（0→20，20~40rad/s 误差区间递减积分）
+                .coef_b = 20,                                    // 变速积分参数 B（0→20，兼作起动抗饱和）
+                .d_lpf_rc = 0,                                   // 微分滤波时间常数 RC (0 = 禁用)
+                .out_lpf_rc = 0,                                 // 输出滤波时间常数 RC (0 = 禁用)
+                .deadband = 0,                                   // 死区范围 (0 = 禁用)
+                .error_normalize_range = 0,                      // 误差归一化范围 (0 = 禁用, 需要 PID_ENABLE_ERROR_NORMALIZE)
+                .out_max = 0,                                    // 输出上限 (需要 PID_ENABLE_OUTPUT_LIMIT)
+                .out_min = 0,                                    // 输出下限 (需要 PID_ENABLE_OUTPUT_LIMIT)
                 .config_mask = PID_ENABLE_TRAPEZOID_INTEGRAL |   // 梯形积分
                                PID_ENABLE_INTEGRAL_LIMIT |       // 积分限幅
                                PID_ENABLE_CHANGING_INTEGRATION | // 变速积分
@@ -560,18 +556,18 @@ void AppChassisInit(void)
         //      裕度：a 700~1600、延时 2~5ms 范围内相位裕度 >35°、增益裕度 >7dB。
         .pid_speed_setting =
             {
-                .kp = 0.10,                 // 比例系数（闭环辨识复核：穿越 14.6Hz / 相位裕度 54°，保持）
-                .ki = 1.0,                  // 积分系数 [1/s]（1e-4→1.0，消除摩擦掉速，见上②③）
-                .kd = 0,                    // 微分系数（纯积分对象，微分先行只会等效降增益）
-                .integral_limit = 4.0,      // 积分限幅阈值 [Nm]（0→4.0；必须 > 摩擦力矩，否则掉速归不了零）
-                .coef_a = 20,               // 变速积分参数 A（0→20，20~40rad/s 误差区间递减积分）
-                .coef_b = 20,               // 变速积分参数 B（0→20，兼作起动抗饱和）
-                .d_lpf_rc = 0,              // 微分滤波时间常数 RC (0 = 禁用)
-                .out_lpf_rc = 0,            // 输出滤波时间常数 RC (0 = 禁用)
-                .deadband = 0,              // 死区范围 (0 = 禁用)
-                .error_normalize_range = 0, // 误差归一化范围 (0 = 禁用, 需要 PID_ENABLE_ERROR_NORMALIZE)
-                .out_max = 0,               // 输出上限 (需要 PID_ENABLE_OUTPUT_LIMIT)
-                .out_min = 0,               // 输出下限 (需要 PID_ENABLE_OUTPUT_LIMIT)
+                .kp = 0.10f,                                     // 比例系数（闭环辨识复核：穿越 14.6Hz / 相位裕度 54°，保持）
+                .ki = 1.0,                                       // 积分系数 [1/s]（1e-4→1.0，消除摩擦掉速，见上②③）
+                .kd = 0,                                         // 微分系数（纯积分对象，微分先行只会等效降增益）
+                .integral_limit = 4.0,                           // 积分限幅阈值 [Nm]（0→4.0；必须 > 摩擦力矩，否则掉速归不了零）
+                .coef_a = 20,                                    // 变速积分参数 A（0→20，20~40rad/s 误差区间递减积分）
+                .coef_b = 20,                                    // 变速积分参数 B（0→20，兼作起动抗饱和）
+                .d_lpf_rc = 0,                                   // 微分滤波时间常数 RC (0 = 禁用)
+                .out_lpf_rc = 0,                                 // 输出滤波时间常数 RC (0 = 禁用)
+                .deadband = 0,                                   // 死区范围 (0 = 禁用)
+                .error_normalize_range = 0,                      // 误差归一化范围 (0 = 禁用, 需要 PID_ENABLE_ERROR_NORMALIZE)
+                .out_max = 0,                                    // 输出上限 (需要 PID_ENABLE_OUTPUT_LIMIT)
+                .out_min = 0,                                    // 输出下限 (需要 PID_ENABLE_OUTPUT_LIMIT)
                 .config_mask = PID_ENABLE_TRAPEZOID_INTEGRAL |   // 梯形积分
                                PID_ENABLE_INTEGRAL_LIMIT |       // 积分限幅
                                PID_ENABLE_CHANGING_INTEGRATION | // 变速积分
@@ -686,7 +682,7 @@ ITCM_RAM void AppChassisRun(float dt, uint64_t time_stamp)
     //   1 位置  2 速度  3 力矩  4 积分项 i_out  5 比例项 p_out  6 PID 总输出
     //   7 积分限幅(常量)  8 实际 ref（正常=setref，寻零期间=扫描速度给定）
     // ch9~12 为本次整定补充：整定是否到位可直接看 9/12，若后续加微分再看 10。
-    VofaSetChannel(1, wheel_r_motor.base.data_all.data.position);
+    VofaSetChannel(1, (float)wheel_r_motor.base.data_all.data.position);
     VofaSetChannel(2, wheel_r_motor.base.data_all.data.speed);
     VofaSetChannel(3, wheel_r_motor.base.data_all.data.torque);
     VofaSetChannel(4, wheel_r_motor.base.controller.pid_speed.i_out);
@@ -702,10 +698,10 @@ ITCM_RAM void AppChassisRun(float dt, uint64_t time_stamp)
     VofaSetChannel(14, wheel_r_motor.base.controller.pid_angle.output);
     // ch15~20 半舵解算观测：舵角看"目标 vs 实际"是否重合（不重合查符号/减速比），
     // 驱动看给定速度（拖动轮子时 17/20 应随实际转速变化方向一致）。
-    VofaSetChannel(15, rudder_l_motor_setref * STEER_GEAR_RATIO_INV); // 左舵目标舵角（舵轮侧 rad）
+    VofaSetChannel(15, rudder_l_motor_setref * STEER_GEAR_RATIO_INV);                             // 左舵目标舵角（舵轮侧 rad）
     VofaSetChannel(16, (float)rudder_l_motor.base.data_all.data.position * STEER_GEAR_RATIO_INV); // 左舵实际
-    VofaSetChannel(17, wheel_l_motor_setref);                         // 左驱动给定（电机侧 rad/s）
-    VofaSetChannel(18, rudder_r_motor_setref * STEER_GEAR_RATIO_INV); // 右舵目标舵角
+    VofaSetChannel(17, wheel_l_motor_setref);                                                     // 左驱动给定（电机侧 rad/s）
+    VofaSetChannel(18, rudder_r_motor_setref * STEER_GEAR_RATIO_INV);                             // 右舵目标舵角
     VofaSetChannel(19, (float)rudder_r_motor.base.data_all.data.position * STEER_GEAR_RATIO_INV); // 右舵实际
     VofaSetChannel(20, wheel_r_motor_setref);                                                     // 右驱动给定
     VofaSend();

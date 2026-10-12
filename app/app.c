@@ -24,7 +24,7 @@ LOG_INSTANCE_DEF(g_app_log, "app", 255); // app 层日志实例
 TASK_INSTANCE_DEF(chassis_task, CHASSIS_STACK_SIZE);
 
 /* 任务函数：周期任务框架（固定周期唤醒 + 执行耗时监控 + 超时计数） */
-APP_TASK_DEF(Chassis, CHASSIS_FREQ_MS, AppChassisRun);
+APP_TASK_DEF(Chassis, CHASSIS_FREQ_MS, AppChassisRun)
 
 static void create_queue(void)
 {
