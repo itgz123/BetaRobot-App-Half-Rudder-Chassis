@@ -30,7 +30,8 @@
 #define DRV_DBUS_USED                // DBUS 遥控器驱动
 #define DRV_SBUS_USED                // SBUS 遥控器驱动
 #define LIB_MAHONY_USED              // Mahony 姿态解算
-#define DRV_DJIMOTOR_BROADCAST_USED  // DJI 电机驱动
+#define DRVS_DJIMOTOR_BROADCAST_USED // DJI 电机驱动（drvs 纯协议版一拖四广播；舵向 2 个 M3508）
+#define DRVLIB_MOTOR_USED            // 三级级联 PID + 反馈后处理（drvs 之上；舵向位置/速度环）
 #define DRV_DMMOTOR_USED             // DM 电机驱动
 #define DRV_RSMOTOR_USED             // RS05 电机驱动（灵足时代，MIT 协议）
 #define DRV_LKMOTOR_USED             // LK MF 一对一协议驱动

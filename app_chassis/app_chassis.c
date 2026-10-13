@@ -4,9 +4,11 @@
 #include "robot_def.h"
 //
 #include "drv_motor_base.h"
-#include "drv_djimotor_broadcast.h"
 #include "drv_lkmotor_broadcast.h"
 #include "drv_vofa.h"
+//
+#include "drvs_djimotor_broadcast.h" // DJI 广播纯协议层（舵向 2 个 M3508）
+#include "drvlib_motor.h"            // 三级级联 PID 控制核（舵向位置/速度环）
 //
 #include "drv_comm.h"
 #include "comm_media_can_idseq.h"
@@ -32,10 +34,13 @@
 
 /* 变量 */
 // 实例
-// rudder_l/r：DJI M3508 (C620) 舵向电机
-// wheel_l/r：LK MF7015 直驱轮电机
-DJIMOTOR_BROADCAST_INSTANCE_DEF(rudder_l_motor);
-DJIMOTOR_BROADCAST_INSTANCE_DEF(rudder_r_motor);
+// rudder_l/r：DJI M3508 (C620) 舵向电机 —— drvs 纯协议（收发）+ drvlib 三级 PID（闭环）
+// wheel_l/r：LK MF7015 直驱轮电机 —— 仍走旧 drv_motor 广播栈
+DRVS_DJIMOTOR_BROADCAST_INSTANCE_DEF(rudder_l_motor);
+DRVS_DJIMOTOR_BROADCAST_INSTANCE_DEF(rudder_r_motor);
+DRVS_DJIMOTOR_BROADCAST_GROUP_DEF(rudder_motor_group); // 两舵向共一组（CAN_2，id2/id4 → 0x201~0x204 同帧下发）
+DRVLIB_MOTOR_INSTANCE_DEF(rudder_l_ctrl);
+DRVLIB_MOTOR_INSTANCE_DEF(rudder_r_ctrl);
 LKMOTOR_BROADCAST_INSTANCE_DEF(wheel_l_motor);
 LKMOTOR_BROADCAST_INSTANCE_DEF(wheel_r_motor);
 
@@ -83,29 +88,35 @@ static uint8_t rudder_r_inited = 0;
 
 /**
  * @brief 光电门跳变沿处重标定零点：把当前读数改成"正前方 + 机械偏置"对应的位置
- * @param rudder 舵向电机（M3508，增量编码器，上电无绝对零点）
+ * @param rudder 舵向控制核（drvlib_motor；位置后处理在它内部，M3508 增量编码器上电无绝对零点）
  * @param offset_deg 跳变沿 → 正前方 的舵轮角度偏置（°，见 robot_def.h）
- * @note 位置由驱动算出：position = wrap((多圈累加 + position_offset) * feedback_direction)，
+ * @note 位置由控制核算出：position = wrap((多圈累加 + position_offset) * feedback_direction)，
  *       即 position_offset 每加 Δ，读数就沿 feedback_direction 方向变 Δ，
  *       故要让读数等于 target，增量须除以 feedback_direction。
+ * @note 控制核把处理后的位置**缓存**在 data 里、只在 SetRef 时刷新（旧 drv_motor 是每次
+ *       读反馈都重算）。标定发生在 SetRef 之后，若不顺手把本拍读数改成新偏置下的值，
+ *       下一拍（已切 RUN）HalfRudderSolve 会拿旧偏置的位置去解算舵角。故这里同时改
+ *       data.position —— 偏置加 delta 使读数沿 feedback_direction 变 (target-position_now)，
+ *       新读数即 target（与下一拍重算结果同余，差整数个跨也不影响：舵角按 mod 2π 用）。
  * @note 跳变沿由控制任务（2ms）轮询得到，采样滞后最多 2ms；标定转速 8rad/s（电机侧）
  *       对应最大零点误差 0.016rad(电机侧) ≈ 0.115°(舵轮)，可忽略，不做补偿。
  */
-static void RudderCalibrateOffset(MotorBase_s *rudder, float offset_deg)
+static void RudderCalibrateOffset(DrvlibMotorInstance *rudder, float offset_deg)
 {
-    float position_now = (float)MotorGetData(rudder).position; // 触发瞬间读数（rad，电机侧）
-    float target = STEER_WHEEL_DEG_TO_MOTOR_RAD(offset_deg);   // 正前方应有的读数
-    rudder->position_offset += (target - position_now) / (float)rudder->setting.feedback_direction;
+    float position_now = (float)rudder->data.position;       // 触发瞬间读数（rad，电机侧，已含方向/偏置/归一化）
+    float target = STEER_WHEEL_DEG_TO_MOTOR_RAD(offset_deg); // 正前方应有的读数
+    rudder->cfg.position_offset += (target - position_now) / (float)rudder->cfg.feedback_direction;
+    rudder->data.position += (double)(target - position_now); // 同步本拍缓存读数，见上（mod 2π 等价）
 }
 
-static void RudderCalibrateOffset_l()
+static void RudderCalibrateOffset_l(void)
 {
-    RudderCalibrateOffset(&(rudder_l_motor.base), RUDDER_ZERO_OFFSET_L_DEG);
+    RudderCalibrateOffset(&rudder_l_ctrl, RUDDER_ZERO_OFFSET_L_DEG);
     rudder_l_inited = 1;
 }
-static void RudderCalibrateOffset_r()
+static void RudderCalibrateOffset_r(void)
 {
-    RudderCalibrateOffset(&(rudder_r_motor.base), RUDDER_ZERO_OFFSET_R_DEG);
+    RudderCalibrateOffset(&rudder_r_ctrl, RUDDER_ZERO_OFFSET_R_DEG);
     rudder_r_inited = 1;
 }
 /*============================ 半舵运动学（lib_chassis 内核） ============================*/
@@ -134,16 +145,18 @@ static LibChassisInstance_s s_chassis; // 内核实例：几何在 AppChassisIni
 /**
  * @brief 采集两组舵轮的当前反馈，填成内核状态
  * @param st 输出：内核状态（舵角 + 轮缘角速度）
- * @note 舵角：电机侧 rad → 舵轮侧 rad。舵向电机是 MOTOR_POSITION_WRAP，读数被归一化在 ±π，
+ * @note 舵角：电机侧 rad → 舵轮侧 rad。舵向控制核是 DRVLIB_MOTOR_POS_WRAP，读数被归一化在 ±π，
  *       不是严格连续值——内核只用它做"±180° 取最近解"的选择，对 2π 取模等价；
  *       解出的目标是"当前角 + 最近角差"，可以超出 ±π，驱动侧 setpoint 与 PID 误差都会做归一化，
  *       实际误差仍是最短角差，故这里直接当连续角用没有问题。
  * @note 轮速：电机侧 rad/s → 轮缘角速度 rad/s。只有正解用它做里程计，逆解不看这个量。
+ * @note 舵角取控制核处理后的多圈位置（rudder_*_ctrl.data.position）——由 AppChassisRun 里
+ *       本拍/上一拍的 DrvlibMotorSetRef 刷新（见那里的调用顺序说明）。
  */
 static void ChassisReadState(LibChassisState_s *st)
 {
-    st->steer_angle[LIB_CHASSIS_HALF_RUDDER_L] = (float)MotorGetData(&(rudder_l_motor.base)).position * STEER_GEAR_RATIO_INV;
-    st->steer_angle[LIB_CHASSIS_HALF_RUDDER_R] = (float)MotorGetData(&(rudder_r_motor.base)).position * STEER_GEAR_RATIO_INV;
+    st->steer_angle[LIB_CHASSIS_HALF_RUDDER_L] = (float)rudder_l_ctrl.data.position * STEER_GEAR_RATIO_INV;
+    st->steer_angle[LIB_CHASSIS_HALF_RUDDER_R] = (float)rudder_r_ctrl.data.position * STEER_GEAR_RATIO_INV;
     st->wheel_speed[LIB_CHASSIS_HALF_RUDDER_L] = MOTOR_RADPS_TO_WHEEL_RADPS((float)MotorGetData(&(wheel_l_motor.base)).speed);
     st->wheel_speed[LIB_CHASSIS_HALF_RUDDER_R] = MOTOR_RADPS_TO_WHEEL_RADPS((float)MotorGetData(&(wheel_r_motor.base)).speed);
 }
@@ -278,13 +291,14 @@ LIB_FSM_TABLE_CHECK_TABLE(chassis_fsm_table);
 
 /*---------------- 进入动作 ----------------*/
 /* 校准结束进入运行的这一拍：舵向从"纯速度环扫描"切到"位置+速度环"，此后才由半舵解算
- * 接管舵角。放进入动作里，只在跨状态那一刻执行一次（旧代码把这一步藏在 lunxunjioazhun
- * 的 return 1 之前，每次进运行都要在同一个函数里读出来）。 */
+ * 接管舵角。放进入动作里，只在跨状态那一刻执行一次。
+ * ⚠ loop_type 在 drvlib 里是实例配置——Config 时按 ANGLE|SPEED 建好两个环，校准期由
+ *   ChassisCalibrateTick 收窄成 SPEED，这里再放开；只改掩码，不重配 PID。 */
 static void ChassisRunEntry(void *ctx)
 {
     (void)ctx;
-    rudder_l_motor.base.setting.loop_type = MOTOR_LOOP_SPEED | MOTOR_LOOP_ANGLE;
-    rudder_r_motor.base.setting.loop_type = MOTOR_LOOP_SPEED | MOTOR_LOOP_ANGLE;
+    rudder_l_ctrl.cfg.loop_type = DRVLIB_MOTOR_LOOP_ANGLE | DRVLIB_MOTOR_LOOP_SPEED;
+    rudder_r_ctrl.cfg.loop_type = DRVLIB_MOTOR_LOOP_ANGLE | DRVLIB_MOTOR_LOOP_SPEED;
 }
 
 static const LibFsmTableStateActions_s chassis_fsm_actions[] = {
@@ -297,47 +311,32 @@ LIB_FSM_TABLE_CHECK_ACTIONS(chassis_fsm_actions, chassis_state_count_e);
 
 /**
  * @brief 四电机统一使能/失能
+ * @note 舵向在 drvlib（软件使能标志，失能顺带 PIDReset），车轮仍在旧 drv_motor
  */
 static void ChassisMotorsEnable(void)
 {
-    MotorEnable(&(rudder_l_motor.base));
-    MotorEnable(&(rudder_r_motor.base));
+    DrvlibMotorEnable(&rudder_l_ctrl);
+    DrvlibMotorEnable(&rudder_r_ctrl);
     MotorEnable(&(wheel_l_motor.base));
     MotorEnable(&(wheel_r_motor.base));
 }
 static void ChassisMotorsDisable(void)
 {
-    MotorDisable(&(rudder_l_motor.base));
-    MotorDisable(&(rudder_r_motor.base));
+    DrvlibMotorDisable(&rudder_l_ctrl); // 置 disable + PIDReset，与旧 MotorDisable 同义
+    DrvlibMotorDisable(&rudder_r_ctrl);
     MotorDisable(&(wheel_l_motor.base));
     MotorDisable(&(wheel_r_motor.base));
 }
 
 /**
- * @brief 校准推进一步（每拍一次；仅在校准态做实质动作）
- * @note 未标定完成时给两舵轮扫描速度并轮询光电门跳变，跳变处重标零点；
- *       两个都标定完 → rudder_*_inited 置位（由状态机切到运行态）；
+ * @brief 校准判据：光电门跳变（1→0 下降沿）处重标零点并置完成标志
+ * @note 必须在舵向 SetRef **之后**调用：标定读的是控制核本拍刚刷新过的 data.position，
+ *       用上一拍的会多出 2ms 采样滞后（标定转速下约 0.3° 舵轮，不可忽略）。
+ * @note 两个都标定完 → rudder_*_inited 置位，下一拍由状态机切到运行态；
  *       计时超限仍未标定 → 由 ChassisFsmUpdate 判故障。
- *       等价于旧 lunxunjioazhun 的"未完成"分支，只是不再兼任"是否完成"的返回值。
- * @note 只写 setref 变量，不在此下发：四个给定由 AppChassisRun 末尾统一 MotorSetRef。
  */
-static void ChassisCalibrateTick(void)
+static void ChassisCalibPollGate(void)
 {
-    if (LibFsmTableCurrent(&chassis_fsm) != chassis_state_cal_e)
-    {
-        return;
-    }
-
-    // 扫描：舵向用纯速度环（位置环留到运行态），两舵轮以恒定速度转着找光电门
-    rudder_l_motor.base.setting.loop_type = MOTOR_LOOP_SPEED;
-    rudder_r_motor.base.setting.loop_type = MOTOR_LOOP_SPEED;
-    MotorEnable(&(rudder_l_motor.base));
-    MotorEnable(&(rudder_r_motor.base));
-    rudder_l_motor_setref = jiaozhun_speed;
-    rudder_r_motor_setref = jiaozhun_speed;
-    wheel_l_motor_setref = 0;
-    wheel_r_motor_setref = 0;
-
     // 光电门跳变（1→0 下降沿）处重标零点
     if ((rudder_l_state == 1) && (0 == GPIORead(&rudder_l_gate_io)))
     {
@@ -397,119 +396,62 @@ void AppChassisInit(void)
     BSP_ASSERT_APP_CALL(LibChassisHalfRudderInit(&s_chassis, &chassis_geom));
 
     // 注册 CAN 实例（四个电机共用 CAN_2）
-    BSP_ASSERT_APP_CALL(DJIMotorBroadcastRegister(&rudder_l_motor));
-    BSP_ASSERT_APP_CALL(DJIMotorBroadcastRegister(&rudder_r_motor));
+    BSP_ASSERT_APP_CALL(DrvsDJIMotorBroadcastRegister(&rudder_l_motor));
+    BSP_ASSERT_APP_CALL(DrvsDJIMotorBroadcastRegister(&rudder_r_motor));
     BSP_ASSERT_APP_CALL(LKMotorBroadcastRegister(&wheel_l_motor));
     BSP_ASSERT_APP_CALL(LKMotorBroadcastRegister(&wheel_r_motor));
 
-    // 配置 rudder_l（M3508，motor_id=2 → rx 0x202 / tx 0x200）
-    DJIMotorBroadcast_Config_s rudder_l_cfg = {
+    /* ---- 舵向协议层（drvs_djimotor_broadcast）----
+     * 两个 M3508 同挂 CAN_2 的 0x201~0x204 组：id2 → rx 0x202、id4 → rx 0x204，
+     * tx 均为 0x200，故两舵向共用一帧下发（一个广播组 rudder_motor_group）。 */
+    DrvsDJIMotorBroadcastConfig_s rudder_l_cfg = {
+        .group = &rudder_motor_group,
         .can_e = CAN_2,
-        .model = DJI_MODEL_M3508,
+        .model = DRVS_DJI_MODEL_M3508,
         .motor_id = 2,
-        .speed_lpf_enable = MOTOR_SPEED_LPF_ENABLE,
-        .speed_lpf_rc = 0.02f,
-        .position_offset = 0,
-        .torque_constant = 1, // M3508 电流→力矩系数，待标定
-        .controller_setting =
-            {
-                .loop_type = MOTOR_LOOP_ANGLE | MOTOR_LOOP_SPEED, // TODO: 后续改为位置/速度环
-                .feedback_direction = MOTOR_DIRECTION_NORMAL,     // 反馈方向
-                .motor_direction = MOTOR_DIRECTION_NORMAL,        // 输出方向
-                .position_mode = MOTOR_POSITION_WRAP,             // 开环占位，不用位置环
-                .angle_limit_max = M_PI * STEER_GEAR_RATIO,
-                .angle_limit_min = -M_PI * STEER_GEAR_RATIO,
-                .speed_feedforward_src = MOTOR_FEEDFORWARD_DISABLE,    // 速度前馈来源
-                .position_feedforward_src = MOTOR_FEEDFORWARD_DISABLE, // 位置前馈来源
-                .speed_feedforward_ptr = NULL,                         // 速度前馈指针
-                .position_feedforward_ptr = NULL,                      // 位置前馈指针
-                .angle_src = MOTOR_FEEDBACK_MOTOR,                     // 角度反馈来源
-                .speed_src = MOTOR_FEEDBACK_MOTOR,                     // 速度反馈来源
-                .angle_external_ptr = NULL,                            // 外部角度反馈指针
-                .speed_external_ptr = NULL,                            // 外部速度反馈指针
-            },
-        // 速度环整定依据 ignore/vofa+.csv（20s，0/30/60 rad/s 阶跃，2ms 周期，kp=0.12/ki=0.15 采得）：
-        //   实测超调 30~38%，0→30 后还残留约 1rad/s 的慢摆（整定 1.2~4.8s）。
-        //   由该数据辨识被控对象：Kt/J≈495 rad/s²/A、B/J≈3 /s、恒值负载≈1.2A、回路延迟≈6ms，
-        //   叠加 20ms 速度低通（speed_lpf_rc）；闭环复现超调 33%，与实测一致。
-        //   根因是"20ms 低通 + 6ms 延迟"的相位滞后——纯 PI 只能靠降 kp 压超调，代价是变慢
-        //   （kp≤0.06 才压到 12%，且负载/模型一漂就回到 25%+）。
-        //   故改用微分先行（仅对反馈微分，不受目标阶跃冲击）补阻尼，并小幅提高 ki 加快积分收敛：
-        //   kp 0.12→0.10、ki 0.15→0.20、kd 0→0.002、微分滤波 rc=0.004。
-        //   辨识模型仿真：平均超调 33.8%→0.8%，平均整定 441ms→178ms；在负载 0.85~1.8A、
-        //   Kt/J 400~640、B/J 2~4.5、延迟 4~10ms 的全范围内，最坏超调仍 <4%。
-        //   kd 量纲：d_out = kd*(last_measure-measure)/dt，kd=0.002 即"每 2ms 速度变化 1rad/s 给 1A 阻尼"；
-        //   实测速度噪声仅 ~0.045rad/s，经 4ms 微分滤波后噪声电流 <0.03A，可忽略。
-        //   ⚠️ 积分语义：lib_pid 已修正为 i_out += ki*error*dt，ki 单位是"每秒"，不随调用频率变。
-        .pid_speed_setting =
-            {
-                .kp = 0.10f,                                     // 比例系数（0.12→0.10，让位给微分阻尼）
-                .ki = 0.20f,                                     // 积分系数 [1/s]（0.15→0.20，加快慢摆收敛）
-                .kd = 0.002f,                                    // 微分系数（配合微分先行补相位裕度）
-                .integral_limit = 2.5,                           // 积分限幅阈值（实测峰值 i_out≈1.47，负载 +50% 仍有余量）
-                .coef_a = 20,                                    // 变速积分参数 A (0 = 禁用)
-                .coef_b = 20,                                    // 变速积分参数 B
-                .d_lpf_rc = 0.004f,                              // 微分滤波时间常数 RC (0 = 禁用)
-                .out_lpf_rc = 0,                                 // 输出滤波时间常数 RC (0 = 禁用)
-                .deadband = 0,                                   // 死区范围 (0 = 禁用)
-                .error_normalize_range = 0,                      // 误差归一化范围 (0 = 禁用, 需要 PID_ENABLE_ERROR_NORMALIZE)
-                .out_max = 0,                                    // 输出上限 (需要 PID_ENABLE_OUTPUT_LIMIT)
-                .out_min = 0,                                    // 输出下限 (需要 PID_ENABLE_OUTPUT_LIMIT)
-                .config_mask = PID_ENABLE_TRAPEZOID_INTEGRAL |   // 梯形积分
-                               PID_ENABLE_INTEGRAL_LIMIT |       // 积分限幅
-                               PID_ENABLE_CHANGING_INTEGRATION | // 变速积分
-                               PID_ENABLE_DERIVATIVE_ON_MEAS |   // 微分先行（避免目标阶跃的微分冲击）
-                               PID_ENABLE_DERIVATIVE_FILTER,     // 微分滤波
-            },
-        .pid_angle_setting =
-            {
-                .kp = 5,                                   // 比例系数（0.12→0.10，让位给微分阻尼）
-                .ki = 0,                                   // 积分系数 [1/s]（0.15→0.20，加快慢摆收敛）
-                .kd = 0.3f,                                // 微分系数（配合微分先行补相位裕度）
-                .integral_limit = 0,                       // 积分限幅阈值（实测峰值 i_out≈1.47，负载 +50% 仍有余量）
-                .coef_a = 0,                               // 变速积分参数 A (0 = 禁用)
-                .coef_b = 0,                               // 变速积分参数 B
-                .d_lpf_rc = 0,                             // 微分滤波时间常数 RC (0 = 禁用)
-                .out_lpf_rc = 0,                           // 输出滤波时间常数 RC (0 = 禁用)
-                .deadband = 0,                             // 死区范围 (0 = 禁用)
-                .error_normalize_range = 0,                // 误差归一化范围 (0 = 禁用, 需要 PID_ENABLE_ERROR_NORMALIZE)
-                .out_max = 0,                              // 输出上限 (需要 PID_ENABLE_OUTPUT_LIMIT)
-                .out_min = 0,                              // 输出下限 (需要 PID_ENABLE_OUTPUT_LIMIT)
-                .config_mask = PID_ENABLE_ERROR_NORMALIZE, // 启用误差归一化
-
-            },
+        .torque_constant = 1, // 转矩常数 Kt (Nm/A)，M3508 待标定（沿用旧 drv_motor 的 Kt=1 占位）
         .reload_count = 100,
         .fault_action = DAEMON_FAULT_NONE,
         .timeout_ms = 1, // CAN 发送超时(ms)
     };
-    BSP_ASSERT_APP_CALL(DJIMotorBroadcastConfig(&rudder_l_motor, &rudder_l_cfg));
-
-    // 配置 rudder_r（M3508，motor_id=4 → rx 0x204 / tx 0x200）
-    DJIMotorBroadcast_Config_s rudder_r_cfg = {
+    DrvsDJIMotorBroadcastConfig_s rudder_r_cfg = {
+        .group = &rudder_motor_group,
         .can_e = CAN_2,
-        .model = DJI_MODEL_M3508,
+        .model = DRVS_DJI_MODEL_M3508,
         .motor_id = 4,
-        .speed_lpf_enable = MOTOR_SPEED_LPF_ENABLE,
-        .speed_lpf_rc = 0.02f,
-        .position_offset = 0,
-        .torque_constant = 1, // M3508 电流→力矩系数，待标定
-        .controller_setting =
-            {
-                .loop_type = MOTOR_LOOP_ANGLE | MOTOR_LOOP_SPEED, // TODO: 后续改为位置/速度环
-                .feedback_direction = MOTOR_DIRECTION_NORMAL,     // 反馈方向
-                .motor_direction = MOTOR_DIRECTION_NORMAL,        // 输出方向
-                .position_mode = MOTOR_POSITION_WRAP,             // 开环占位，不用位置环
-                .angle_limit_max = M_PI * STEER_GEAR_RATIO,
-                .angle_limit_min = -M_PI * STEER_GEAR_RATIO,
-                .speed_feedforward_src = MOTOR_FEEDFORWARD_DISABLE,    // 速度前馈来源
-                .position_feedforward_src = MOTOR_FEEDFORWARD_DISABLE, // 位置前馈来源
-                .speed_feedforward_ptr = NULL,                         // 速度前馈指针
-                .position_feedforward_ptr = NULL,                      // 位置前馈指针
-                .angle_src = MOTOR_FEEDBACK_MOTOR,                     // 角度反馈来源
-                .speed_src = MOTOR_FEEDBACK_MOTOR,                     // 速度反馈来源
-                .angle_external_ptr = NULL,                            // 外部角度反馈指针
-                .speed_external_ptr = NULL,                            // 外部速度反馈指针
-            },
+        .torque_constant = 1, // 同 rudder_l
+        .reload_count = 100,
+        .fault_action = DAEMON_FAULT_NONE,
+        .timeout_ms = 1,
+    };
+    BSP_ASSERT_APP_CALL(DrvsDJIMotorBroadcastConfig(&rudder_l_motor, &rudder_l_cfg));
+    BSP_ASSERT_APP_CALL(DrvsDJIMotorBroadcastConfig(&rudder_r_motor, &rudder_r_cfg));
+
+    /* ---- 舵向控制核（drvlib_motor）：左右舵同参数，一份 cfg 配两个实例 ----
+     * 复刻旧 drv_motor 的语义：
+     *   loop_type   ANGLE|SPEED 两环都建（校准期由 ChassisCalibrateTick 临时收窄成 SPEED）
+     *   位置模式    WRAP，归一化范围 ±π×减速比（舵轮一周 = 电机 STEER_GEAR_RATIO 圈）
+     *   position_span 单圈 2π（M3508 编码器跨度），供多圈累加
+     *   方向        左右舵旧值均为 NORMAL（feedback/motor 须成对；只反一个会变成正反馈）
+     *   低通        速度/电流 20ms（旧 speed_lpf_rc=0.02）
+     * Config 会自动给位置/速度环补 TRAPEZOID_INTEGRAL，WRAP 下再给位置环补误差归一化。 */
+    DrvlibMotor_Config_s rudder_ctrl_cfg = {
+        .loop_type = DRVLIB_MOTOR_LOOP_ANGLE | DRVLIB_MOTOR_LOOP_SPEED,
+        .motor_direction = DRVLIB_MOTOR_DIRECTION_NORMAL,    // 输出方向
+        .feedback_direction = DRVLIB_MOTOR_DIRECTION_NORMAL, // 反馈方向
+        .position_mode = DRVLIB_MOTOR_POS_WRAP,
+        .angle_limit_min = -M_PI * STEER_GEAR_RATIO,
+        .angle_limit_max = M_PI * STEER_GEAR_RATIO,
+        .position_span = 6.2831853f, // 单圈 2π
+        .position_offset = 0,        // 光电门标定时由 RudderCalibrateOffset 改写
+        .lpf_enable = DRVLIB_MOTOR_LPF_ENABLE,
+        .lpf_rc = 0.02f,
+        .angle_feedforward_src = DRVLIB_MOTOR_FF_DISABLE, // 前馈来源
+        .speed_feedforward_src = DRVLIB_MOTOR_FF_DISABLE,
+        .current_feedforward_src = DRVLIB_MOTOR_FF_DISABLE,
+        .angle_feedforward_ptr = NULL, // 前馈指针
+        .speed_feedforward_ptr = NULL,
+        .current_feedforward_ptr = NULL,
         // 速度环整定依据 ignore/vofa+.csv（20s，0/30/60 rad/s 阶跃，2ms 周期，kp=0.12/ki=0.15 采得）：
         //   实测超调 30~38%，0→30 后还残留约 1rad/s 的慢摆（整定 1.2~4.8s）。
         //   由该数据辨识被控对象：Kt/J≈495 rad/s²/A、B/J≈3 /s、恒值负载≈1.2A、回路延迟≈6ms，
@@ -523,48 +465,51 @@ void AppChassisInit(void)
         //   kd 量纲：d_out = kd*(last_measure-measure)/dt，kd=0.002 即"每 2ms 速度变化 1rad/s 给 1A 阻尼"；
         //   实测速度噪声仅 ~0.045rad/s，经 4ms 微分滤波后噪声电流 <0.03A，可忽略。
         //   ⚠️ 积分语义：lib_pid 已修正为 i_out += ki*error*dt，ki 单位是"每秒"，不随调用频率变。
-        .pid_speed_setting =
+        .pid =
             {
-                .kp = 0.10f,                                     // 比例系数（0.12→0.10，让位给微分阻尼）
-                .ki = 0.20f,                                     // 积分系数 [1/s]（0.15→0.20，加快慢摆收敛）
-                .kd = 0.002f,                                    // 微分系数（配合微分先行补相位裕度）
-                .integral_limit = 2.5,                           // 积分限幅阈值（实测峰值 i_out≈1.47，负载 +50% 仍有余量）
-                .coef_a = 20,                                    // 变速积分参数 A (0 = 禁用)
-                .coef_b = 20,                                    // 变速积分参数 B
-                .d_lpf_rc = 0.004f,                              // 微分滤波时间常数 RC (0 = 禁用)
-                .out_lpf_rc = 0,                                 // 输出滤波时间常数 RC (0 = 禁用)
-                .deadband = 0,                                   // 死区范围 (0 = 禁用)
-                .error_normalize_range = 0,                      // 误差归一化范围 (0 = 禁用, 需要 PID_ENABLE_ERROR_NORMALIZE)
-                .out_max = 0,                                    // 输出上限 (需要 PID_ENABLE_OUTPUT_LIMIT)
-                .out_min = 0,                                    // 输出下限 (需要 PID_ENABLE_OUTPUT_LIMIT)
-                .config_mask = PID_ENABLE_TRAPEZOID_INTEGRAL |   // 梯形积分
-                               PID_ENABLE_INTEGRAL_LIMIT |       // 积分限幅
-                               PID_ENABLE_CHANGING_INTEGRATION | // 变速积分
-                               PID_ENABLE_DERIVATIVE_ON_MEAS |   // 微分先行（避免目标阶跃的微分冲击）
-                               PID_ENABLE_DERIVATIVE_FILTER,     // 微分滤波
+                [DRVLIB_MOTOR_STAGE_SPEED] =
+                    {
+                        .kp = 0.10f,                                     // 比例系数（0.12→0.10，让位给微分阻尼）
+                        .ki = 0.20f,                                     // 积分系数 [1/s]（0.15→0.20，加快慢摆收敛）
+                        .kd = 0.002f,                                    // 微分系数（配合微分先行补相位裕度）
+                        .integral_limit = 2.5,                           // 积分限幅阈值（实测峰值 i_out≈1.47，负载 +50% 仍有余量）
+                        .coef_a = 20,                                    // 变速积分参数 A (0 = 禁用)
+                        .coef_b = 20,                                    // 变速积分参数 B
+                        .d_lpf_rc = 0.004f,                              // 微分滤波时间常数 RC (0 = 禁用)
+                        .out_lpf_rc = 0,                                 // 输出滤波时间常数 RC (0 = 禁用)
+                        .deadband = 0,                                   // 死区范围 (0 = 禁用)
+                        .error_normalize_range = 0,                      // 误差归一化范围 (0 = 禁用)
+                        .out_max = 0,                                    // 输出上限 (需要 PID_ENABLE_OUTPUT_LIMIT)
+                        .out_min = 0,                                    // 输出下限 (需要 PID_ENABLE_OUTPUT_LIMIT)
+                        .config_mask = PID_ENABLE_TRAPEZOID_INTEGRAL |   // 梯形积分
+                                       PID_ENABLE_INTEGRAL_LIMIT |       // 积分限幅
+                                       PID_ENABLE_CHANGING_INTEGRATION | // 变速积分
+                                       PID_ENABLE_DERIVATIVE_ON_MEAS |   // 微分先行（避免目标阶跃的微分冲击）
+                                       PID_ENABLE_DERIVATIVE_FILTER,     // 微分滤波
+                    },
+                // 位置环：只上 P+D（无积分），误差归一化（WRAP 下由 Config 自动开）
+                [DRVLIB_MOTOR_STAGE_ANGLE] =
+                    {
+                        .kp = 50,                                  // 比例系数
+                        .ki = 0,                                   // 积分系数 [1/s]
+                        .kd = 0.3f,                                // 微分系数（补相位裕度）
+                        .integral_limit = 0,                       // 积分限幅阈值（未启用 INTEGRAL_LIMIT，0 无影响）
+                        .coef_a = 0,                               // 变速积分参数 A (0 = 禁用)
+                        .coef_b = 0,                               // 变速积分参数 B
+                        .d_lpf_rc = 0,                             // 微分滤波时间常数 RC (0 = 禁用)
+                        .out_lpf_rc = 0,                           // 输出滤波时间常数 RC (0 = 禁用)
+                        .deadband = 0,                             // 死区范围 (0 = 禁用)
+                        .error_normalize_range = 0,                // 误差归一化范围（WRAP 下 Config 会自动填）
+                        .out_max = 0,                              // 输出上限 (需要 PID_ENABLE_OUTPUT_LIMIT)
+                        .out_min = 0,                              // 输出下限 (需要 PID_ENABLE_OUTPUT_LIMIT)
+                        .config_mask = PID_ENABLE_ERROR_NORMALIZE, // 启用误差归一化
+                    },
             },
-        .pid_angle_setting =
-            {
-                .kp = 5,                                   // 比例系数（0.12→0.10，让位给微分阻尼）
-                .ki = 0,                                   // 积分系数 [1/s]（0.15→0.20，加快慢摆收敛）
-                .kd = 0.3f,                                // 微分系数（配合微分先行补相位裕度）
-                .integral_limit = 0,                       // 积分限幅阈值（实测峰值 i_out≈1.47，负载 +50% 仍有余量）
-                .coef_a = 0,                               // 变速积分参数 A (0 = 禁用)
-                .coef_b = 0,                               // 变速积分参数 B
-                .d_lpf_rc = 0,                             // 微分滤波时间常数 RC (0 = 禁用)
-                .out_lpf_rc = 0,                           // 输出滤波时间常数 RC (0 = 禁用)
-                .deadband = 0,                             // 死区范围 (0 = 禁用)
-                .error_normalize_range = 0,                // 误差归一化范围 (0 = 禁用, 需要 PID_ENABLE_ERROR_NORMALIZE)
-                .out_max = 0,                              // 输出上限 (需要 PID_ENABLE_OUTPUT_LIMIT)
-                .out_min = 0,                              // 输出下限 (需要 PID_ENABLE_OUTPUT_LIMIT)
-                .config_mask = PID_ENABLE_ERROR_NORMALIZE, // 启用误差归一化
-
-            },
-        .reload_count = 100,
-        .fault_action = DAEMON_FAULT_NONE,
-        .timeout_ms = 1, // CAN 发送超时(ms)
+        .dt_max = 0.01f,  // 单帧 dt 上限 (s)
+        .vofa_enable = 0, // 本 app 的 VOFA 通道自定义，不用控制核内置 CH1~CH3
     };
-    BSP_ASSERT_APP_CALL(DJIMotorBroadcastConfig(&rudder_r_motor, &rudder_r_cfg));
+    BSP_ASSERT_APP_CALL(DrvlibMotorConfig(&rudder_l_ctrl, &rudder_ctrl_cfg));
+    BSP_ASSERT_APP_CALL(DrvlibMotorConfig(&rudder_r_ctrl, &rudder_ctrl_cfg)); // 左右舵同参数
 
     // 避震方向看过去逆时针转动为正方向
     // 配置 wheel_l（LK MF7015V1-24V-23T，广播模式 motor_id=1 → 槽位 0，回复 ID 0x141）
@@ -734,17 +679,17 @@ void AppChassisInit(void)
     };
     BSP_ASSERT_APP_CALL(LKMotorBroadcastConfig(&wheel_r_motor, &wheel_r_cfg));
 
-    MotorEnable(&(rudder_l_motor.base));
-    MotorEnable(&(rudder_r_motor.base));
-    MotorEnable(&(wheel_l_motor.base));
+    DrvlibMotorEnable(&rudder_l_ctrl); // 舵向：drvlib 软件使能
+    DrvlibMotorEnable(&rudder_r_ctrl);
+    MotorEnable(&(wheel_l_motor.base)); // 车轮：旧 drv_motor 广播栈
     MotorEnable(&(wheel_r_motor.base));
 
     // 注册并配置两个光电门（改为控制任务轮询：回调置 NULL，不占 EXTI 分发）
     /* ⚠️ 侧别↔引脚：实机曾出现"转右舵只进 RudderPhotogate_l_Callback"，而当时 l 回调
      *    绑的是 PA2(GPIO_PWM_2)，说明右舵门在 PA2、左舵门在 PA0，故按下面填；
      *    改线后把这两行的 gpio_e 对调即可（实例名/回调/被标定电机三者保持同侧）。 */
-    rudder_l_gate_io.parent = &(rudder_l_motor.base);
-    rudder_r_gate_io.parent = &(rudder_r_motor.base);
+    rudder_l_gate_io.parent = &rudder_l_motor; // parent 仅作身份绑定；回调为 NULL，轮询不用它
+    rudder_r_gate_io.parent = &rudder_r_motor;
     BSP_ASSERT_APP_CALL(GPIORegister(&rudder_l_gate_io));
     BSP_ASSERT_APP_CALL(GPIORegister(&rudder_r_gate_io));
 
@@ -793,21 +738,84 @@ void AppChassisInit(void)
     LibFsmTableStart(&chassis_fsm);
 }
 
+/**
+ * @brief 把一个舵向控制核的一整套观测量写进连续 12 个 VOFA 通道（自外环向内环再到实际反馈）
+ * @param ch_base       起始通道：写 ch_base ~ ch_base+11
+ * @param ctrl          舵向控制核（drvlib_motor）
+ * @param steer_ref_motor 本拍喂给控制核的舵角给定（电机侧 rad；CAL 态是扫描速度，见调用处）
+ * @note 通道顺序：
+ *   +0  舵角给定(舵轮侧 rad)   +1  舵角实际(舵轮侧 rad)   +2  角度环误差(舵轮侧 rad)
+ *   +3  角度环 p_out(rad/s)    +4  角度环 d_out(rad/s)    +5  角度环输出 = 速度给定(rad/s)
+ *   +6  速度实际(rad/s)        +7  速度环误差(rad/s)
+ *   +8  速度环 p_out(A)        +9  速度环 i_out(A)        +10 下发力矩/电流(A)
+ *   +11 实际电流(A)
+ * @note 舵角类（+0/+1/+2）换算到舵轮侧（÷STEER_GEAR_RATIO）便于对着机械角读；
+ *       其余是控制核原生量纲（rad/s、A）。+10 是位置+速度环的最终输出，即下发电流。
+ */
+static void ChassisVofaRudder(uint8_t ch_base, const DrvlibMotorInstance *ctrl, float steer_ref_motor)
+{
+    const PIDInstance *pid_angle = &ctrl->pid[DRVLIB_MOTOR_STAGE_ANGLE];
+    const PIDInstance *pid_speed = &ctrl->pid[DRVLIB_MOTOR_STAGE_SPEED];
+    VofaSetChannel(ch_base + 0, steer_ref_motor * STEER_GEAR_RATIO_INV);            // 舵角给定
+    VofaSetChannel(ch_base + 1, (float)ctrl->data.position * STEER_GEAR_RATIO_INV); // 舵角实际
+    VofaSetChannel(ch_base + 2, pid_angle->error * STEER_GEAR_RATIO_INV);           // 角度环误差
+    VofaSetChannel(ch_base + 3, pid_angle->p_out);                                  // 角度环 p_out
+    VofaSetChannel(ch_base + 4, pid_angle->d_out);                                  // 角度环 d_out
+    VofaSetChannel(ch_base + 5, pid_angle->output);                                 // 角度环输出=速度给定
+    VofaSetChannel(ch_base + 6, ctrl->data.speed);                                  // 速度实际
+    VofaSetChannel(ch_base + 7, pid_speed->error);                                  // 速度环误差
+    VofaSetChannel(ch_base + 8, pid_speed->p_out);                                  // 速度环 p_out
+    VofaSetChannel(ch_base + 9, pid_speed->i_out);                                  // 速度环 i_out
+    VofaSetChannel(ch_base + 10, pid_speed->output);                                // 下发力矩/电流
+    VofaSetChannel(ch_base + 11, ctrl->data.current);                               // 实际电流
+}
+
 ITCM_RAM void AppChassisRun(float dt, uint64_t time_stamp)
 {
-    (void)dt;
     (void)time_stamp;
-    /* 状态机三步：① 校准推进（仅 CAL 态）→ ② 采样条件并（变化时）派发 → ③ 按状态执行给定。
-     * ① 必须在 ② 之前：标定完成/超时是 ② 的输入。这样在"最后一个光电门触发"的当拍就切到
-     * RUN 并解算（旧代码把完成判据放在 lunxunjioazhun 开头，要多等一拍 = 2ms 才进控制）。
-     * 每步只写 setref 变量，四个给定由本函数末尾统一 MotorSetRef。 */
-    ChassisCalibrateTick();
-    ChassisFsmUpdate();
+    const float dt_s = dt * 0.001f; // drvlib 的 dt 要秒；APP_TASK_DEF 给的 dt 是毫秒（见 bsp_app.h）
 
-    switch ((chassis_state_e)LibFsmTableCurrent(&chassis_fsm))
+    /* 采两舵向反馈：drvs 纯协议原始量 → drvlib 反馈结构（方向/多圈/偏置/低通都交给控制核） */
+    DrvsDJIMotorBroadcastData_s rudder_l_data = DrvsDJIMotorBroadcastGetData(&rudder_l_motor);
+    DrvsDJIMotorBroadcastData_s rudder_r_data = DrvsDJIMotorBroadcastGetData(&rudder_r_motor);
+    DrvlibMotorFeedback_s rudder_l_fb = {
+        .position = rudder_l_data.position,
+        .speed = rudder_l_data.speed,
+        .current = rudder_l_data.current,
+        .timestamp_us = rudder_l_data.timestamp_us,
+    };
+    DrvlibMotorFeedback_s rudder_r_fb = {
+        .position = rudder_r_data.position,
+        .speed = rudder_r_data.speed,
+        .current = rudder_r_data.current,
+        .timestamp_us = rudder_r_data.timestamp_us,
+    };
+
+    /* 本拍两舵向下发量（电流 A；Kt=1 下与 drvs 要的 Nm 数值相等）。失能态保持 0。 */
+    float rudder_l_cmd = 0.0f;
+    float rudder_r_cmd = 0.0f;
+
+    /* 本拍状态：由上一拍的派发决定，本拍内不再变（下一拍的派发在末尾，见下）。
+     * 顺序：① 按状态给出给定（舵向在这里喂本拍反馈 + 算下发量）→ ② 校准判光电门（用 ①
+     *       刚刷新的 data.position）→ ③ 采样条件并（变化时）派发 → ④ 下发。
+     * ⚠ 每拍每个舵向只跑一次 SetRef（① 里各调一次）；② 不能在 ① 之前（标定要本拍位置），
+     *   ③ 放到最后则状态变化下一拍生效（与旧 lunxunjioazhun 的 1 拍节奏一致）。 */
+    const chassis_state_e state = (chassis_state_e)LibFsmTableCurrent(&chassis_fsm);
+
+    switch (state)
     {
     case chassis_state_cal_e:
-        // 校准动作已在 ChassisCalibrateTick 里做过（给定=扫描速度），此处无需再写
+        // 扫描：舵向用纯速度环（位置环留到运行态），两舵轮以恒定速度转着找光电门
+        rudder_l_ctrl.cfg.loop_type = DRVLIB_MOTOR_LOOP_SPEED;
+        rudder_r_ctrl.cfg.loop_type = DRVLIB_MOTOR_LOOP_SPEED;
+        DrvlibMotorEnable(&rudder_l_ctrl);
+        DrvlibMotorEnable(&rudder_r_ctrl);
+        rudder_l_cmd = DrvlibMotorSetRef(&rudder_l_ctrl, jiaozhun_speed, &rudder_l_fb, dt_s);
+        rudder_r_cmd = DrvlibMotorSetRef(&rudder_r_ctrl, jiaozhun_speed, &rudder_r_fb, dt_s);
+        rudder_l_motor_setref = jiaozhun_speed; // 供 VOFA 观测
+        rudder_r_motor_setref = jiaozhun_speed;
+        wheel_l_motor_setref = 0; // 校准期车轮不动（其余流程照旧下发 0）
+        wheel_r_motor_setref = 0;
         break;
 
     case chassis_state_fault_e:
@@ -843,6 +851,12 @@ ITCM_RAM void AppChassisRun(float dt, uint64_t time_stamp)
     case chassis_state_run_e:
         ChassisMotorsEnable();
         HalfRudderSolve(&gimbal2chassis_data); // 逆解出四个给定 + 正解回填速度反馈
+        /* 舵向：位置+速度环算出下发力矩交给 drvs（Kt=1，A 与 Nm 数值相同）。
+         * ⚠ 顺序：HalfRudderSolve 读的是上一拍 SetRef 刷新的 data.position（本拍反馈在
+         *    SetRef 里才处理）——即几何解算的舵角滞后一拍(2ms)。舵向变化慢，可忽略；
+         *    想要零滞后就得把"处理反馈"和"跑环"拆开，drvlib 没提供该接口。 */
+        rudder_l_cmd = DrvlibMotorSetRef(&rudder_l_ctrl, rudder_l_motor_setref, &rudder_l_fb, dt_s);
+        rudder_r_cmd = DrvlibMotorSetRef(&rudder_r_ctrl, rudder_r_motor_setref, &rudder_r_fb, dt_s);
         break;
 
     default:
@@ -850,43 +864,37 @@ ITCM_RAM void AppChassisRun(float dt, uint64_t time_stamp)
         break;
     }
 
-    // 统一设置四个给定
-    MotorSetRef(&(rudder_l_motor.base), rudder_l_motor_setref);
-    MotorSetRef(&(rudder_r_motor.base), rudder_r_motor_setref);
+    // 校准判据：用上面 SetRef 刚刷新的 data.position（见函数注释），早一拍位置就旧了
+    if (state == chassis_state_cal_e)
+    {
+        ChassisCalibPollGate();
+    }
+
+    // 采样四个条件 + 变化才派发；状态变化从下一拍生效
+    ChassisFsmUpdate();
+
+    /* 下发：舵向走 drvs（一次组帧发两台 3508，故两个 SetRef 必须都在 GroupSend 之前完成）；
+     * 车轮仍走旧 drv_motor 广播栈（每个广播组任一成员调用即发整组帧）。失能态 cmd=0。 */
+    DrvsDJIMotorBroadcastSetRef(&rudder_l_motor, rudder_l_cmd);
+    DrvsDJIMotorBroadcastSetRef(&rudder_r_motor, rudder_r_cmd);
+    DrvsDJIMotorBroadcastGroupSend(&rudder_motor_group);
     MotorSetRef(&(wheel_l_motor.base), wheel_l_motor_setref);
     MotorSetRef(&(wheel_r_motor.base), wheel_r_motor_setref);
 
     // 电机发送
-    MotorSend(&(rudder_l_motor.base));
     MotorSend(&(wheel_l_motor.base));
 
-    // 发送
-    // rudder_r 速度环观测通道（ch1~8 沿用旧布局，便于复用已存的 VOFA+ 配置）：
-    //   1 位置  2 速度  3 力矩  4 积分项 i_out  5 比例项 p_out  6 PID 总输出
-    //   7 积分限幅(常量)  8 实际 ref（正常=setref，寻零期间=扫描速度给定）
-    // ch9~12 为本次整定补充：整定是否到位可直接看 9/12，若后续加微分再看 10。
-    VofaSetChannel(1, (float)wheel_r_motor.base.data_all.data.position);
-    VofaSetChannel(2, wheel_r_motor.base.data_all.data.speed);
-    VofaSetChannel(3, wheel_r_motor.base.data_all.data.torque);
-    VofaSetChannel(4, wheel_r_motor.base.controller.pid_speed.i_out);
-    VofaSetChannel(5, wheel_r_motor.base.controller.pid_speed.p_out);
-    VofaSetChannel(6, wheel_r_motor.base.controller.pid_speed.output);
-    VofaSetChannel(7, wheel_r_motor.base.controller.pid_speed.integral_limit);
-    VofaSetChannel(8, wheel_r_motor.base.controller.ref);                // 驱动实际用的 ref（寻零时是扫描给定）
-    VofaSetChannel(9, wheel_r_motor.base.controller.pid_speed.error);    // 误差 ref-measure
-    VofaSetChannel(10, wheel_r_motor.base.controller.pid_speed.d_out);   // 微分项（kd=0 时应恒 0）
-    VofaSetChannel(11, wheel_r_motor.base.controller.pid_speed.measure); // PID 实际用的反馈速度
-    VofaSetChannel(12, wheel_r_motor.base.controller.output);            // 最终电流/力矩命令（已含方向与量纲换算）
-    VofaSetChannel(13, wheel_r_motor.base.controller.pid_angle.error);
-    VofaSetChannel(14, wheel_r_motor.base.controller.pid_angle.output);
-    // ch15~20 半舵解算观测：舵角看"目标 vs 实际"是否重合（不重合查符号/减速比），
-    // 驱动看给定速度（拖动轮子时 17/20 应随实际转速变化方向一致）。
-    VofaSetChannel(15, rudder_l_motor_setref * STEER_GEAR_RATIO_INV);                             // 左舵目标舵角（舵轮侧 rad）
-    VofaSetChannel(16, (float)rudder_l_motor.base.data_all.data.position * STEER_GEAR_RATIO_INV); // 左舵实际
-    VofaSetChannel(17, wheel_l_motor_setref);                                                     // 左驱动给定（电机侧 rad/s）
-    VofaSetChannel(18, rudder_r_motor_setref * STEER_GEAR_RATIO_INV);                             // 右舵目标舵角
-    VofaSetChannel(19, (float)rudder_r_motor.base.data_all.data.position * STEER_GEAR_RATIO_INV); // 右舵实际
-    VofaSetChannel(20, wheel_r_motor_setref);                                                     // 右驱动给定
+    /* 发送：25 路全部给两个舵向控制核，看位置/速度双环的控制效果（顺序见 ChassisVofaRudder）。
+     *   ch1~12  左舵 12 项
+     *   ch13~24 右舵 12 项
+     *   ch25    底盘状态机当前状态（0=CAL 1=FAULT 2=SAFE 3=RUN）
+     * 读法：每组里 ch+0/+1 重合 = 舵角跟得上；+2→0 且 +5 不饱和 = 位置环正常；
+     *      +7→0 且 +10 是被控对象真正吃到的电流；+10 与 +11 长期不等查 Kt/方向。
+     * ⚠ CAL 态只有速度环在跑（+0 是扫描速度给定、+3~+5 是上一帧残留）；SAFE/FAULT 舵向失能，
+     *   各路为 0。跑起来后再录。 */
+    ChassisVofaRudder(1, &rudder_l_ctrl, rudder_l_motor_setref);
+    ChassisVofaRudder(13, &rudder_r_ctrl, rudder_r_motor_setref);
+    VofaSetChannel(25, (float)LibFsmTableCurrent(&chassis_fsm));
     VofaSend();
 
     CommSend(&gimbal_comm,
