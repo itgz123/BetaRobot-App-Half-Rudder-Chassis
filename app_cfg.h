@@ -37,6 +37,7 @@
 #define DRV_LKMOTOR_BROADCAST_USED   // LK 广播模式驱动（一拖四 V2.35，0x280）
 #define DRV_AXIS_MIT_LITE_USED       // 单轴 MIT 关节控制
 #define LIB_CHASSIS_HALF_RUDDER_USED // 底盘运动学内核（半舵封装：2 组舵轮正/逆解）
+#define LIB_FSM_TABLE_USED           // 表驱动状态机（底盘顶层状态机：校准/故障/失能/运行）
 #define DAEMON_USED                  // Daemon 看门狗
 #define VOFA_USED                    // VOFA+ JustFloat 遥测
 #define LIB_CRC_USED                 // 软件 CRC 计算（Direct/GenTable/TableCalc）
@@ -52,8 +53,8 @@
 
 // UART 选择
 #if DEVELOPMENT_BOARD == DM_MC02
-// #define VOFA_UART UART_7
-#define LOG_UART UART_7
+#define VOFA_UART UART_7
+// #define LOG_UART UART_7
 #elif DEVELOPMENT_BOARD == DJI_C // UART_1:4pin,UART_6:3pin
 // #define VOFA_UART
 #define LOG_UART UART_6

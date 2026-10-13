@@ -14,6 +14,7 @@
 //
 #include "lib_math.h"
 #include "lib_chassis_half_rudder.h"
+#include "lib_fsm_table.h" // 表驱动状态机（底盘顶层状态机）
 //
 #include "bsp_gpio.h"
 #include "bsp_sys_status.h"
@@ -24,7 +25,10 @@
 #define STEER_GEAR_RATIO 8.0f       // 减速比：电机 8 圈 = 舵轮 1 圈
 #define STEER_GEAR_RATIO_INV 0.125f // 减速比：电机 8 圈 = 舵轮 1 圈
 // 校准光电门
-#define jiaozhun_speed 8.0f
+#define jiaozhun_speed 24.0f
+// 校准超时：两光电门迟迟不跳变（传感器坏/线束断/挡片装反/电机堵转）时别无限转。
+// 标称转速下舵轮转满一圈约 2.1s（电机侧 24rad/s，减速比 8），留足余量取 5s。
+#define CHASSIS_CAL_TIMEOUT_TICKS 5000u // 2500 拍 × 2ms（任务周期见 app.c 的 CHASSIS_FREQ_MS）= 5s
 
 /* 变量 */
 // 实例
@@ -39,7 +43,7 @@ LKMOTOR_BROADCAST_INSTANCE_DEF(wheel_r_motor);
 // M3508 为增量编码器，上电无绝对零点，用两个光电门在转动中找机械零点。
 // 左舵 PA0 → GPIO_PWM_1，右舵 PA2 → GPIO_PWM_2（DM_MC02 映射）。
 // 遮光片是半遮半透的圆环：电机每转一圈，光电门电平"低→高→低"各变化一次，
-// 取其中一个跳变（上升沿）当零点即可——每圈有且仅有一个，且与电机旋向无关
+// 取其中一个跳变（本代码用下降沿 1→0）当零点即可——每圈有且仅有一个，且与电机旋向无关
 // （左右舵若镜像安装、旋向相反，同一个判据照样成立）。
 // CubeMX 里这两个脚仍配着上升沿 EXTI，但本方案改为在控制任务里轮询：
 // 回调置 NULL（不占 EXTI 分发），EXTI 触发时 BSP 层判空后直接返回，不影响轮询。
@@ -103,39 +107,6 @@ static void RudderCalibrateOffset_r()
 {
     RudderCalibrateOffset(&(rudder_r_motor.base), RUDDER_ZERO_OFFSET_R_DEG);
     rudder_r_inited = 1;
-}
-static uint8_t lunxunjioazhun()
-{
-    if (rudder_l_inited && rudder_r_inited)
-    {
-        rudder_l_motor.base.setting.loop_type = MOTOR_LOOP_SPEED | MOTOR_LOOP_ANGLE;
-        rudder_r_motor.base.setting.loop_type = MOTOR_LOOP_SPEED | MOTOR_LOOP_ANGLE;
-        return 1;
-    }
-
-    // 控制旋转
-    rudder_l_motor.base.setting.loop_type = MOTOR_LOOP_SPEED;
-    rudder_r_motor.base.setting.loop_type = MOTOR_LOOP_SPEED;
-    MotorEnable(&(rudder_l_motor.base));
-    MotorEnable(&(rudder_r_motor.base));
-    MotorSetRef(&(rudder_l_motor.base), jiaozhun_speed);
-    MotorSetRef(&(rudder_r_motor.base), jiaozhun_speed);
-
-    // 判断是否结束
-    if ((rudder_l_state == 1) && (0 == GPIORead(&rudder_l_gate_io)))
-    {
-        RudderCalibrateOffset_l();
-    }
-    if ((rudder_r_state == 1) && (0 == GPIORead(&rudder_r_gate_io)))
-    {
-        RudderCalibrateOffset_r();
-    }
-
-    // 记录上次状态
-    rudder_l_state = GPIORead(&rudder_l_gate_io);
-    rudder_r_state = GPIORead(&rudder_r_gate_io);
-
-    return 0;
 }
 /*============================ 半舵运动学（lib_chassis 内核） ============================*/
 /* 几何与解算全部交给 lib/lib_chassis 的 chassis_half_rudder 封装，本文件只做
@@ -229,6 +200,189 @@ static uint8_t GimbalCommIsOnline(void)
     return (media != NULL && media->daemon != NULL) ? DaemonIsOnline(media->daemon) : 1;
 }
 
+/*============================ 底盘顶层状态机（lib_fsm_table） ============================*/
+/* 状态 = 底盘"现在能干的事"，不是云台下发的档位：
+ *   CAL   上电校准：两舵轮扫描找光电门零点（此时不理会云台在线与否）
+ *   FAULT 校准失败（超时）：失能 + 给定清零，终态（需复位重启再标）
+ *   SAFE  已标定但不可动：云台掉线 或 云台下发 stop —— 失能 + 给定清零 + 作废指令
+ *   RUN   已标定且可动：使能 + 逆解/正解
+ * 产出：本状态下四电机的使能与给定（见 AppChassisRun 的 switch）。
+ * 事件只有一个"每拍更新"：状态完全由 (是否标定, 是否超时, 是否在线, 是否 stop) 决定，
+ * 与云台状态机同构——守卫划分状态空间、表顺序即优先级。
+ * ⚠ 校准是"上电即可做、与云台无关"的第一步：云台常没上电，故 CAL 不受 online 影响；
+ *   若把它一并拦掉，底盘会永远停在"未标定"状态起不了步（旧代码的同一顾虑）。 */
+typedef enum : uint8_t
+{
+    chassis_state_cal_e = 0, // 上电校准中
+    chassis_state_fault_e,   // 校准超时（故障）
+    chassis_state_safe_e,    // 未使能 / 云台掉线
+    chassis_state_run_e,     // 使能运行
+    chassis_state_count_e,   // 状态值域上界（= 动作表项数）
+} chassis_state_e;
+
+typedef enum : uint8_t
+{
+    chassis_ev_update_e = 0, // 每拍更新（把下面四个条件重新汇总）
+} chassis_event_e;
+
+typedef struct
+{
+    uint8_t cal_done;   // 两舵轮均已标定
+    uint8_t cal_fault;  // 校准超时（未标定且计时超限）
+    uint8_t online;     // 云台链路在线
+    uint8_t stopped;    // 云台下发模式为 stop
+    uint32_t cal_ticks; // 校准已持续拍数（超时判据）
+    uint8_t key_last;   // 上次派发时的条件打包（变化才派发，见 ChassisFsmUpdate）
+} ChassisFsmCtx_s;
+
+static ChassisFsmCtx_s chassis_fsm_ctx;
+static LibFsmTableInstance_s chassis_fsm;
+
+/*---------------- 守卫 ----------------*/
+/* 守卫必须无副作用且幂等：同 from/event 的多条规则会依次求值（见 lib_fsm_table.h）。
+ * 下面四个条件互斥，故表内先后只决定"故障优先、校准次之"这一条语义。 */
+static bool ChassisGuardFault(void *ctx, const void *event_data)
+{
+    (void)event_data;
+    return ((ChassisFsmCtx_s *)ctx)->cal_fault != 0;
+}
+static bool ChassisGuardCal(void *ctx, const void *event_data)
+{
+    (void)event_data;
+    ChassisFsmCtx_s *c = (ChassisFsmCtx_s *)ctx;
+    return (c->cal_done == 0) && (c->cal_fault == 0);
+}
+static bool ChassisGuardSafe(void *ctx, const void *event_data)
+{
+    (void)event_data;
+    ChassisFsmCtx_s *c = (ChassisFsmCtx_s *)ctx;
+    return (c->cal_done != 0) && ((c->online == 0) || (c->stopped != 0));
+}
+static bool ChassisGuardRun(void *ctx, const void *event_data)
+{
+    (void)event_data;
+    ChassisFsmCtx_s *c = (ChassisFsmCtx_s *)ctx;
+    return (c->cal_done != 0) && (c->online != 0) && (c->stopped == 0);
+}
+
+/*---------------- 转移表 ----------------*/
+/* 源状态一律通配：四条守卫已把 (标定 × 在线 × stop) 完全划分，落点唯一；
+ * 表顺序 = 优先级，故障排最前（一旦超时，无论别的条件如何都进故障）。 */
+static const LibFsmTableTransition_s chassis_fsm_table[] = {
+    {LIB_FSM_TABLE_ANY_STATE, chassis_ev_update_e, chassis_state_fault_e, ChassisGuardFault, NULL, LIB_FSM_TABLE_TRANS_EXTERNAL},
+    {LIB_FSM_TABLE_ANY_STATE, chassis_ev_update_e, chassis_state_cal_e, ChassisGuardCal, NULL, LIB_FSM_TABLE_TRANS_EXTERNAL},
+    {LIB_FSM_TABLE_ANY_STATE, chassis_ev_update_e, chassis_state_safe_e, ChassisGuardSafe, NULL, LIB_FSM_TABLE_TRANS_EXTERNAL},
+    {LIB_FSM_TABLE_ANY_STATE, chassis_ev_update_e, chassis_state_run_e, ChassisGuardRun, NULL, LIB_FSM_TABLE_TRANS_EXTERNAL},
+};
+LIB_FSM_TABLE_CHECK_TABLE(chassis_fsm_table);
+
+/*---------------- 进入动作 ----------------*/
+/* 校准结束进入运行的这一拍：舵向从"纯速度环扫描"切到"位置+速度环"，此后才由半舵解算
+ * 接管舵角。放进入动作里，只在跨状态那一刻执行一次（旧代码把这一步藏在 lunxunjioazhun
+ * 的 return 1 之前，每次进运行都要在同一个函数里读出来）。 */
+static void ChassisRunEntry(void *ctx)
+{
+    (void)ctx;
+    rudder_l_motor.base.setting.loop_type = MOTOR_LOOP_SPEED | MOTOR_LOOP_ANGLE;
+    rudder_r_motor.base.setting.loop_type = MOTOR_LOOP_SPEED | MOTOR_LOOP_ANGLE;
+}
+
+static const LibFsmTableStateActions_s chassis_fsm_actions[] = {
+    [chassis_state_cal_e] = {NULL, NULL},
+    [chassis_state_fault_e] = {NULL, NULL},
+    [chassis_state_safe_e] = {NULL, NULL},
+    [chassis_state_run_e] = {ChassisRunEntry, NULL},
+};
+LIB_FSM_TABLE_CHECK_ACTIONS(chassis_fsm_actions, chassis_state_count_e);
+
+/**
+ * @brief 四电机统一使能/失能
+ */
+static void ChassisMotorsEnable(void)
+{
+    MotorEnable(&(rudder_l_motor.base));
+    MotorEnable(&(rudder_r_motor.base));
+    MotorEnable(&(wheel_l_motor.base));
+    MotorEnable(&(wheel_r_motor.base));
+}
+static void ChassisMotorsDisable(void)
+{
+    MotorDisable(&(rudder_l_motor.base));
+    MotorDisable(&(rudder_r_motor.base));
+    MotorDisable(&(wheel_l_motor.base));
+    MotorDisable(&(wheel_r_motor.base));
+}
+
+/**
+ * @brief 校准推进一步（每拍一次；仅在校准态做实质动作）
+ * @note 未标定完成时给两舵轮扫描速度并轮询光电门跳变，跳变处重标零点；
+ *       两个都标定完 → rudder_*_inited 置位（由状态机切到运行态）；
+ *       计时超限仍未标定 → 由 ChassisFsmUpdate 判故障。
+ *       等价于旧 lunxunjioazhun 的"未完成"分支，只是不再兼任"是否完成"的返回值。
+ * @note 只写 setref 变量，不在此下发：四个给定由 AppChassisRun 末尾统一 MotorSetRef。
+ */
+static void ChassisCalibrateTick(void)
+{
+    if (LibFsmTableCurrent(&chassis_fsm) != chassis_state_cal_e)
+    {
+        return;
+    }
+
+    // 扫描：舵向用纯速度环（位置环留到运行态），两舵轮以恒定速度转着找光电门
+    rudder_l_motor.base.setting.loop_type = MOTOR_LOOP_SPEED;
+    rudder_r_motor.base.setting.loop_type = MOTOR_LOOP_SPEED;
+    MotorEnable(&(rudder_l_motor.base));
+    MotorEnable(&(rudder_r_motor.base));
+    rudder_l_motor_setref = jiaozhun_speed;
+    rudder_r_motor_setref = jiaozhun_speed;
+    wheel_l_motor_setref = 0;
+    wheel_r_motor_setref = 0;
+
+    // 光电门跳变（1→0 下降沿）处重标零点
+    if ((rudder_l_state == 1) && (0 == GPIORead(&rudder_l_gate_io)))
+    {
+        RudderCalibrateOffset_l();
+    }
+    if ((rudder_r_state == 1) && (0 == GPIORead(&rudder_r_gate_io)))
+    {
+        RudderCalibrateOffset_r();
+    }
+    // 记录本次电平，供下拍判边沿
+    rudder_l_state = GPIORead(&rudder_l_gate_io);
+    rudder_r_state = GPIORead(&rudder_r_gate_io);
+}
+
+/**
+ * @brief 每拍汇总条件，仅在条件变化时派发一次更新事件
+ * @note 状态完全由四个布尔量决定；若每拍都派发，同状态也会走一次外部自转移
+ *       （退出 + 进入各跑一遍），将来挂上状态动作就会每拍重跑，故只在变化时派发。
+ * @note 故障为终态：进入后不再派发（需复位重启才能重标）。
+ */
+static void ChassisFsmUpdate(void)
+{
+    ChassisFsmCtx_s *c = &chassis_fsm_ctx;
+
+    // 校准计时：仅在校准态累加
+    if (LibFsmTableCurrent(&chassis_fsm) == chassis_state_cal_e)
+    {
+        c->cal_ticks++;
+    }
+
+    // 采样四个条件
+    c->cal_done = (uint8_t)(rudder_l_inited && rudder_r_inited);
+    c->cal_fault = (uint8_t)((c->cal_done == 0) && (c->cal_ticks >= CHASSIS_CAL_TIMEOUT_TICKS));
+    c->online = GimbalCommIsOnline();
+    c->stopped = (uint8_t)(gimbal2chassis_data.enabled == robot_mode_stop);
+
+    // 打包成一个字节比较：任一条件变化就派发一次
+    uint8_t key = (uint8_t)(c->cal_done | (c->cal_fault << 1) | (c->online << 2) | (c->stopped << 3));
+    if ((key != c->key_last) && (LibFsmTableCurrent(&chassis_fsm) != chassis_state_fault_e))
+    {
+        LibFsmTableDispatch(&chassis_fsm, chassis_ev_update_e, NULL);
+    }
+    c->key_last = key;
+}
+
 void AppChassisInit(void)
 {
     // 半舵运动学内核：几何尺寸全部来自 robot_def.h（两组回转中心位置 + 驱动轮半径）。
@@ -309,7 +463,7 @@ void AppChassisInit(void)
             },
         .pid_angle_setting =
             {
-                .kp = 10,                                  // 比例系数（0.12→0.10，让位给微分阻尼）
+                .kp = 5,                                   // 比例系数（0.12→0.10，让位给微分阻尼）
                 .ki = 0,                                   // 积分系数 [1/s]（0.15→0.20，加快慢摆收敛）
                 .kd = 0.3f,                                // 微分系数（配合微分先行补相位裕度）
                 .integral_limit = 0,                       // 积分限幅阈值（实测峰值 i_out≈1.47，负载 +50% 仍有余量）
@@ -391,7 +545,7 @@ void AppChassisInit(void)
             },
         .pid_angle_setting =
             {
-                .kp = 10,                                  // 比例系数（0.12→0.10，让位给微分阻尼）
+                .kp = 5,                                   // 比例系数（0.12→0.10，让位给微分阻尼）
                 .ki = 0,                                   // 积分系数 [1/s]（0.15→0.20，加快慢摆收敛）
                 .kd = 0.3f,                                // 微分系数（配合微分先行补相位裕度）
                 .integral_limit = 0,                       // 积分限幅阈值（实测峰值 i_out≈1.47，负载 +50% 仍有余量）
@@ -585,7 +739,7 @@ void AppChassisInit(void)
     MotorEnable(&(wheel_l_motor.base));
     MotorEnable(&(wheel_r_motor.base));
 
-    // 注册并配置两个光电门（EXTI 上升沿，回调触发即写偏置）
+    // 注册并配置两个光电门（改为控制任务轮询：回调置 NULL，不占 EXTI 分发）
     /* ⚠️ 侧别↔引脚：实机曾出现"转右舵只进 RudderPhotogate_l_Callback"，而当时 l 回调
      *    绑的是 PA2(GPIO_PWM_2)，说明右舵门在 PA2、左舵门在 PA0，故按下面填；
      *    改线后把这两行的 gpio_e 对调即可（实例名/回调/被标定电机三者保持同侧）。 */
@@ -623,55 +777,84 @@ void AppChassisInit(void)
     };
     BSP_ASSERT_APP_CALL(CommRegister(&gimbal_comm));
     BSP_ASSERT_APP_CALL(CommConfig(&gimbal_comm, &gimbal_comm_cfg));
+
+    // 底盘顶层状态机：上电从"校准"起（旧代码的 lunxunjioazhun 第一拍也是从零状态开始扫），
+    // 等两个光电门标定完再判在线/使能决定进 RUN 还是 SAFE。
+    LibFsmTableConfig_s chassis_fsm_cfg = {
+        .initial_state = chassis_state_cal_e,
+        .transitions = chassis_fsm_table,
+        .transition_count = sizeof(chassis_fsm_table) / sizeof(chassis_fsm_table[0]),
+        .state_actions = chassis_fsm_actions, // 仅 RUN 的进入动作（切舵向环型）
+        .state_count = chassis_state_count_e,
+        .ctx = &chassis_fsm_ctx,
+        .trace_fn = NULL,
+    };
+    LibFsmTableInit(&chassis_fsm, &chassis_fsm_cfg);
+    LibFsmTableStart(&chassis_fsm);
 }
 
 ITCM_RAM void AppChassisRun(float dt, uint64_t time_stamp)
 {
     (void)dt;
     (void)time_stamp;
-    // 判断
-    if (lunxunjioazhun()) // 轮询校准；校准期间由该函数自行给扫描速度，此处不解算
-    {
-        /* 云台链路看门狗：掉线与云台主动失能走同一条停车路径（四个给定清零 + 四电机失能）。
-         * 判据放在最前：掉线时最后一帧下的无论是"使能 + 速度"还是别的，一律不予执行——
-         * 否则车会捧着几秒前的那帧速度指令一直跑下去。
-         * 注：只拦控制，不拦上面的轮询校准——标定时云台常未上电，若一并拦掉，
-         *     底盘会永远停在"未标定"状态起不了步。 */
-        if ((!GimbalCommIsOnline()) || (gimbal2chassis_data.enabled == robot_mode_stop))
-        {
-            MotorDisable(&(rudder_l_motor.base));
-            MotorDisable(&(rudder_r_motor.base));
-            MotorDisable(&(wheel_l_motor.base));
-            MotorDisable(&(wheel_r_motor.base));
-            // 给定一并清零，避免下次使能瞬间残留上一拍的舵角/速度
-            rudder_l_motor_setref = 0;
-            rudder_r_motor_setref = 0;
-            wheel_l_motor_setref = 0;
-            wheel_r_motor_setref = 0;
-            /* 收到的指令也一并作废，防止"链路刚恢复"那一拍：喂狗（置在线）与解包写
-             * gimbal2chassis_data 之间有微秒级窗口——本任务若正好插在中间，会拿着掉线
-             * 前的旧帧当新帧执行。清零后该窗口最多执行一拍"停车"，失效方向是安全的
-             * （若插空失败、读到的是 ISR 刚写好的新帧，那本就是一帧可用指令）。 */
-            gimbal2chassis_data.enabled = robot_mode_stop;
-            gimbal2chassis_data.vx = 0;
-            gimbal2chassis_data.vy = 0;
-            gimbal2chassis_data.w = 0;
-        }
-        else
-        {
-            MotorEnable(&(rudder_l_motor.base));
-            MotorEnable(&(rudder_r_motor.base));
-            MotorEnable(&(wheel_l_motor.base));
-            MotorEnable(&(wheel_r_motor.base));
-            HalfRudderSolve(&gimbal2chassis_data); // 逆解出四个给定 + 正解回填速度反馈
-        }
+    /* 状态机三步：① 校准推进（仅 CAL 态）→ ② 采样条件并（变化时）派发 → ③ 按状态执行给定。
+     * ① 必须在 ② 之前：标定完成/超时是 ② 的输入。这样在"最后一个光电门触发"的当拍就切到
+     * RUN 并解算（旧代码把完成判据放在 lunxunjioazhun 开头，要多等一拍 = 2ms 才进控制）。
+     * 每步只写 setref 变量，四个给定由本函数末尾统一 MotorSetRef。 */
+    ChassisCalibrateTick();
+    ChassisFsmUpdate();
 
-        // 设置
-        MotorSetRef(&(rudder_l_motor.base), rudder_l_motor_setref);
-        MotorSetRef(&(rudder_r_motor.base), rudder_r_motor_setref);
-        MotorSetRef(&(wheel_l_motor.base), wheel_l_motor_setref);
-        MotorSetRef(&(wheel_r_motor.base), wheel_r_motor_setref);
+    switch ((chassis_state_e)LibFsmTableCurrent(&chassis_fsm))
+    {
+    case chassis_state_cal_e:
+        // 校准动作已在 ChassisCalibrateTick 里做过（给定=扫描速度），此处无需再写
+        break;
+
+    case chassis_state_fault_e:
+        /* 校准超时（传感器坏/线束断/挡片装反/堵转）：失能 + 给定清零，终态。
+         * 不自动重试：多半是硬件真坏了，重标也不会好，需人工排查后复位重启。 */
+        ChassisMotorsDisable();
+        rudder_l_motor_setref = 0;
+        rudder_r_motor_setref = 0;
+        wheel_l_motor_setref = 0;
+        wheel_r_motor_setref = 0;
+        break;
+
+    case chassis_state_safe_e:
+        /* 云台链路看门狗：掉线与云台主动失能走同一条停车路径（四个给定清零 + 四电机失能）。
+         * 判据在守卫里（ChassisGuardSafe）：掉线时最后一帧下的无论是"使能 + 速度"还是别的，
+         * 一律不予执行——否则车会捧着几秒前的那帧速度指令一直跑下去。 */
+        ChassisMotorsDisable();
+        // 给定一并清零，避免下次使能瞬间残留上一拍的舵角/速度
+        rudder_l_motor_setref = 0;
+        rudder_r_motor_setref = 0;
+        wheel_l_motor_setref = 0;
+        wheel_r_motor_setref = 0;
+        /* 收到的指令也一并作废，防止"链路刚恢复"那一拍：喂狗（置在线）与解包写
+         * gimbal2chassis_data 之间有微秒级窗口——本任务若正好插在中间，会拿着掉线
+         * 前的旧帧当新帧执行。清零后该窗口最多执行一拍"停车"，失效方向是安全的
+         * （若插空失败、读到的是 ISR 刚写好的新帧，那本就是一帧可用指令）。 */
+        gimbal2chassis_data.enabled = robot_mode_stop;
+        gimbal2chassis_data.vx = 0;
+        gimbal2chassis_data.vy = 0;
+        gimbal2chassis_data.w = 0;
+        break;
+
+    case chassis_state_run_e:
+        ChassisMotorsEnable();
+        HalfRudderSolve(&gimbal2chassis_data); // 逆解出四个给定 + 正解回填速度反馈
+        break;
+
+    default:
+        // chassis_state_count_e 不是合法状态，枚举新增状态忘了加分支会落到这里
+        break;
     }
+
+    // 统一设置四个给定
+    MotorSetRef(&(rudder_l_motor.base), rudder_l_motor_setref);
+    MotorSetRef(&(rudder_r_motor.base), rudder_r_motor_setref);
+    MotorSetRef(&(wheel_l_motor.base), wheel_l_motor_setref);
+    MotorSetRef(&(wheel_r_motor.base), wheel_r_motor_setref);
 
     // 电机发送
     MotorSend(&(rudder_l_motor.base));
