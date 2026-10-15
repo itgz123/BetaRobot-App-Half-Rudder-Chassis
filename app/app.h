@@ -10,8 +10,8 @@ void function_in_main_c(void);
 
 /*============================================
  *            底盘-云台 CAN 通信数据结构
- *   （CAN1 / idseq / PROTO_CUSTOM：payload 即业务结构体，
- *   线上帧 = [0xA5][seq][payload N][CRC8][0x5A]，N = sizeof(结构体)）
+ *   （CAN1 / idseq / PROTO_EXT：payload 即业务结构体，先过扩展汉明码再算 CRC，
+ *   线上帧 = [0xA5][seq][汉明编码区 E][CRC8][0x5A]，N = sizeof(结构体)）
  *============================================*/
 #pragma pack(push, 1)
 /* 云台→底盘（13B）与底盘→云台（12B）各一结构体；两端 app.h 的定义须字节对齐
