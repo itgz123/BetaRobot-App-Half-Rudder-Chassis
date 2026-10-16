@@ -179,6 +179,9 @@ static void ChassisReadState(LibChassisState_s *st)
 static float s_steer_target_last[LIB_CHASSIS_HALF_RUDDER_NUM]; // 上次下发的目标舵角（舵轮侧连续角）
 static int8_t s_steer_reverse[LIB_CHASSIS_HALF_RUDDER_NUM];    // 迟滞状态：上一拍是否采用反向解
 static uint8_t s_steer_seeded;                                 // bit i = 轮 i 的上面两项已初始化
+/* 本拍实际乘进轮速的余弦系数（不是控制状态，只是留一份给 VOFA 观测：
+ * 上面存的是"想要转到哪"，它才是"这拍真打了多少折扣"）。 */
+static float s_steer_align[LIB_CHASSIS_HALF_RUDDER_NUM];
 
 /**
  * @brief 舵轮换向决策：内核的"期望轮向 + 轮速大小" → 目标舵角 + 带符号轮速
@@ -236,14 +239,36 @@ static float ChassisRudderSteer(uint8_t idx, float phi_des, float phi_cur, float
  * @param st           内核状态（取实测舵角）
  * @param steer_setref 输出：舵向电机位置给定 [电机侧 rad]
  * @param wheel_setref 输出：驱动电机速度给定 [电机侧 rad/s]（内核只给大小，符号在这里定）
+ * @note 轮速带**余弦优化**：再乘一个 cos(参考舵角 − 实际舵角)，见下面注释。
  */
 static void ChassisRudderOut(uint8_t idx, const LibChassisRef_s *ref, const LibChassisState_s *st, float *steer_setref, float *wheel_setref)
 {
     float speed_wheel = ref->wheel_speed[idx]; // 轮缘速度大小（≥ 0），反向解时下面取负
     int8_t reverse = 0;
+    float steer_ref, align;
 
-    *steer_setref = ChassisRudderSteer(idx, ref->steer_target[idx], st->steer_angle[idx], speed_wheel, &reverse) * STEER_GEAR_RATIO;
-    *wheel_setref = WHEEL_RADPS_TO_MOTOR_RADPS((reverse != 0) ? -speed_wheel : speed_wheel);
+    // 舵角参考（舵轮侧连续角）：本拍换向决策定下的、位置环要跟的那个角
+    steer_ref = ChassisRudderSteer(idx, ref->steer_target[idx], st->steer_angle[idx], speed_wheel, &reverse);
+    *steer_setref = steer_ref * STEER_GEAR_RATIO;
+
+    /* 余弦优化：驱动轮只有"轮面正对着希望的运动方向"时，推力才全部用在那个方向上；
+     * 舵向还没转到位时轮面偏了 θ，真正有用的分量只有 cos θ，其余把车往别处拽（侧滑/擦胎）。
+     * 故把轮速按 cos(参考舵角 − 实际舵角) 缩放：大角度回转过程中轮子不再全速硬推，
+     * 而是随舵角到位平滑起速；到位后 cos θ ≈ 1，与不做优化时完全一致。
+     * 小角度下 cos 很平（θ=10° 才降 1.5%），跟踪误差与舵角噪声几乎不会被放大。
+     * ⚠ 角差必须在**舵轮侧**算：cos 不是按比例的，换成电机侧算（角差再 ×8）得到的是另一个角。
+     * ⚠ 角差已被换向决策按迟滞分档削到 ≤ 90°+迟滞 = 105°；迟滞特意留出的 90°~105° 那一带里
+     *   cos 是负的，而负系数会让驱动轮倒转、把车往反方向拽，故下限钳到 0
+     *   （= 轮面垂直于目标方向，不推）。这一带只在迟滞边界上短暂出现。
+     * ⚠ cos 以 2π 为周期，而参考是连续角、实测被归一化在 ±π：两者相差整数个 2π 等价，
+     *   故不必先归一化角差。 */
+    align = Lib_Math_Cos(steer_ref - st->steer_angle[idx]);
+    if (align < 0.0f)
+    {
+        align = 0.0f;
+    }
+    s_steer_align[idx] = align; // 留档给 VOFA（ch26/27），与实际乘进去的是同一个数
+    *wheel_setref = WHEEL_RADPS_TO_MOTOR_RADPS(((reverse != 0) ? -speed_wheel : speed_wheel) * align);
 }
 
 /**
@@ -954,16 +979,29 @@ ITCM_RAM void AppChassisRun(float dt, uint64_t time_stamp)
     // 电机发送
     MotorSend(&(wheel_l_motor.base));
 
-    /* 25 路全部给两个舵向控制核，看位置/速度双环的控制效果（顺序见 ChassisVofaRudder）。
+    /* 27 路：两个舵向控制核 24 路 + 状态机 1 路 + 余弦系数 2 路（通道数见 app_cfg.h 的 VOFA_CHANNELS）。
      *   ch1~12  左舵 12 项
      *   ch13~24 右舵 12 项
      *   ch25    底盘状态机当前状态（0=CAL 1=FAULT 2=SAFE 3=RUN）
+     *   ch26/27 左右舵的余弦优化系数（本拍实际乘进轮速的那个值）
      * 读法：每组里 ch+0/+1 重合 = 舵角跟得上；+2→0 且 +5 不饱和 = 位置环正常；
      *      +7→0 且 +10 是被控对象真正吃到的电流；+10 与 +11 长期不等查 Kt/方向。
+     *      ch26/27：1 = 舵角已对齐（轮速不打折）、→0 = 轮面正垂直于目标方向（轮速被钳到 0），
+     *      中间随舵角到位平滑爬升。只做小幅修正时它一直贴着 1 属正常——cos 在小角度很平
+     *      （差 10° 才降 1.5%）；要看到它明显压低轮速，得是大角度回转（如直行切横移）。
      * ⚠ CAL 态只有速度环在跑（+0 是扫描速度给定）；SAFE/FAULT 舵向失能，各路为 0。 */
     ChassisVofaRudder(1, &rudder_l_ctrl, rudder_l_motor_setref, rudder_l_data.speed, rudder_l_data.current);
     ChassisVofaRudder(13, &rudder_r_ctrl, rudder_r_motor_setref, rudder_r_data.speed, rudder_r_data.current);
     VofaSetChannel(25, (float)LibFsmTableCurrent(&chassis_fsm));
+    /* 余弦系数只在 RUN 态由 HalfRudderSolve → ChassisRudderOut 更新；其余状态轮速本来就恒 0、
+     * 系数无从谈起，这里显式清零，免得看到上一段运行态留下的旧数（与舵向失能时那 12 路清 0 同理）。 */
+    if (state != chassis_state_run_e)
+    {
+        s_steer_align[LIB_CHASSIS_HALF_RUDDER_L] = 0.0f;
+        s_steer_align[LIB_CHASSIS_HALF_RUDDER_R] = 0.0f;
+    }
+    VofaSetChannel(26, s_steer_align[LIB_CHASSIS_HALF_RUDDER_L]);
+    VofaSetChannel(27, s_steer_align[LIB_CHASSIS_HALF_RUDDER_R]);
     VofaSend();
 
     CommSend(&gimbal_comm,

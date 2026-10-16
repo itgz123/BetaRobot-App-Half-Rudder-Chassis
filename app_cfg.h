@@ -41,6 +41,7 @@
 #define LIB_FSM_TABLE_USED           // 表驱动状态机（底盘顶层状态机：校准/故障/失能/运行）
 #define DAEMON_USED                  // Daemon 看门狗
 #define VOFA_USED                    // VOFA+ JustFloat 遥测
+#define VOFA_CHANNELS 27             // 用户通道数（覆盖 drv_vofa.h 的默认 25）：ch26/27 = 左右舵余弦优化系数
 #define LIB_CRC_USED                 // 软件 CRC 计算（Direct/GenTable/TableCalc）
 #define LIB_CRC_TABLES_USED          // 软件 CRC 常用算法 Flash 表（lib_crc_tables.c）
 #define LIB_HAMMING_USED             // 汉明码纠错（标准 / 扩展缩短 SECDED，任意 bit 长度）
