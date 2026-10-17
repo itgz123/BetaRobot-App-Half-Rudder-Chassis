@@ -10,6 +10,7 @@
 //
 #include "drvs_djimotor_broadcast.h" // DJI 广播纯协议层（舵向 2 个 M3508）
 #include "drvlib_motor.h"            // 三级级联 PID 控制核（舵向位置/速度环）
+#include "drvlib_bmi088_kalman.h"    // 底盘 IMU：通信 + 标定修正 + 线性卡尔曼（纯观测）
 //
 #include "drv_comm.h"
 #include "comm_media_can_idseq.h"
@@ -43,6 +44,201 @@ DRVLIB_MOTOR_INSTANCE_DEF(rudder_l_ctrl);
 DRVLIB_MOTOR_INSTANCE_DEF(rudder_r_ctrl);
 LKMOTOR_BROADCAST_INSTANCE_DEF(wheel_l_motor);
 LKMOTOR_BROADCAST_INSTANCE_DEF(wheel_r_motor);
+
+/*============================ 姿态传感器（BMI088） ============================*/
+/* 底盘 IMU：和云台同一套栈（drv_bmi088 只做通信 + drvlib_bmi088_kalman 做标定修正与姿态），
+ * 但**是另一颗器件、装在底盘车架上**，标定值不能沿用云台那份（见下面 s_bmi088_calib）。
+ *
+ * 用途有两个：
+ *   ① 观测：ch28/29 记世界系偏航角速度与航向角、ch30/31 记指令 w 与正解 w（见
+ *      AppChassisRun 末尾的通道说明）。
+ *   ② **偏航轴闭环**（2026-10-17 加入）：用原始陀螺在"世界向上"的投影 dot(gyro,u)
+ *      做 yaw rate 阻尼 + 航向保持，修正量在 CHASSIS_WIRE_TWIST_SIGN 之前注入 w
+ *      （见 ChassisYawLoopStep 与 app_chassis_def.h 的偏航闭环一节）。
+ *
+ * ⚠ 看门狗仍不挂离线动作（DAEMON_FAULT_NONE）：偏航闭环对 IMU 的依赖是**可旁路**的
+ *   —— 连续 CHASSIS_YAW_IMU_TIMEOUT_MS 没有新样本、或姿态没 seed 成功时，闭环自动
+ *   退化成原来的开环，底盘照跑。所以 IMU 掉线不应把车拦停。
+ * ⚠ 装法对 yaw 无影响、对倾角有：yaw_rate 是航向角的导数，IMU 绕 z 装偏多少都只差一个
+ *   常量偏置；但绕 x/y 的安装倾角会进 ψ̇ 的运动学换算（除以 cosθ），故须像云台那样
+ *   尽量装平（KF 会用加速度计自己认出静态倾角，不需要手填）。 */
+BMI088_KALMAN_INSTANCE_DEF(bmi088);
+
+/* ─────────── PC 端标定结果：写死进固件 ───────────
+ * ⚠ 这是**底盘车架上那颗** BMI088 的标定，与 app_gimbal.c 里那份（云台底座那颗）不是
+ *   同一颗器件，数值不可互抄。拟合流程与取值口径见 app_gimbal.c 同名结构体的注释：
+ *   上电静置录一段 → drvlib/drvlib_bmi088_calib/bmi088_calib.py（残差法：旧值 + 录到的残差）
+ *   → 填进 .gyro.bias → 重新编译烧录。
+ * 未标定（全 0）时的代价：yaw_rate 带一个零偏（量级 ~0.1°/s，把静止段的读数取均值即得），
+ * 它积分出的航向角会缓慢漂。本阶段只用它判"转没转、转多快"，够用；将来若要把 euler.yaw
+ * 当绝对航向用（例如喂给底盘航向环），必须先重标。 */
+static const BMI088_Calib_s s_bmi088_calib = {
+    .gyro =
+        {
+            /* 2026-10-17 静止段中位（`w 给0还是漂移.csv` 的 [12] 段）：gx 恰好 1 LSB，
+             * gy/gz 小于 1LSB(0.061°/s)。航向是纯积分，填上它可把零偏漂移压到 <0.06°/s。 */
+            .bias = {-0.001065f, 0.0f, 0.0f}, // ← 标定后填这里；其余项缺省 0 = 不修正
+        },
+};
+
+/*============================ 偏航轴闭环 ============================*/
+/* 反馈/控制律/参数见 app_chassis_def.h 的"偏航轴闭环"一节。这里只放状态机：
+ *   - Init 在进入 RUN 时调用（清积分项、重新播种角速度低通）；
+ *   - Step 每拍在 HalfRudderSolve 之前调用，返回**修正后的 wire w**；
+ *   - IMU 无数据/未 seed/超时 ⇒ 自动旁路，返回原指令（开环）。
+ * 符号：w_cmd 与 yaw_rate 都是物理/线协议约定（w>0 = 俯视逆时针），
+ *       所以"实测正转 → 减一点 w"就是负反馈；修正量在 CHASSIS_WIRE_TWIST_SIGN
+ *       之前注入，与云台指令同一条链路。 */
+typedef struct
+{
+    float rate_lpf;   // 低通后的物理 yaw rate (rad/s)
+    float integ;      // 速率误差积分 [rad/s]，等价于"航向误差"折算成的 w 修正
+    float err;        // 本拍速率误差 w_cmd − yaw_rate (rad/s)，供 VOFA
+    float corr;       // 本拍施加的 w 修正 (rad/s，已过变化率限制)，供 VOFA
+    float corr_last;  // 上一拍的修正量，用于变化率限制
+    uint64_t last_ts; // 上次看到的陀螺时间戳 (us)，用于判新鲜度
+    uint32_t stale_ms; // 连续没有新样本的时长 (ms)
+    uint8_t seeded;    // 0 = 角速度低通/积分器还没播种
+} ChassisYawLoop_s;
+
+static ChassisYawLoop_s s_yaw_loop;
+
+static void ChassisYawLoopInit(void)
+{
+    s_yaw_loop.rate_lpf = 0.0f;
+    s_yaw_loop.integ = 0.0f;
+    s_yaw_loop.err = 0.0f;
+    s_yaw_loop.corr = 0.0f;
+    s_yaw_loop.corr_last = 0.0f;
+    s_yaw_loop.last_ts = 0;
+    s_yaw_loop.stale_ms = 0;
+    s_yaw_loop.seeded = 0;
+}
+
+/**
+ * @brief 偏航闭环一拍：返回修正后的 wire w（物理约定，w>0 = 俯视逆时针）
+ * @param w_cmd   云台下发的 w（物理约定）
+ * @param imu     本拍 IMU 输出（用 gyro 原始量，不用 KF 的 yaw_rate）
+ * @param dt_ms   控制周期（ms）
+ * @param steer_l 左舵实测轮角 [rad]（舵轮侧，不是电机侧）
+ * @param steer_r 右舵实测轮角 [rad]
+ * @note IMU 不可用时原样返回 w_cmd（开环），不会因为观测件掉线把车拦停。
+ * @note 权限门控：两轮 |cos(舵角)| 都要 > CHASSIS_YAW_MIN_AUTHORITY 才闭环。
+ *       半舵底盘 `v_i = v·g ∓ a·w·cosδ`，cosδ≈0（横移）时差模**没有**偏航权限，
+ *       此时硬修只会把轮向从平移方向拽开（首份日志的 ±2.5rad/s 极限环就是这么来的）。
+ *       门控关断时返回原 w_cmd、冻结积分（不重置，切回有权限时接着用）。
+ */
+static float ChassisYawLoopStep(float w_cmd, const BMI088Kalman_Data_t *imu, float dt_ms,
+                                float steer_l, float steer_r)
+{
+    const float dt_s = dt_ms * 0.001f;
+
+    s_yaw_loop.err = 0.0f;
+    s_yaw_loop.corr = 0.0f;
+
+    if ((imu == 0) || (imu->time_stamp_g == 0) || (imu->valid == 0))
+    {
+        ChassisYawLoopInit();
+        return w_cmd;
+    }
+
+    // 新鲜度：每秒 1000 个样本 ⇒ 500Hz 任务每拍都该见到新时间戳
+    if (imu->time_stamp_g != s_yaw_loop.last_ts)
+    {
+        s_yaw_loop.last_ts = imu->time_stamp_g;
+        s_yaw_loop.stale_ms = 0;
+    }
+    else
+    {
+        s_yaw_loop.stale_ms += (uint32_t)dt_ms;
+        if (s_yaw_loop.stale_ms > CHASSIS_YAW_IMU_TIMEOUT_MS)
+        {
+            ChassisYawLoopInit();
+            return w_cmd;
+        }
+    }
+
+    // 物理 yaw rate = 机体系陀螺在"世界向上"方向的投影（安装常量，见 app_chassis_def.h）
+    float rate = imu->gyro[0] * CHASSIS_IMU_UP_X +
+                 imu->gyro[1] * CHASSIS_IMU_UP_Y +
+                 imu->gyro[2] * CHASSIS_IMU_UP_Z;
+
+    if (!s_yaw_loop.seeded)
+    {
+        // 首拍直接吃进当前角速度，避免低通从 0 爬升时产生一段假阻尼
+        s_yaw_loop.rate_lpf = rate;
+        s_yaw_loop.integ = 0.0f;
+        s_yaw_loop.seeded = 1;
+    }
+
+    if (CHASSIS_YAW_RATE_LPF_RC > 0.0f)
+    {
+        const float alpha = dt_s / (CHASSIS_YAW_RATE_LPF_RC + dt_s);
+        s_yaw_loop.rate_lpf += alpha * (rate - s_yaw_loop.rate_lpf);
+        rate = s_yaw_loop.rate_lpf;
+    }
+
+    // 偏航权限：两轮都要 |cos(舵角)| 足够大，差模才推得动车体。
+    // 横移（舵角≈±90°）时门控关断：只观测、不修正，避免把轮向从平移方向拽开。
+    const float authority_l = Lib_Math_Cos(steer_l);
+    const float authority_r = Lib_Math_Cos(steer_r);
+    if ((Lib_Math_Fabs(authority_l) < CHASSIS_YAW_MIN_AUTHORITY) ||
+        (Lib_Math_Fabs(authority_r) < CHASSIS_YAW_MIN_AUTHORITY))
+    {
+        s_yaw_loop.err = w_cmd - rate;
+        s_yaw_loop.corr = 0.0f;
+        s_yaw_loop.corr_last = 0.0f; // 重新开环时从 0 平滑起修，别攒着猛甩
+        return w_cmd;
+    }
+
+    // 速率误差 PI：P 阻尼、I 消稳态漂移（I 本身就是 ∫(w_cmd−yaw_rate)dt，
+    // 即"指令航向 − 实测航向"，只是不显式积分两个角、避免 wrap 的边界问题）。
+    const float err = w_cmd - rate;
+    const float corr_raw = CHASSIS_YAW_RATE_KP * err + s_yaw_loop.integ;
+
+    // 条件积分抗饱和：输出已顶到限幅、且误差还在往同方向推时，冻结积分。
+    if (!(((corr_raw > CHASSIS_YAW_CORR_MAX) && (err > 0.0f)) ||
+          ((corr_raw < -CHASSIS_YAW_CORR_MAX) && (err < 0.0f))))
+    {
+        s_yaw_loop.integ += CHASSIS_YAW_RATE_KI * err * dt_s;
+        if (s_yaw_loop.integ > CHASSIS_YAW_INTEGRAL_MAX)
+        {
+            s_yaw_loop.integ = CHASSIS_YAW_INTEGRAL_MAX;
+        }
+        else if (s_yaw_loop.integ < -CHASSIS_YAW_INTEGRAL_MAX)
+        {
+            s_yaw_loop.integ = -CHASSIS_YAW_INTEGRAL_MAX;
+        }
+    }
+
+    float corr = CHASSIS_YAW_RATE_KP * err + s_yaw_loop.integ;
+    if (corr > CHASSIS_YAW_CORR_MAX)
+    {
+        corr = CHASSIS_YAW_CORR_MAX;
+    }
+    else if (corr < -CHASSIS_YAW_CORR_MAX)
+    {
+        corr = -CHASSIS_YAW_CORR_MAX;
+    }
+
+    /* 变化率限制：陀螺噪声/换向瞬间 err 会跳，P 项一拍就能把轮向打翻。
+     * 首份日志里修正量在 ±1.0 之间 bang-bang、舵角跟着 0/π↔±90° 来回扫，
+     * 就是没有这层限制。限幅后修正量按 CHASSIS_YAW_CORR_SLEW 线性逼近目标。 */
+    const float max_step = CHASSIS_YAW_CORR_SLEW * dt_s;
+    if (corr > s_yaw_loop.corr_last + max_step)
+    {
+        corr = s_yaw_loop.corr_last + max_step;
+    }
+    else if (corr < s_yaw_loop.corr_last - max_step)
+    {
+        corr = s_yaw_loop.corr_last - max_step;
+    }
+
+    s_yaw_loop.err = err;
+    s_yaw_loop.corr = corr;
+    s_yaw_loop.corr_last = corr;
+    return w_cmd + corr;
+}
 
 /*============================ 光电门（M3508 增量编码器零点标定） ============================*/
 // M3508 为增量编码器，上电无绝对零点，用两个光电门在转动中找机械零点。
@@ -81,6 +277,9 @@ static float rudder_l_motor_setref = 0;
 static float rudder_r_motor_setref = 0;
 static float wheel_l_motor_setref = 0;
 static float wheel_r_motor_setref = 0;
+
+/* VOFA 发帧分频计数（控制 500Hz → 遥测 250Hz，见 app_chassis_def.h 的 CHASSIS_VOFA_SEND_DIV） */
+static uint8_t s_vofa_send_div = 0;
 
 static uint8_t rudder_l_state = 0;
 static uint8_t rudder_r_state = 0;
@@ -130,8 +329,8 @@ static void RudderCalibrateOffset_r(void)
  *   逆解：底盘速度 (vx,vy,w) → 2 组 {目标舵角, 驱动速度}
  *   正解：2 组 {驱动速度, 当前舵角} → 底盘速度（里程计：2 组舵轮给 4 个方程解 3 个未知量）
  * 内核输出的舵轮量是"期望轮向 + 轮速大小"（纯几何、无跨帧状态）：在 φ 与 φ+180° 两个
- * 等价解里挑哪个、驱动要不要反转，是**离散决策**、需要迟滞才不抖，故落在本层
- * （见 ChassisRudderSteer）；内核那边不做选择，也就不需要记任何东西。
+ * 等价解里挑哪个、驱动要不要反转，是**离散决策**必须看整车（两轮同拍翻）才不抖，
+ * 故落在本层（见 ChassisRudderDecide）；内核那边不做选择，也就不需要记任何东西。
  *
  * 约定（与内核一致）：舵角用"舵轮侧 rad"（0 = 正前方，即光电门标定后的零点），
  *   车体系 x+ 前、y+ 左、w+ 逆时针；驱动速度在文件里进出都是"电机侧 rad/s"
@@ -169,67 +368,227 @@ static void ChassisReadState(LibChassisState_s *st)
     st->wheel_speed[LIB_CHASSIS_HALF_RUDDER_R] = MOTOR_RADPS_TO_WHEEL_RADPS((float)MotorGetData(&(wheel_r_motor.base)).speed);
 }
 
-/*============================ 舵轮换向（最近 180° 等价解 + 迟滞） ============================*/
+/*============================ 舵轮换向决策（档2：短时域代价预测） ============================*/
 /* 内核只给"期望轮向 + 轮速大小"（纯几何、无状态）；在 φ_des 与 φ_des+180° 两个等价解里
  * 挑哪个、驱动轮要不要反转、静止时保持哪个朝向，都是**离散决策**，放本层。
- * 判据是"|角差| 是否超过 90°"，而这条线恰好是两种解**等贵**的地方——轮面垂直于期望速度
- * 方向时（对称工况、被反推、舵角反馈噪声），取舍会在噪声下逐拍翻转：目标舵角每拍跳 ±180°、
- * 驱动符号跟着翻，位置环（kp=50）被反复踢。故判据必须带迟滞，而迟滞要跨帧记忆。
- * ⚠ 这三项与 s_chassis 一样由控制任务独占（无锁），不得在别的上下文读改写。 */
-static float s_steer_target_last[LIB_CHASSIS_HALF_RUDDER_NUM]; // 上次下发的目标舵角（舵轮侧连续角）
-static int8_t s_steer_reverse[LIB_CHASSIS_HALF_RUDDER_NUM];    // 迟滞状态：上一拍是否采用反向解
-static uint8_t s_steer_seeded;                                 // bit i = 轮 i 的上面两项已初始化
+ *
+ * 判据 = 短时域预测的代价（FCS-MPC 的退化形态，见 app_chassis.md §2.2）：把 4 个候选
+ * （两轮各取 0/1）各自演一遍过渡过程，取代价最小者——
+ *   舵角：从实测角以 ω_max 走最短弧到候选目标，到位后保持（时间最优/砰-砰）；
+ *   轮速：按余弦律 s_i = V_i·cos(d_i − φ_i(t)) 跟着舵角走（§2.1：这个式子与分支恒等，
+ *         两个候选给的轮速一模一样，差别**只在 φ(t) 走哪条弧**，故不钳负）；
+ *   整车：每步喂 LibChassisForward 得 ξ̂ —— 正解里含"轮面不侧滑"约束，过渡期舵轮斜着推
+ *         时的推力损失、以及两轮不对称产生的偏航，都被自动算进去，不用给工况分类；
+ *   代价：J(c) = ∫₀ᵀ ‖ξ̂(t;c) − ξ*‖²_W dt，T = 最慢一轮的到位时间（makespan）。
+ * ⚠ **不能只比"谁转到位更快"**：两轮对称起步的纯平移，四个候选的 T 完全相同（都转 180°−|e|，
+ *   只是反向）——时间是零信息量，能分开好坏的只有过渡期的偏航（§2.2 表1/表2）。这里的
+ *   "时间"没有丢：T 取候选**自己的** makespan，演得慢的那个自然积得多。
+ * ⚠ 决策仍是**两轮一起做**，但不再靠"平移/自旋"分类：比的是"两轮合成 twist vs 指令 twist"，
+ *   一个翻一个不翻会立刻以偏航的形式反映到 J 里（§2.2）。档1 的 SYNC 判据随之删除。
+ * ⚠ 决策必须两轮同拍落地：先算完 4 个候选再一起 ChassisRudderApply。
+ * ⚠ 状态同样由控制任务独占（无锁），不得在别的上下文读改写。 */
+static float s_steer_target_last[LIB_CHASSIS_HALF_RUDDER_NUM]; // 本拍下发的目标舵角（舵轮侧连续角）
+static int8_t s_steer_reverse[LIB_CHASSIS_HALF_RUDDER_NUM];    // 本拍是否采用反向解（每拍重算，不是记忆）
+static uint8_t s_steer_seeded;                                 // bit i = 轮 i 的首拍锚定已完成
 /* 本拍实际乘进轮速的余弦系数（不是控制状态，只是留一份给 VOFA 观测：
  * 上面存的是"想要转到哪"，它才是"这拍真打了多少折扣"）。 */
 static float s_steer_align[LIB_CHASSIS_HALF_RUDDER_NUM];
 
 /**
- * @brief 舵轮换向决策：内核的"期望轮向 + 轮速大小" → 目标舵角 + 带符号轮速
- * @param idx     轮序号（< LIB_CHASSIS_HALF_RUDDER_NUM，取本层的迟滞状态）
- * @param phi_des 内核给的期望轮向 [rad]（舵轮侧；本拍 speed == 0 时无意义）
+ * @brief 写下一轮的目标舵角与分支：把 |角差| 按选择结果折算到 φ_des 或 φ_des±180°
+ * @param idx 轮序号
+ * @param e   不翻转时的角差 wrap(phi_des − phi_cur) [rad]
+ * @param rev 本拍分支：1 = 取反向解（目标舵角再偏 ±180°、驱动反转）
  * @param phi_cur 当前舵角 [rad]（舵轮侧实测，按连续角用）
- * @param speed   内核给的轮缘速度**大小** [rad/s]（恒 ≥ 0；0 表示内核判为"不需转向"）
- * @param reverse 输出：1=选了反向解、驱动轮需反转；0=不反转。可为 NULL
- * @return 目标舵角 [rad]（舵轮侧连续角）
- * @note speed == 0（内核按 LIB_CHASSIS_STEER_SPEED_EPS 判）：保持**上次目标舵角**、驱动停转。
- *       不拿实测舵角当目标：它是带噪声的归一化读数，拿它当目标等于把噪声直接喂进位置环。
- * @note speed > 0：判据 |wrap(phi_des − phi_cur)| 是否超过 90°，阈值按上一拍的取舍分两档
- *       （± CHASSIS_STEER_HYST_RAD，见 app_chassis_def.h），带宽内沿用上一拍的选择；
- *       选反向解时角差再补 ±180°（即"舵朝 φ_des+180°、轮子反转"这个等价解）。
- * @note 首拍锚到当前实测舵角（别一上来就把舵甩到别处），之后由本层记忆接管。
  */
-static float ChassisRudderSteer(uint8_t idx, float phi_des, float phi_cur, float speed, int8_t *reverse)
+static void ChassisRudderApply(uint8_t idx, float e, int8_t rev, float phi_cur)
 {
-    uint8_t bit = (uint8_t)(1u << idx);
-    float e, th;
-    int8_t rev;
-
-    if ((s_steer_seeded & bit) == 0u)
-    {
-        s_steer_target_last[idx] = phi_cur;
-        s_steer_reverse[idx] = 0;
-        s_steer_seeded |= bit;
-    }
-
-    if (speed <= 0.0f)
-    {
-        if (reverse != NULL)
-            *reverse = 0;
-        return s_steer_target_last[idx];
-    }
-
-    e = Lib_Math_WrapAngleNegPIToPI(phi_des - phi_cur); // (-π, π]
-    th = (s_steer_reverse[idx] != 0) ? (M_PI_2 - CHASSIS_STEER_HYST_RAD) : (M_PI_2 + CHASSIS_STEER_HYST_RAD);
-    rev = (FABS(e) > th) ? 1 : 0;
-
     if (rev != 0)
         e -= (e > 0.0f) ? (float)M_PI : -(float)M_PI;
 
     s_steer_reverse[idx] = rev;
     s_steer_target_last[idx] = phi_cur + e;
-    if (reverse != NULL)
-        *reverse = rev;
-    return s_steer_target_last[idx];
+}
+
+/* 预测一个候选所需的本拍量：每轮的期望轮向 d_i、轮速大小 V_i、实测舵角 φ_i；
+ * moving 是本拍在转的轮（内核给 wheel_speed = 0 的轮不转也不出力）。 */
+typedef struct
+{
+    float d[LIB_CHASSIS_HALF_RUDDER_NUM];
+    float v[LIB_CHASSIS_HALF_RUDDER_NUM];
+    float phi[LIB_CHASSIS_HALF_RUDDER_NUM];
+    uint8_t moving;
+} ChassisRudderPred_s;
+
+/**
+ * @brief 预测候选分支 (rev_l, rev_r) 的代价 J = ∫₀ᵀ ‖ξ̂(t) − ξ*‖²_W dt
+ * @param inst   内核实例（正解要用它，会被重算雅可比——本函数在 HalfRudderSolve 的那次正解之前跑，
+ *               故留下的中间状态随后即被覆盖，不影响反馈回填）
+ * @param twist  指令 twist（车体系，**与内核同一个坐标系**：调用方已经取过负号）
+ * @param p      本拍预测输入（期望轮向/轮速大小/实测舵角/哪几个轮在动）
+ * @param rev_l  左轮候选分支（0 = 正解，1 = 反解）
+ * @param rev_r  右轮候选分支
+ * @param vscale 线速度误差的归一键（|v*|，见 ChassisRudderDecide）
+ * @param wscale 偏航误差的归一键（|w*|，见 ChassisRudderDecide）
+ * @return 代价（越小越好）；0 = 两轮本拍都已在候选目标角 1° 内（J 非负 ⇒ 必为全局最优）；
+ *         CHASSIS_STEER_COST_INFEASIBLE = 该候选下正解几何退化，不可比
+ */
+static float ChassisRudderCost(LibChassisInstance_s *inst, const vector3_t *twist,
+                               const ChassisRudderPred_s *p, uint8_t rev_l, uint8_t rev_r,
+                               float vscale, float wscale)
+{
+    const uint8_t rev[LIB_CHASSIS_HALF_RUDDER_NUM] = {rev_l, rev_r};
+    float delta[LIB_CHASSIS_HALF_RUDDER_NUM];
+    float travel = 0.0f; // 两轮的共同到位时间由最慢的一轮决定（makespan）
+    float t_end, dt, j = 0.0f;
+    uint8_t i, k;
+
+    for (i = 0; i < LIB_CHASSIS_HALF_RUDDER_NUM; i++)
+    {
+        /* 候选目标 = 期望轮向，反向解再偏 ±180°（两解等价，只是让舵轮走另一条弧） */
+        const float target = p->d[i] - ((rev[i] != 0) ? (float)M_PI : 0.0f);
+
+        // 本拍不转的轮：行程为 0（目标角由 Apply 保持，不参与预测）
+        delta[i] = ((p->moving & (uint8_t)(1u << i)) != 0u)
+                       ? Lib_Math_WrapAngleNegPIToPI(target - p->phi[i])
+                       : 0.0f;
+        if (FABS(delta[i]) > travel)
+            travel = FABS(delta[i]);
+    }
+
+    /* 两轮都已在目标角附近：演出来也只有这点残差，且 J 非负 ⇒ 0 是最小值，直接返回。
+     * 稳态跟踪走这条快路径（实测角度环误差 rms 0.05°），不跑下面的循环。 */
+    if (travel < CHASSIS_STEER_COST_ZERO_RAD)
+        return 0.0f;
+
+    t_end = travel / CHASSIS_STEER_OMEGA_MAX_RAD; // 候选自己的 makespan：转得慢的积得多
+    dt = t_end / (float)CHASSIS_STEER_COST_STEPS;
+
+    for (k = 0; k < CHASSIS_STEER_COST_STEPS; k++)
+    {
+        const float t = ((float)k + 0.5f) * dt; // 中点法：采样点全落在过渡期内（含收尾）
+        LibChassisState_s st = {0};
+        vector3_t xi;
+        float dvx, dvy, dw;
+
+        for (i = 0; i < LIB_CHASSIS_HALF_RUDDER_NUM; i++)
+        {
+            float phi = p->phi[i];
+
+            if (FABS(delta[i]) > 1e-6f)
+            {
+                float frac = t * CHASSIS_STEER_OMEGA_MAX_RAD / FABS(delta[i]);
+                if (frac > 1.0f)
+                    frac = 1.0f; // 到位后保持（砰-砰：全程 ω_max，不做减速收尾）
+                phi += delta[i] * frac;
+            }
+
+            st.steer_angle[i] = phi;
+            /* 余弦律：轮速随舵角连续缩放，过 90° 后自然翻负（轮子反向出力）——不钳负，
+             * 钳了就与"两个解恒等"矛盾，翻转会被切成两段（§2.1）。 */
+            st.wheel_speed[i] = p->v[i] * Lib_Math_Cos(p->d[i] - phi);
+        }
+
+        if (LibChassisForward(inst, &st, &xi) != 0)
+            return CHASSIS_STEER_COST_INFEASIBLE; // 几何退化（JᵀJ 奇异）：该候选没得比
+
+        dvx = (xi.x - twist->x) / vscale;
+        dvy = (xi.y - twist->y) / vscale;
+        dw = (xi.z - twist->z) / wscale;
+        j += CHASSIS_STEER_COST_W_V * (dvx * dvx + dvy * dvy) + CHASSIS_STEER_COST_W_W * (dw * dw);
+    }
+
+    return j * dt;
+}
+
+/**
+ * @brief 换向决策（整套）：内核输出 → 两轮各自的目标舵角 + 分支
+ * @param inst  内核实例（预测要跑正解）
+ * @param twist 本拍指令 twist（车体系）
+ * @param ref   内核逆解输出（steer_target = 期望轮向，wheel_speed = 轮速大小）
+ * @param st    内核状态（取实测舵角）
+ * @note 枚举 4 个候选，取 J 最小者；枚举顺序把**上一拍的分支**排在第一个并用严格 <
+ *       ⇒ 平手时保持不动。镜像对称工况（如 ψ=90° 平移 + 两轮对称起步）下两个同分支候选的
+ *       J **逐位相等**（实测 rel ≤ 7e-16），没有这条就会逐拍翻转、目标角每拍跳 180°。
+ *       这不是迟滞带：只在**精确**平手时生效，且选定后状态朝该分支走、J 差随之变大
+ *       ⇒ 不会来回跳，也不会像档1 那样把车锁在坏分支上（J 差一点点就换）。
+ * @note 首拍锚到当前实测舵角（别一上来就把舵甩到别处），之后由本层接管。
+ * @note speed == 0（内核按 LIB_CHASSIS_STEER_SPEED_EPS 判）：保持**上次目标舵角**、驱动停转。
+ *       不拿实测舵角当目标：它是带噪声的归一化读数，拿它当目标等于把噪声直接喂进位置环。
+ *       该轮在预测里 V=0、行程 0：不出力、只贡献"轮面不侧滑"那条约束行（它确实还压在地上）。
+ */
+static void ChassisRudderDecide(LibChassisInstance_s *inst, const vector3_t *twist,
+                                const LibChassisRef_s *ref, const LibChassisState_s *st)
+{
+    ChassisRudderPred_s p = {0};
+    float e[LIB_CHASSIS_HALF_RUDDER_NUM] = {0};
+    float arm = 0.0f, vscale, wscale, best_j = 0.0f;
+    uint8_t rev_cur[LIB_CHASSIS_HALF_RUDDER_NUM], rev_best[LIB_CHASSIS_HALF_RUDDER_NUM];
+    uint8_t i, k;
+
+    for (i = 0; i < LIB_CHASSIS_HALF_RUDDER_NUM; i++)
+    {
+        if ((s_steer_seeded & (uint8_t)(1u << i)) == 0u)
+        {
+            s_steer_target_last[i] = st->steer_angle[i];
+            s_steer_reverse[i] = 0;
+            s_steer_seeded |= (uint8_t)(1u << i);
+        }
+        p.d[i] = ref->steer_target[i];
+        p.v[i] = ref->wheel_speed[i];
+        p.phi[i] = st->steer_angle[i];
+        e[i] = Lib_Math_WrapAngleNegPIToPI(ref->steer_target[i] - st->steer_angle[i]); // (-π, π]
+        if (ref->wheel_speed[i] > 0.0f)
+            p.moving |= (uint8_t)(1u << i);
+    }
+
+    if (p.moving == 0u)
+        return; // 两轮都不转：保持上次目标舵角（§2.5 的"两轮保持同一目标角"仍留给后续）
+
+    /* 归一键：线速度取"指令"与"自旋在轮上产生的轮速"里大的那个——纯自旋指令 vx=vy=0，
+     * 不这么取就会除以 ~0（vscale 下限兜底）；偏航取 |w*|，纯平移 w*=0 时用常量当尺子。 */
+    for (i = 0; i < LIB_CHASSIS_HALF_RUDDER_NUM; i++)
+    {
+        const float ay = FABS(inst->cfg.wheel[i].y);
+        if (ay > arm)
+            arm = ay;
+    }
+    vscale = FABS(twist->x);
+    if (FABS(twist->y) > vscale)
+        vscale = FABS(twist->y);
+    if (FABS(twist->z) * arm > vscale)
+        vscale = FABS(twist->z) * arm;
+    if (vscale < CHASSIS_STEER_COST_SCALE_MIN)
+        vscale = CHASSIS_STEER_COST_SCALE_MIN;
+    wscale = (FABS(twist->z) > CHASSIS_STEER_COST_SCALE_MIN) ? FABS(twist->z) : CHASSIS_STEER_COST_W_SCALE_MIN;
+
+    /* 4 个候选：k 的低位异或左轮上一拍分支、高位异或右轮 —— k=0 恰好就是"保持上一拍"，
+     * 配合下面的严格 `<` 实现"平手不动"（见函数注释）。 */
+    rev_cur[LIB_CHASSIS_HALF_RUDDER_L] = rev_best[LIB_CHASSIS_HALF_RUDDER_L] =
+        (uint8_t)s_steer_reverse[LIB_CHASSIS_HALF_RUDDER_L];
+    rev_cur[LIB_CHASSIS_HALF_RUDDER_R] = rev_best[LIB_CHASSIS_HALF_RUDDER_R] =
+        (uint8_t)s_steer_reverse[LIB_CHASSIS_HALF_RUDDER_R];
+
+    for (k = 0; k < 4u; k++)
+    {
+        const uint8_t rl = (uint8_t)((k & 1u) ^ rev_cur[LIB_CHASSIS_HALF_RUDDER_L]);
+        const uint8_t rr = (uint8_t)(((k >> 1) & 1u) ^ rev_cur[LIB_CHASSIS_HALF_RUDDER_R]);
+        const float j = ChassisRudderCost(inst, twist, &p, rl, rr, vscale, wscale);
+
+        if (k == 0u || j < best_j)
+        {
+            best_j = j;
+            rev_best[LIB_CHASSIS_HALF_RUDDER_L] = rl;
+            rev_best[LIB_CHASSIS_HALF_RUDDER_R] = rr;
+        }
+    }
+
+    for (i = 0; i < LIB_CHASSIS_HALF_RUDDER_NUM; i++)
+    {
+        if ((p.moving & (uint8_t)(1u << i)) == 0u)
+            continue; // 本拍不转：保持上次目标舵角
+        ChassisRudderApply(i, e[i], (int8_t)rev_best[i], st->steer_angle[i]);
+    }
 }
 
 /**
@@ -239,16 +598,17 @@ static float ChassisRudderSteer(uint8_t idx, float phi_des, float phi_cur, float
  * @param st           内核状态（取实测舵角）
  * @param steer_setref 输出：舵向电机位置给定 [电机侧 rad]
  * @param wheel_setref 输出：驱动电机速度给定 [电机侧 rad/s]（内核只给大小，符号在这里定）
+ * @note 舵角参考与分支由 ChassisRudderDecide 提前算好（两轮联合决策），这里只取出。
  * @note 轮速带**余弦优化**：再乘一个 cos(参考舵角 − 实际舵角)，见下面注释。
  */
 static void ChassisRudderOut(uint8_t idx, const LibChassisRef_s *ref, const LibChassisState_s *st, float *steer_setref, float *wheel_setref)
 {
     float speed_wheel = ref->wheel_speed[idx]; // 轮缘速度大小（≥ 0），反向解时下面取负
-    int8_t reverse = 0;
+    int8_t reverse = s_steer_reverse[idx];
     float steer_ref, align;
 
     // 舵角参考（舵轮侧连续角）：本拍换向决策定下的、位置环要跟的那个角
-    steer_ref = ChassisRudderSteer(idx, ref->steer_target[idx], st->steer_angle[idx], speed_wheel, &reverse);
+    steer_ref = s_steer_target_last[idx];
     *steer_setref = steer_ref * STEER_GEAR_RATIO;
 
     /* 余弦优化：驱动轮只有"轮面正对着希望的运动方向"时，推力才全部用在那个方向上；
@@ -257,17 +617,14 @@ static void ChassisRudderOut(uint8_t idx, const LibChassisRef_s *ref, const LibC
      * 而是随舵角到位平滑起速；到位后 cos θ ≈ 1，与不做优化时完全一致。
      * 小角度下 cos 很平（θ=10° 才降 1.5%），跟踪误差与舵角噪声几乎不会被放大。
      * ⚠ 角差必须在**舵轮侧**算：cos 不是按比例的，换成电机侧算（角差再 ×8）得到的是另一个角。
-     * ⚠ 角差已被换向决策按迟滞分档削到 ≤ 90°+迟滞 = 105°；迟滞特意留出的 90°~105° 那一带里
-     *   cos 是负的，而负系数会让驱动轮倒转、把车往反方向拽，故下限钳到 0
-     *   （= 轮面垂直于目标方向，不推）。这一带只在迟滞边界上短暂出现。
+     * ⚠ **不钳负**（§2.1）：乘上 (−1)^rev 后总系数恒等于 V·cos(d − φ)，与分支无关——这才是
+     *   "两个等价解推力完全相同"的代数来源。钳 0 会破坏这个恒等：舵角越过 90° 之后本该反向
+     *   出力（轮子从 +V 扫到 −V、过零），钳了就是一段**无力死区**，翻转被切成两段。
+     *   代价函数（ChassisRudderCost）用的就是这个不钳负的式子，两边必须同一个假设。
      * ⚠ cos 以 2π 为周期，而参考是连续角、实测被归一化在 ±π：两者相差整数个 2π 等价，
      *   故不必先归一化角差。 */
     align = Lib_Math_Cos(steer_ref - st->steer_angle[idx]);
-    if (align < 0.0f)
-    {
-        align = 0.0f;
-    }
-    s_steer_align[idx] = align; // 留档给 VOFA（ch26/27），与实际乘进去的是同一个数
+    s_steer_align[idx] = align; // 留档给 VOFA（ch26/27），与实际乘进去的是同一个数（可负）
     *wheel_setref = WHEEL_RADPS_TO_MOTOR_RADPS(((reverse != 0) ? -speed_wheel : speed_wheel) * align);
 }
 
@@ -281,9 +638,17 @@ static void HalfRudderSolve(const gimbal2chassis_data_t *cmd)
     ChassisReadState(&st);
 
     // 逆解 → 期望轮向 + 轮速大小（轮侧量；跨接口时换回电机侧，舵轮的等价解选择见上）
+    // ⚠ 整条 twist 的符号补偿只在这一处，原因见 app_chassis_def.h 的 CHASSIS_WIRE_TWIST_SIGN
+    //   （驱动轮轮速正方向与舵角参考方向相反 ⇒ 模型的 x/y/w 全是物理量的负）。
     LibChassisRef_s ref;
-    vector3_t twist = {.x = -cmd->vx, .y = -cmd->vy, .z = cmd->w};
+    vector3_t twist = {.x = CHASSIS_WIRE_TWIST_SIGN * cmd->vx,
+                       .y = CHASSIS_WIRE_TWIST_SIGN * cmd->vy,
+                       .z = CHASSIS_WIRE_TWIST_SIGN * cmd->w};
     LibChassisInverse(&s_chassis, twist, &ref);
+
+    // 换向决策必须先走：它要同时看两轮才能保证同拍翻（见 ChassisRudderDecide），
+    // 之后每个轮再各自把结果翻成两个电机侧给定。
+    ChassisRudderDecide(&s_chassis, &twist, &ref, &st);
     ChassisRudderOut(LIB_CHASSIS_HALF_RUDDER_L, &ref, &st, &rudder_l_motor_setref, &wheel_l_motor_setref);
     ChassisRudderOut(LIB_CHASSIS_HALF_RUDDER_R, &ref, &st, &rudder_r_motor_setref, &wheel_r_motor_setref);
 
@@ -293,9 +658,10 @@ static void HalfRudderSolve(const gimbal2chassis_data_t *cmd)
     vector3_t odom;
     if (LibChassisForward(&s_chassis, &st, &odom) != 0)
         odom = (vector3_t){0};
-    chassis2gimbal_data.vx = odom.x;
-    chassis2gimbal_data.vy = odom.y;
-    chassis2gimbal_data.w = odom.z;
+    // 正解在内部约定下算，回传前按线协议符号翻回去（与入口补偿严格对称，三轴一起）
+    chassis2gimbal_data.vx = CHASSIS_WIRE_TWIST_SIGN * odom.x;
+    chassis2gimbal_data.vy = CHASSIS_WIRE_TWIST_SIGN * odom.y;
+    chassis2gimbal_data.w = CHASSIS_WIRE_TWIST_SIGN * odom.z;
 }
 
 /* 云台接收出帧回调（UNPACK_IN_ISR：payload 指向接收缓冲，回调返回后即被覆盖，须同步拷贝） */
@@ -412,6 +778,8 @@ static void ChassisRunEntry(void *ctx)
     (void)ctx;
     rudder_l_ctrl.cfg.loop_type = DRVLIB_MOTOR_LOOP_ANGLE | DRVLIB_MOTOR_LOOP_SPEED;
     rudder_r_ctrl.cfg.loop_type = DRVLIB_MOTOR_LOOP_ANGLE | DRVLIB_MOTOR_LOOP_SPEED;
+    // 偏航闭环重新起算：积分项清零，低通在下一拍用当前角速度播种
+    ChassisYawLoopInit();
 }
 
 /* 进入故障（终态）：上报一次。失能 + 给定清零在 AppChassisRun 的 FAULT 分支里做。
@@ -799,6 +1167,43 @@ void AppChassisInit(void)
     BSP_ASSERT_APP_CALL(CommRegister(&gimbal_comm));
     BSP_ASSERT_APP_CALL(CommConfig(&gimbal_comm, &gimbal_comm_cfg));
 
+    /* ---- 底盘 IMU（BMI088 + 线性卡尔曼）：纯观测，见文件上面那两个常量/实例的注释 ----
+     * 硬件参数与噪声参数逐项抄自 app_gimbal.c（同一辆车、同一套栈、同一种安装环境），
+     * 差别只有三处：标定值（器件属性，见 s_bmi088_calib）、daemon_fault（观测件不拦控制）、
+     * vofa_enable（必须为 0，见下）。参数取值的依据见 drvlib_bmi088_kalman.h 头注释。
+     * ⚠ vofa_enable 保持 0：它会让 drvlib 自己把数据写进 CH1~CH15 并**自己发一帧**，
+     *   而本 app 的 ch1~27 已经给了舵向控制核、帧也由 AppChassisRun 统一发（同一时刻只能
+     *   一路在写缓冲区，混写就是互相覆盖）。本 app 要的 6 路自己写进 ch28~33。 */
+    BSP_ASSERT_APP_CALL(BMI088KalmanRegister(&bmi088));
+    BMI088Kalman_Config_s bmi088_cfg = {
+        .imu =
+            {
+                .spi_e = SPI_BMI088,
+                .cs_acc_e = GPIO_BMI088_CS_ACCEL,
+                .cs_gyro_e = GPIO_BMI088_CS_GYRO,
+                .int_acc_e = GPIO_BMI088_INT_ACCEL,
+                .int_gyro_e = GPIO_BMI088_INT_GYRO,
+                .daemon_reload = 20,                // 20ms 没喂狗判掉线（IMU 自由运行 500Hz~1kHz）
+                .daemon_fault = DAEMON_FAULT_NONE,  // 观测件：掉线只影响这几路通道，不停车
+                .acc_range = BMI088_ACC_RANGE_3G,   // ±3g，只做低频倾角校正（同云台）
+                .acc_bwp = BMI088_ACC_BWP_NORMAL,   // 正常带宽（ODR>400Hz 才必须切 OSR 模式）
+                .acc_odr = BMI088_ACC_ODR_400,      // 400Hz：倾角校正够用
+                .gyro_range = BMI088_GYRO_RANGE_2000,
+                .gyro_conf = BMI088_GYRO_CONF_1000_116, // ODR=1000Hz/BW=116Hz（任务 2ms，2000Hz 用不上）
+                .work_mode = BMI088_MODE_INT,           // DRDY EXTI 里发起采样，时间戳不含 SPI 往返
+                .spi_mode = BSP_DMA_MODE,               // INT 模式下只能用 IT/DMA（BLOCK 会在中断里死等）
+                .spi_timeout_ms = 10,
+            },
+        .calib = &s_bmi088_calib,
+        .q_tilt = 1e-5f,
+        .q_bias = 0.0f, // 0 = 关掉零偏残差状态（与云台同：标定值覆盖慢漂，再开一个状态会互相打架）
+        .r_tilt = 4e-4f,
+        .dt_max = 0.01f,        // 任务被拖延时钳位单步积分
+        .temp_lpf_alpha = 0.01f, // ≈0.2s@500Hz；bias_tempco 未标定时无影响
+        .vofa_enable = 0,        // 帧由本 app 统一发，见上
+    };
+    BSP_ASSERT_APP_CALL(BMI088KalmanConfig(&bmi088, &bmi088_cfg));
+
     // 底盘顶层状态机：上电从"校准"起（旧代码的 lunxunjioazhun 第一拍也是从零状态开始扫），
     // 等两个光电门标定完再判在线/使能决定进 RUN 还是 SAFE。
     LibFsmTableConfig_s chassis_fsm_cfg = {
@@ -866,6 +1271,13 @@ ITCM_RAM void AppChassisRun(float dt, uint64_t time_stamp)
 {
     (void)time_stamp;
     const float dt_s = dt * 0.001f; // drvlib 的 dt 要秒；APP_TASK_DEF 给的 dt 是毫秒（见 bsp_app.h）
+
+    /* 底盘 IMU：每拍更新一次（模块内部按陀螺时间戳差分算 dt，与调用抖动无关）。
+     * 结果用于两处：① 观测通道 ch28/29/36~43；② RUN 态的偏航闭环（ChassisYawLoopStep）。
+     * valid=0（还没用加速度计播种 / 这拍没数据）时 data 保持上一次的值或全 0；
+     * 闭环会用 valid/time_stamp_g 自行判可用性并旁路。 */
+    BMI088KalmanUpdate(&bmi088);
+    const BMI088Kalman_Data_t imu_data = BMI088KalmanGetData(&bmi088);
 
     /* 采两舵向反馈：drvs 纯协议原始量 → drvlib 反馈结构（方向/多圈/偏置/低通都交给控制核） */
     DrvsDJIMotorBroadcastData_s rudder_l_data = DrvsDJIMotorBroadcastGetData(&rudder_l_motor);
@@ -944,8 +1356,15 @@ ITCM_RAM void AppChassisRun(float dt, uint64_t time_stamp)
         break;
 
     case chassis_state_run_e:
+    {
         ChassisMotorsEnable();
-        HalfRudderSolve(&gimbal2chassis_data); // 逆解出四个给定 + 正解回填速度反馈
+        /* 偏航闭环：在**物理/线协议约定**下修正 w（CHASSIS_WIRE_TWIST_SIGN 之前）。
+         * 修正后的指令只用于本拍解算；gimbal2chassis_data 本身不改，ch30 仍记原始指令。 */
+        gimbal2chassis_data_t cmd_eff = gimbal2chassis_data;
+        cmd_eff.w = ChassisYawLoopStep(cmd_eff.w, &imu_data, dt,
+                                       (float)rudder_l_ctrl.data.position * STEER_GEAR_RATIO_INV,
+                                       (float)rudder_r_ctrl.data.position * STEER_GEAR_RATIO_INV);
+        HalfRudderSolve(&cmd_eff); // 逆解出四个给定 + 正解回填速度反馈
         /* 舵向：位置+速度环算出下发力矩交给 drvs（Kt=1，A 与 Nm 数值相同）。
          * ⚠ 顺序：HalfRudderSolve 读的是上一拍 SetRef 刷新的 data.position（本拍反馈在
          *    SetRef 里才处理）——即几何解算的舵角滞后一拍(2ms)。舵向变化慢，可忽略；
@@ -953,6 +1372,7 @@ ITCM_RAM void AppChassisRun(float dt, uint64_t time_stamp)
         rudder_l_cmd = DrvlibMotorSetRef(&rudder_l_ctrl, rudder_l_motor_setref, &rudder_l_fb, dt_s);
         rudder_r_cmd = DrvlibMotorSetRef(&rudder_r_ctrl, rudder_r_motor_setref, &rudder_r_fb, dt_s);
         break;
+    }
 
     default:
         // chassis_state_count_e 不是合法状态，枚举新增状态忘了加分支会落到这里
@@ -979,16 +1399,23 @@ ITCM_RAM void AppChassisRun(float dt, uint64_t time_stamp)
     // 电机发送
     MotorSend(&(wheel_l_motor.base));
 
-    /* 27 路：两个舵向控制核 24 路 + 状态机 1 路 + 余弦系数 2 路（通道数见 app_cfg.h 的 VOFA_CHANNELS）。
+    /* 46 路：舵向/状态机/余弦系数 27 路 + 偏航观测组 8 路 + IMU 原始量 8 路
+     * + 偏航闭环 3 路（通道数见 app_cfg.h 的 VOFA_CHANNELS）。
      *   ch1~12  左舵 12 项
      *   ch13~24 右舵 12 项
      *   ch25    底盘状态机当前状态（0=CAL 1=FAULT 2=SAFE 3=RUN）
      *   ch26/27 左右舵的余弦优化系数（本拍实际乘进轮速的那个值）
+     *   ch28~35 偏航观测组（见下面"偏航观测组"那段）
+     *   ch36~43 IMU 原始量（陀螺/加计机体系 + roll/pitch，用于诊断安装方向）
+     *   ch44    偏航闭环实测 yaw rate（物理投影 + 低通）[rad/s]
+     *   ch45    偏航闭环速率误差 w_cmd−yaw_rate（物理约定）[rad/s]
+     *   ch46    偏航闭环施加到 w 的修正 [rad/s]（ch30 + ch46 = 实际解算用的 w）
      * 读法：每组里 ch+0/+1 重合 = 舵角跟得上；+2→0 且 +5 不饱和 = 位置环正常；
      *      +7→0 且 +10 是被控对象真正吃到的电流；+10 与 +11 长期不等查 Kt/方向。
-     *      ch26/27：1 = 舵角已对齐（轮速不打折）、→0 = 轮面正垂直于目标方向（轮速被钳到 0），
-     *      中间随舵角到位平滑爬升。只做小幅修正时它一直贴着 1 属正常——cos 在小角度很平
-     *      （差 10° 才降 1.5%）；要看到它明显压低轮速，得是大角度回转（如直行切横移）。
+     *      ch26/27：1 = 舵角已对齐（轮速不打折）、→0 = 轮面正垂直于目标方向、<0 = 轮面已偏过
+     *      垂直（轮子在反向出力，翻转后半程的正常形态，见 ChassisRudderOut）。
+     *      只做小幅修正时它一直贴着 1 属正常——cos 在小角度很平（差 10° 才降 1.5%）；
+     *      要看到它明显压低轮速，得是大角度回转（如直行切横移）。
      * ⚠ CAL 态只有速度环在跑（+0 是扫描速度给定）；SAFE/FAULT 舵向失能，各路为 0。 */
     ChassisVofaRudder(1, &rudder_l_ctrl, rudder_l_motor_setref, rudder_l_data.speed, rudder_l_data.current);
     ChassisVofaRudder(13, &rudder_r_ctrl, rudder_r_motor_setref, rudder_r_data.speed, rudder_r_data.current);
@@ -999,10 +1426,86 @@ ITCM_RAM void AppChassisRun(float dt, uint64_t time_stamp)
     {
         s_steer_align[LIB_CHASSIS_HALF_RUDDER_L] = 0.0f;
         s_steer_align[LIB_CHASSIS_HALF_RUDDER_R] = 0.0f;
+        // 偏航闭环不在 RUN 态跑，显示量清零（状态本身在进 RUN 时 Init）
+        s_yaw_loop.rate_lpf = 0.0f;
+        s_yaw_loop.err = 0.0f;
+        s_yaw_loop.corr = 0.0f;
+        s_yaw_loop.corr_last = 0.0f;
     }
     VofaSetChannel(26, s_steer_align[LIB_CHASSIS_HALF_RUDDER_L]);
     VofaSetChannel(27, s_steer_align[LIB_CHASSIS_HALF_RUDDER_R]);
-    VofaSend();
+
+    /* ─────────── 偏航观测组（ch28~35）：把"车到底转没转"变成直接测量 ───────────
+     *   ch28  IMU 世界系偏航角速度 yaw_rate (rad/s)  —— 车**真的**在转多快（陀螺实测）
+     *   ch29  IMU 世界系航向角 euler.yaw (rad)       —— 上面积出来的航向（无绝对参考，只看变化量）
+     *   ch30  指令 w（云台下发，rad/s）              —— 命令里到底带没带自旋
+     *   ch31  正解 w（odom.z，rad/s）                —— 按"轮面不侧滑"从四轮实际状态算出的 w
+     *   ch32/33 左/右驱动轮实际轮缘角速度 (rad/s)    —— 两轮出力的大小与方向（带符号）
+     *   ch34/35 左/右驱动轮速度给定（轮缘 rad/s）    —— 与 ch32/33 同量纲，直接看跟随误差
+     * 三种"w"并排就是这一组的用处：
+     *   ① ch30 与 ch28 一起看，能一刀切开"命令的自旋"与"舵向过渡诱导的偏航"——
+     *      ch30≈0 而 ch28≠0 就是后者（这正是"控制前后左右时 w 明显转动"要判的那一刀）；
+     *   ② ch31 与 ch28 不符 ⇒ 两轮实际状态解释不了实测偏航，即"轮面不侧滑"前提不成立
+     *      （侧滑/擦胎），ch32/33 再给出是哪一轮、往哪个方向出的力；
+     *   ③ ch34/35 与 ch32/33 对照 ⇒ 把"命令本来就有差模"与"速度环没跟住"分开：给定边
+     *      自己就有差模是逆解/换向解的事，给定无差模而实际有差模才轮到速度环/滑移。
+     * ⚠ ch28/29 恒等于 0 = IMU 没就绪（valid=0：没播种 / SPI 或 DRDY 没通 / 看门狗掉线），
+     *   不是"车没转"；真实陀螺静置时也是非零的（零偏 + 噪声）。
+     * ⚠ ch28 的零偏未标定（s_bmi088_calib 全 0）：静止段读到的均值就是该补的零偏。
+     * ⚠ ch28/29 乘了 CHASSIS_IMU_YAW_SIGN（安装方向校正，见 app_chassis_def.h）；这个符号
+     *   必须用一次受控转动确认后才能用于闭环，单看日志里的相关性定不下来。
+     * ⚠ ch30 在 SAFE 态被显式清零（那里的指令已作废，见 chassis_state_safe_e 分支）；
+     *   ch31 只在 RUN 态由 HalfRudderSolve 更新，其余状态显式写 0，免得看到上一段的旧数。
+     *   给定 ch34/35 在非 RUN 态本来就已被清 0（见各状态分支），无需额外处理。 */
+    VofaSetChannel(28, CHASSIS_IMU_YAW_SIGN * imu_data.yaw_rate);
+    VofaSetChannel(29, CHASSIS_IMU_YAW_SIGN * imu_data.euler.yaw);
+    VofaSetChannel(30, gimbal2chassis_data.w);
+    VofaSetChannel(31, (state == chassis_state_run_e) ? chassis2gimbal_data.w : 0.0f);
+    VofaSetChannel(32, MOTOR_RADPS_TO_WHEEL_RADPS((float)MotorGetData(&(wheel_l_motor.base)).speed));
+    VofaSetChannel(33, MOTOR_RADPS_TO_WHEEL_RADPS((float)MotorGetData(&(wheel_r_motor.base)).speed));
+    VofaSetChannel(34, MOTOR_RADPS_TO_WHEEL_RADPS(wheel_l_motor_setref));
+    VofaSetChannel(35, MOTOR_RADPS_TO_WHEEL_RADPS(wheel_r_motor_setref));
+
+    /* ─────────── IMU 原始量（ch36~43）：诊断安装方向 ───────────
+     *   ch36~38  机体系陀螺 x/y/z (rad/s，已按标定修正)
+     *   ch39~41  机体系加速度 x/y/z (m/s²，已按标定修正)。按 BMI088 手册 §8.3：
+     *            静止时**朝上的轴读 +g**。本车实测 (−0.12,−0.03,−9.70) ⇒ +z 轴朝下
+     *            （IMU 装倒），KF 因此把 roll 收敛到 ≈180°；yaw_rate 的符号仍是对的。
+     *   ch42/43  KF 的 roll/pitch (rad)
+     * 为什么需要：ch28 的 yaw_rate 是**世界系欧拉角速率**，由 KF 的 roll/pitch 把机体系
+     * 陀螺投影出来（`(sinφ·ωy+cosφ·ωz)/cosθ`）。实测发现本车 IMU 的 +z 轴朝下（见上），
+     * KF 的 roll 因此收敛到 ≈180°、并在 ±180° 附近漂移：roll 处于 ±90° 之外时
+     * ch28 ≈ −gz（与物理 yaw 同号，正确）；一旦 roll 漂过 ±90° 的分支，符号就会翻错
+     * （实测约 6% 的帧）。这不是"装反"，改 CHASSIS_IMU_YAW_SIGN 修不了。原始量能直接看出：
+     *   ① 静止段 acc 哪个分量 ≈ ±9.8 ⇒ 哪根机体系轴朝上（安装方向一目了然）；
+     *   ② 自旋段 roll/pitch 是否在漂/跳、陀螺各轴是否只有一根在转；
+     *   ③ 更稳的 yaw 修法：`yaw_rate = dot(gyro, u_rest)`，u_rest = 静止 acc 归一化
+     *      （= 世界向上在机体系的方向，本车为 −z），完全绕开 KF 的 roll 分支；
+     *      或先用固定的安装旋转把原始量旋到"平装"机体系再喂 KF。 */
+    VofaSetChannel(36, imu_data.gyro[0]);
+    VofaSetChannel(37, imu_data.gyro[1]);
+    VofaSetChannel(38, imu_data.gyro[2]);
+    VofaSetChannel(39, imu_data.acc[0]);
+    VofaSetChannel(40, imu_data.acc[1]);
+    VofaSetChannel(41, imu_data.acc[2]);
+    VofaSetChannel(42, imu_data.euler.roll);
+    VofaSetChannel(43, imu_data.euler.pitch);
+
+    /* 偏航闭环观测量：ch44 实测角速度、ch45 速率误差、ch46 本拍修正。
+     * 判读：稳态直行时 ch44→0、ch45→0；有恒定扰动时 ch44 会被压小但 ch46 非零
+     * （积分项在出力，ch46 与其差 = K_P·ch45）；若 ch44 长期非零而 ch46 贴限幅，
+     * 查方向/增益；若一停车就朝一个方向自转，查 ch44 的零偏和符号。 */
+    VofaSetChannel(44, s_yaw_loop.rate_lpf);
+    VofaSetChannel(45, s_yaw_loop.err);
+    VofaSetChannel(46, s_yaw_loop.corr);
+
+    /* 遥测隔拍发（250Hz）：46 路每帧 192B，500Hz 会超出 921600baud 的带宽（见 app_cfg.h）。
+     * 通道值每拍都刷新，这里只决定哪一拍把当前快照推出去。 */
+    if (++s_vofa_send_div >= CHASSIS_VOFA_SEND_DIV)
+    {
+        s_vofa_send_div = 0;
+        VofaSend();
+    }
 
     CommSend(&gimbal_comm,
              (uint8_t *)&chassis2gimbal_data); // 云台通信：每周期发一帧（接收已由 CAN 中断写入 gimbal_rx_data）

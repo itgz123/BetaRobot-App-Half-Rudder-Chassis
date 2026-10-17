@@ -23,6 +23,7 @@ typedef enum : uint8_t
     robot_mode_gyro = 2,
     robot_mode_hole = 3,
 } robot_mode; // 状态机 参考`app/half_rudder_gimbal/README.md`
+// 方向定义，vx>0:前;xy>0:左;w>0:俯视逆时针
 typedef struct
 {
     robot_mode enabled;

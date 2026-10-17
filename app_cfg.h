@@ -30,6 +30,8 @@
 #define DRV_DBUS_USED                // DBUS 遥控器驱动
 #define DRV_SBUS_USED                // SBUS 遥控器驱动
 #define LIB_MAHONY_USED              // Mahony 姿态解算
+#define LIB_LKF_USED                 // 通用卡尔曼滤波 (lib_lkf)
+#define DRVLIB_BMI088_KALMAN_USED    // BMI088 零偏标定 + 线性卡尔曼姿态（drv_bmi088 + lib_lkf 联合）
 #define DRVS_DJIMOTOR_BROADCAST_USED // DJI 电机驱动（drvs 纯协议版一拖四广播；舵向 2 个 M3508）
 #define DRVLIB_MOTOR_USED            // 三级级联 PID + 反馈后处理（drvs 之上；舵向位置/速度环）
 #define DRV_DMMOTOR_USED             // DM 电机驱动
@@ -41,7 +43,15 @@
 #define LIB_FSM_TABLE_USED           // 表驱动状态机（底盘顶层状态机：校准/故障/失能/运行）
 #define DAEMON_USED                  // Daemon 看门狗
 #define VOFA_USED                    // VOFA+ JustFloat 遥测
-#define VOFA_CHANNELS 27             // 用户通道数（覆盖 drv_vofa.h 的默认 25）：ch26/27 = 左右舵余弦优化系数
+/* 用户通道数（覆盖 drv_vofa.h 的默认 25）。布局的唯一出处是 app_chassis.c
+ * AppChassisRun 末尾那段注释（ch1~27 舵向控制核 + ch28~35 偏航观测组 + ch36~43 IMU 原始量
+ * + ch44~46 偏航闭环）。
+ * ⚠ 通道数直接决定每帧字节数：(27+1+1)×4+4 = 120B → (46+1+1)×4+4 = 196B。
+ *   921600 baud（10 bit/Byte，92160 B/s）下：
+ *     500Hz（每拍发） 196B×500 = 98kB/s > 100%，必然丢帧；
+ *     250Hz（隔拍发） 196B×250 = 49kB/s = 53%，留出余量。
+ *   故 AppChassisRun 里 VofaSend 按 CHASSIS_VOFA_SEND_DIV 隔拍调用（见 app_chassis_def.h）。 */
+#define VOFA_CHANNELS 46             // 27 舵向/状态机/余弦系数 + 8 偏航观测 + 8 IMU 原始量 + 3 偏航闭环
 #define LIB_CRC_USED                 // 软件 CRC 计算（Direct/GenTable/TableCalc）
 #define LIB_CRC_TABLES_USED          // 软件 CRC 常用算法 Flash 表（lib_crc_tables.c）
 #define LIB_HAMMING_USED             // 汉明码纠错（标准 / 扩展缩短 SECDED，任意 bit 长度）
