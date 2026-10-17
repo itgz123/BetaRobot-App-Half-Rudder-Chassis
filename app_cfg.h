@@ -43,15 +43,11 @@
 #define LIB_FSM_TABLE_USED           // 表驱动状态机（底盘顶层状态机：校准/故障/失能/运行）
 #define DAEMON_USED                  // Daemon 看门狗
 #define VOFA_USED                    // VOFA+ JustFloat 遥测
-/* 用户通道数（覆盖 drv_vofa.h 的默认 25）。布局的唯一出处是 app_chassis.c
- * AppChassisRun 末尾那段注释（ch1~27 舵向控制核 + ch28~35 偏航观测组 + ch36~43 IMU 原始量
- * + ch44~46 偏航闭环）。
- * ⚠ 通道数直接决定每帧字节数：(27+1+1)×4+4 = 120B → (46+1+1)×4+4 = 196B。
- *   921600 baud（10 bit/Byte，92160 B/s）下：
- *     500Hz（每拍发） 196B×500 = 98kB/s > 100%，必然丢帧；
- *     250Hz（隔拍发） 196B×250 = 49kB/s = 53%，留出余量。
- *   故 AppChassisRun 里 VofaSend 按 CHASSIS_VOFA_SEND_DIV 隔拍调用（见 app_chassis_def.h）。 */
-#define VOFA_CHANNELS 46             // 27 舵向/状态机/余弦系数 + 8 偏航观测 + 8 IMU 原始量 + 3 偏航闭环
+/* 用户通道数（覆盖 drv_vofa.h 的默认 25）。
+ * 当前只用于 IMU 标定：drvlib_bmi088_kalman 在 vofa_enable=1 时写 CH1~CH15 并自己发帧，
+ * 布局与 bmi088_calib.py 的通道表一致（CH4~6 残差、CH13~15 生效零偏）。
+ * 每帧 (15+1+1)×4+4 = 68B，500Hz 下 34kB/s，921600 baud 有充足余量。 */
+#define VOFA_CHANNELS 15             // CH1~3 euler、4~6 gyro、7~9 acc、10 dt、11 yaw_rate、12 温度、13~15 零偏
 #define LIB_CRC_USED                 // 软件 CRC 计算（Direct/GenTable/TableCalc）
 #define LIB_CRC_TABLES_USED          // 软件 CRC 常用算法 Flash 表（lib_crc_tables.c）
 #define LIB_HAMMING_USED             // 汉明码纠错（标准 / 扩展缩短 SECDED，任意 bit 长度）

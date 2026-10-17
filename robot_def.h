@@ -36,5 +36,10 @@
 // imu系x轴方向向量(-1,1,0)
 // imu系y轴方向向量(1,1,0)
 // imu系z轴方向向量(0,0,-1)
+// 即 R_chassis<-imu = [(-1,1,0)/√2, (1,1,0)/√2, (0,0,-1)]
+// （app 里用这个构造 4x4 齐次变换，一次把旋转 + 平移都带上）
+#define CHASSIS_IMU_POS_X (-0.117f)  // IMU 中心在底盘系的 x (m)
+#define CHASSIS_IMU_POS_Y (-0.0953f) // IMU 中心在底盘系的 y (m)
+#define CHASSIS_IMU_POS_Z (0.0f)     // IMU 中心在底盘系的 z (m)
 
 #endif // !__ROBOT_DEF_H
