@@ -24,17 +24,17 @@ BMI088_KALMAN_INSTANCE_DEF(bmi088);
 
 /*============================ IMU → 底盘系 ============================*/
 /* 4x4 齐次变换：p_chassis = R · p_imu + t。
- * R 的三列 = IMU 的 x/y/z 轴在底盘系中的方向（robot_def.h）：
+ * R 的三列 = IMU 的 x/y/z 轴在底盘系中的方向（宏在 robot_def.h）：
  *     x_imu = (−1, 1, 0)/√2   y_imu = (1, 1, 0)/√2   z_imu = (0, 0, −1)
  *     t     = IMU 中心在底盘系的位置。
  * 陀螺/加速度是方向量，用 Lib_Math_Mat4MulDir（不带平移）；
- * 需要杆臂补偿时用 Lib_Math_Mat4MulPoint 把 IMU 系里的点转到地底盘系。 */
+ * 点是位置量，用 Lib_Math_Mat4MulPoint（带平移）。 */
 static const matrix4_t s_imu_to_chassis = {
     .data =
         {
-            {-0.70710678f, 0.70710678f, 0.0f, CHASSIS_IMU_POS_X},
-            {0.70710678f, 0.70710678f, 0.0f, CHASSIS_IMU_POS_Y},
-            {0.0f, 0.0f, -1.0f, CHASSIS_IMU_POS_Z},
+            {CHASSIS_IMU_X_AXIS_X, CHASSIS_IMU_Y_AXIS_X, CHASSIS_IMU_Z_AXIS_X, CHASSIS_IMU_POS_X},
+            {CHASSIS_IMU_X_AXIS_Y, CHASSIS_IMU_Y_AXIS_Y, CHASSIS_IMU_Z_AXIS_Y, CHASSIS_IMU_POS_Y},
+            {CHASSIS_IMU_X_AXIS_Z, CHASSIS_IMU_Y_AXIS_Z, CHASSIS_IMU_Z_AXIS_Z, CHASSIS_IMU_POS_Z},
             {0.0f, 0.0f, 0.0f, 1.0f},
         },
 };
@@ -43,12 +43,27 @@ static const matrix4_t s_imu_to_chassis = {
 typedef struct
 {
     vector3_t gyro; // 底盘系角速度 (rad/s)
-    vector3_t acc;  // 底盘系比力 (m/s²)，测点在 IMU 处（未做杆臂补偿）
+    vector3_t acc;  // 底盘系比力 (m/s²)，已做杆臂补偿到 底盘中心
     vector3_t pos;  // IMU 安装点在底盘系的位置 (m)，固定
     float yaw_rate; // 底盘系绕竖直轴角速度 (rad/s)（world 系，与安装方向无关）
     uint8_t valid;  // 1 = 本拍姿态可用（已播种/有数据）
 } AppChassisImu_s;
 static AppChassisImu_s s_imu_chassis; // 底盘系观测，供力控使用
+
+/* ---- 杆臂补偿 ----
+ * a_imu = a_center + α×r + ω×(ω×r)（r = IMU 相对底盘中心的位置）
+ * ⇒ a_center = a_imu − α×r − ω×(ω×r)
+ * α 由底盘系 gyro 差分得到；差分对噪声敏感，先经一阶低通再乘 r。 */
+#ifndef CHASSIS_IMU_ALPHA_LPF_RC
+#define CHASSIS_IMU_ALPHA_LPF_RC 0.02f // 角加速度低通时间常数 (s)，≈20ms
+#endif
+#ifndef CHASSIS_IMU_ALPHA_LIMIT
+#define CHASSIS_IMU_ALPHA_LIMIT 100.0f // 角加速度限幅 (rad/s²)，防差分尖峰
+#endif
+
+static vector3_t s_gyro_prev;     // 上一有效陀螺样本（底盘系）
+static vector3_t s_alpha_lpf;     // 低通后的角加速度（底盘系）
+static uint8_t s_gyro_prev_valid; // 0 = 还没有上一样本（首拍/掉线后）
 
 /* 底盘车架上那颗 BMI088 的静态零偏（2026-10-17，ignore/chassis_data/imu.csv）
  * 录制条件：静置 112s、约 33℃、IMU 倒装（+z 朝下）。地面轻微不平按水平处理；
@@ -147,6 +162,11 @@ void AppChassisInit(void)
 
     // IMU 原点 (0,0,0) 经齐次变换得到它在底盘系的位置（旋转 + 平移一起验证）
     s_imu_chassis.pos = Lib_Math_Mat4MulPoint(s_imu_to_chassis, (vector3_t){0.0f, 0.0f, 0.0f});
+
+    // 杆臂补偿状态复位
+    s_gyro_prev = (vector3_t){0.0f, 0.0f, 0.0f};
+    s_alpha_lpf = (vector3_t){0.0f, 0.0f, 0.0f};
+    s_gyro_prev_valid = 0;
 }
 
 void AppChassisRun(float dt, uint64_t time_stamp)
@@ -159,11 +179,39 @@ void AppChassisRun(float dt, uint64_t time_stamp)
     BMI088KalmanUpdate(&bmi088);
     const BMI088Kalman_Data_t imu = BMI088KalmanGetData(&bmi088);
 
-    /* IMU 系 → 底盘系（纯旋转；加速度测点仍在 IMU 处，杆臂补偿后续再加） */
+    /* IMU 系 → 底盘系（方向量，不带平移） */
     const vector3_t gyro_imu = {imu.gyro[0], imu.gyro[1], imu.gyro[2]};
     const vector3_t acc_imu = {imu.acc[0], imu.acc[1], imu.acc[2]};
-    s_imu_chassis.gyro = Lib_Math_Mat4MulDir(s_imu_to_chassis, gyro_imu);
-    s_imu_chassis.acc = Lib_Math_Mat4MulDir(s_imu_to_chassis, acc_imu);
+    const vector3_t gyro = Lib_Math_Mat4MulDir(s_imu_to_chassis, gyro_imu);
+    const vector3_t acc_chassis = Lib_Math_Mat4MulDir(s_imu_to_chassis, acc_imu);
+
+    s_imu_chassis.gyro = gyro;
     s_imu_chassis.yaw_rate = imu.yaw_rate; // world 竖直轴，与安装方向无关
     s_imu_chassis.valid = imu.valid;
+
+    /* 角加速度：只在有新陀螺样本时差分（imu.dt == 0 = 本拍没新样本，保持上次 α）。
+     * 直接差分噪声大，先限幅再做一阶低通；RC 见 CHASSIS_IMU_ALPHA_LPF_RC。 */
+    if (imu.dt > 0.0f)
+    {
+        if (s_gyro_prev_valid)
+        {
+            const float dt_a = imu.dt;
+            vector3_t alpha = Lib_Math_Vec3Scale(Lib_Math_Vec3Sub(gyro, s_gyro_prev), 1.0f / dt_a);
+            alpha.x = Lib_Math_Clamp(alpha.x, -CHASSIS_IMU_ALPHA_LIMIT, CHASSIS_IMU_ALPHA_LIMIT);
+            alpha.y = Lib_Math_Clamp(alpha.y, -CHASSIS_IMU_ALPHA_LIMIT, CHASSIS_IMU_ALPHA_LIMIT);
+            alpha.z = Lib_Math_Clamp(alpha.z, -CHASSIS_IMU_ALPHA_LIMIT, CHASSIS_IMU_ALPHA_LIMIT);
+
+            const float k = dt_a / (CHASSIS_IMU_ALPHA_LPF_RC + dt_a);
+            s_alpha_lpf.x += (alpha.x - s_alpha_lpf.x) * k;
+            s_alpha_lpf.y += (alpha.y - s_alpha_lpf.y) * k;
+            s_alpha_lpf.z += (alpha.z - s_alpha_lpf.z) * k;
+        }
+        s_gyro_prev = gyro;
+        s_gyro_prev_valid = 1;
+    }
+
+    /* 杆臂补偿：a_center = a_imu − α×r − ω×(ω×r) */
+    const vector3_t centripetal = Lib_Math_Vec3Cross(gyro, Lib_Math_Vec3Cross(gyro, s_imu_chassis.pos));
+    const vector3_t tangential = Lib_Math_Vec3Cross(s_alpha_lpf, s_imu_chassis.pos);
+    s_imu_chassis.acc = Lib_Math_Vec3Sub(Lib_Math_Vec3Sub(acc_chassis, tangential), centripetal);
 }

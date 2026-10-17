@@ -36,8 +36,19 @@
 // imu系x轴方向向量(-1,1,0)
 // imu系y轴方向向量(1,1,0)
 // imu系z轴方向向量(0,0,-1)
-// 即 R_chassis<-imu = [(-1,1,0)/√2, (1,1,0)/√2, (0,0,-1)]
-// （app 里用这个构造 4x4 齐次变换，一次把旋转 + 平移都带上）
+// 即 R_chassis<-imu 的三列 = [(-1,1,0)/√2, (1,1,0)/√2, (0,0,-1)]
+// （app 里用这些宏构造 4x4 齐次变换，一次把旋转 + 平移都带上）
+/* IMU 各轴单位方向在底盘系中的分量：第一列 = IMU x 轴，第二列 = y 轴，第三列 = z 轴 */
+#define CHASSIS_IMU_X_AXIS_X (-0.70710678f) // IMU x 轴在底盘 x 上的分量
+#define CHASSIS_IMU_X_AXIS_Y (0.70710678f)  // IMU x 轴在底盘 y 上的分量
+#define CHASSIS_IMU_X_AXIS_Z (0.0f)         // IMU x 轴在底盘 z 上的分量
+#define CHASSIS_IMU_Y_AXIS_X (0.70710678f)  // IMU y 轴在底盘 x 上的分量
+#define CHASSIS_IMU_Y_AXIS_Y (0.70710678f)  // IMU y 轴在底盘 y 上的分量
+#define CHASSIS_IMU_Y_AXIS_Z (0.0f)         // IMU y 轴在底盘 z 上的分量
+#define CHASSIS_IMU_Z_AXIS_X (0.0f)         // IMU z 轴在底盘 x 上的分量
+#define CHASSIS_IMU_Z_AXIS_Y (0.0f)         // IMU z 轴在底盘 y 上的分量
+#define CHASSIS_IMU_Z_AXIS_Z (-1.0f)        // IMU z 轴在底盘 z 上的分量
+
 #define CHASSIS_IMU_POS_X (-0.117f)  // IMU 中心在底盘系的 x (m)
 #define CHASSIS_IMU_POS_Y (-0.0953f) // IMU 中心在底盘系的 y (m)
 #define CHASSIS_IMU_POS_Z (0.0f)     // IMU 中心在底盘系的 z (m)
