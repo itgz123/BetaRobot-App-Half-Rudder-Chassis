@@ -11,7 +11,7 @@
 #include "drv_daemon.h"
 #include "drv_vofa.h"
 //
-#include "app_chassis.h"
+#include "app_chassis_force.h"
 
 /* 日志实例定义 */
 LOG_INSTANCE_DEF(g_app_log, "app", 255); // app 层日志实例

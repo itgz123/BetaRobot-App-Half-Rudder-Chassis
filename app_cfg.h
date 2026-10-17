@@ -37,7 +37,7 @@
 #define DRV_DMMOTOR_USED             // DM 电机驱动
 #define DRV_RSMOTOR_USED             // RS05 电机驱动（灵足时代，MIT 协议）
 #define DRV_LKMOTOR_USED             // LK MF 一对一协议驱动
-#define DRV_LKMOTOR_BROADCAST_USED   // LK 广播模式驱动（一拖四 V2.35，0x280）
+#define DRVS_LKMOTOR_BROADCAST_USED  // LK 电机驱动（drvs 纯协议版一拖四广播；驱动 2 个 MF7015，力控）
 #define DRV_AXIS_MIT_LITE_USED       // 单轴 MIT 关节控制
 #define LIB_CHASSIS_HALF_RUDDER_USED // 底盘运动学内核（半舵封装：2 组舵轮正/逆解）
 #define LIB_FSM_TABLE_USED           // 表驱动状态机（底盘顶层状态机：校准/故障/失能/运行）
