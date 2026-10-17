@@ -1,5 +1,6 @@
 #include "app_chassis_force.h"
 #include "app_cfg.h"
+#include "app.h" // 板间线协议结构体（gimbal2chassis_data_t / chassis2gimbal_data_t）
 #include "robot_def.h"
 //
 #include "lib_math.h"
@@ -7,6 +8,12 @@
 #include "drvs_djimotor_broadcast.h"
 #include "drvs_lkmotor_broadcast.h"
 #include "drvlib_bmi088_kalman.h"
+
+#include "drv_comm.h"
+#include "comm_media_can_idseq.h"
+#include "comm_proto_ext.h"
+
+#include <string.h>
 
 /*============================ 电机实例 ============================*/
 // 舵向：DJI M3508（C620），id2 / id4，共用 0x200 广播帧
@@ -18,6 +25,26 @@ DRVS_DJIMOTOR_BROADCAST_GROUP_DEF(rudder_motor_group);
 DRVS_LKMOTOR_BROADCAST_INSTANCE_DEF(wheel_l_motor);
 DRVS_LKMOTOR_BROADCAST_INSTANCE_DEF(wheel_r_motor);
 DRVS_LKMOTOR_BROADCAST_GROUP_DEF(wheel_motor_group);
+
+/*============================ 云台↔底盘通信 ============================*/
+/* CAN1 / IDSEQ / PROTO_EXT。底盘 tx_id=0x110 段、rx_id=0x100 段（云台侧对调）；
+ * 线上帧 = [0xA5][seq][汉明编码区 E][CRC8][0x5A]，payload 就是下面两个业务结构体。
+ * CAN1 上还有经典 CAN 的 RS05，故介质必须 CLASSIC，不能开 FD。 */
+COMM_DEF(gimbal_comm, MEDIA_CAN_IDSEQ, EXT, EXT, gimbal2chassis_data_t, 13, chassis2gimbal_data_t, 12, UNPACK_IN_ISR);
+
+static gimbal2chassis_data_t gimbal2chassis_data = {0};      // 云台→底盘：速度指令 + 档位
+static volatile robot_mode gimbal_mode_rx = robot_mode_stop; // 接收回调写的档位原始副本
+static chassis2gimbal_data_t chassis2gimbal_data = {0};      // 底盘→云台：速度反馈
+
+/* 接收回调（UNPACK_IN_ISR：payload 在返回后会被覆盖，必须同步拷贝） */
+static void GimbalRecvOnFrame(const uint8_t *payload)
+{
+    gimbal2chassis_data_t frame;
+
+    memcpy(&frame, payload, sizeof(frame));
+    gimbal_mode_rx = frame.enabled;
+    gimbal2chassis_data = frame;
+}
 
 /*============================ 底盘 IMU ============================*/
 BMI088_KALMAN_INSTANCE_DEF(bmi088);
@@ -126,6 +153,25 @@ void AppChassisInit(void)
     BSP_ASSERT_APP_CALL(DrvsLKMotorBroadcastConfig(&wheel_l_motor, &wheel_l_cfg));
     BSP_ASSERT_APP_CALL(DrvsLKMotorBroadcastConfig(&wheel_r_motor, &wheel_r_cfg));
 
+    /* ---- 云台通信（CAN1 / IDSEQ / EXT）---- */
+    // 一个实例双向：底盘在 tx_id 段发、rx_id 段收（idseq 后端支持收发异段）。
+    CommMediaCanIdseqConfig_s gimbal_comm_media_cfg = {
+        .can_e = CAN_1,
+        .tx_id = 0x110, /* 底盘→云台 ID 段基址 */
+        .rx_id = 0x100, /* 云台→底盘 ID 段基址 */
+        .frame_type = CAN_STANDARD_DATA_FRAME,
+        .mode = CAN_FRAME_FORMAT_CLASSIC, /* CAN1 上挂经典 CAN 的 RS05，不可用 FD */
+        .timeout_ms = 1,
+    };
+    CommConfig_s gimbal_comm_cfg = {
+        .media_cfg = &gimbal_comm_media_cfg,
+        .on_frame = GimbalRecvOnFrame,
+        .daemon_fault = DAEMON_FAULT_BUZZER_SHORT,
+        .daemon_reload = 10, /* 对端每 2ms 发一帧，超 10ms 判离线 */
+    };
+    BSP_ASSERT_APP_CALL(CommRegister(&gimbal_comm));
+    BSP_ASSERT_APP_CALL(CommConfig(&gimbal_comm, &gimbal_comm_cfg));
+
     /* ---- 底盘 IMU：BMI088 + 线性卡尔曼（纯观测） ---- */
     BSP_ASSERT_APP_CALL(BMI088KalmanRegister(&bmi088));
     BMI088Kalman_Config_s bmi088_cfg = {
@@ -214,4 +260,8 @@ void AppChassisRun(float dt, uint64_t time_stamp)
     const vector3_t centripetal = Lib_Math_Vec3Cross(gyro, Lib_Math_Vec3Cross(gyro, s_imu_chassis.pos));
     const vector3_t tangential = Lib_Math_Vec3Cross(s_alpha_lpf, s_imu_chassis.pos);
     s_imu_chassis.acc = Lib_Math_Vec3Sub(Lib_Math_Vec3Sub(acc_chassis, tangential), centripetal);
+
+    /* 云台通信：每周期回一帧。当前还没有正解，vx/vy/w 反馈先保持 0；
+     * 接入轮速正解后再填写。即使全 0 也必须发——云台侧靠这帧维持链路在线。 */
+    CommSend(&gimbal_comm, (uint8_t *)&chassis2gimbal_data);
 }
