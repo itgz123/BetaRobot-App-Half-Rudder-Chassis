@@ -33,7 +33,7 @@
  *   轮向 +：沿当前舵角方向推动车体（不是"俯视逆时针"） */
 #define CHASSIS_RUDDER_L_DIR (1)
 #define CHASSIS_RUDDER_R_DIR (1)
-#define CHASSIS_WHEEL_L_DIR (-1)
+#define CHASSIS_WHEEL_L_DIR (1)
 #define CHASSIS_WHEEL_R_DIR (1)
 
 /*============================================

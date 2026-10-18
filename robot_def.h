@@ -11,7 +11,7 @@
  *       （电机侧 rad，看 VOFA 通道 1），则
  *       偏置(°) = 位置(rad) / STEER_GEAR_RATIO * 180 / π */
 // 当前位置下，舵轮朝向0的位置，2个轮向给正力矩，向底盘系的x正方向（前）走
-#define RUDDER_ZERO_OFFSET_L_DEG (0.0f)
+#define RUDDER_ZERO_OFFSET_L_DEG (180.0f)
 #define RUDDER_ZERO_OFFSET_R_DEG (60.0f)
 
 /*============================ 半舵底盘 运动学参数 ============================*/
