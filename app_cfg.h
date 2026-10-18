@@ -44,18 +44,29 @@
 #define DAEMON_USED                  // Daemon 看门狗
 #define VOFA_USED                    // VOFA+ JustFloat 遥测
 /* 用户通道数（覆盖 drv_vofa.h 的默认 25）。
- * 当前只用于 IMU 标定：drvlib_bmi088_kalman 在 vofa_enable=1 时写 CH1~CH15 并自己发帧，
- * 布局与 bmi088_calib.py 的通道表一致（CH4~6 残差、CH13~15 生效零偏）。
- * 每帧 (15+1+1)×4+4 = 68B，500Hz 下 34kB/s，921600 baud 有充足余量。 */
-#define VOFA_CHANNELS 15             // CH1~3 euler、4~6 gyro、7~9 acc、10 dt、11 yaw_rate、12 温度、13~15 零偏
-#define LIB_CRC_USED                 // 软件 CRC 计算（Direct/GenTable/TableCalc）
-#define LIB_CRC_TABLES_USED          // 软件 CRC 常用算法 Flash 表（lib_crc_tables.c）
-#define LIB_HAMMING_USED             // 汉明码纠错（标准 / 扩展缩短 SECDED，任意 bit 长度）
-#define DRV_COMM_USED                //
-#define LIB_FORMAT_USED              // 快速格式化（零除法整数转换，bsp_log 依赖）
-#define BSP_LOG_USED                 // 日志输出
-#define GENERATE_DISASSEMBLY         // 生成反汇编文件 .lst
-#define GENERATE_READELF             // 生成 readelf 输出文件
+ * 当前用于底盘遥测（app 自写，100Hz）；CSV 第 k 列 = CHk，第 0 列是时间戳：
+ *   CH1~4  左/右舵目标角、实际角 (deg)
+ *   CH5~8  左/右轮目标力矩、实测力矩 (N·m，带符号)
+ *   CH9    换向方案 combo（bit0=左反、bit1=右反）
+ *   CH10~13 四种组合的代价 (s)
+ *   CH14   小力矩锁定标志
+ *   CH15   状态机状态
+ *   CH16~17 左/右驱动轮出力比例 cos(目标−实际)，带符号 (−1~1)
+ *   CH18~20 云台下发速度指令 vx/vy/w (m/s, m/s, rad/s)
+ *   CH21~23 底盘实测速度反馈 vx/vy/w（vx/vy=轮速正解，w=IMU 底盘系）
+ *   CH24~26 期望广义力 fx/fy/mw (N, N, N·m)（力控环输出，分配前）
+ *   CH27~28 左/右驱动轮轮速 (rad/s，轮侧，app 正方向)
+ * 每帧 (1+28)×4+4 = 120B，100Hz 下 12kB/s，921600 baud 余量很大。
+ * ⚠ IMU 自己的 VOFA 帧（标定脚本用）与这里共用通道，已设 vofa_enable=0。 */
+#define VOFA_CHANNELS 28
+#define LIB_CRC_USED         // 软件 CRC 计算（Direct/GenTable/TableCalc）
+#define LIB_CRC_TABLES_USED  // 软件 CRC 常用算法 Flash 表（lib_crc_tables.c）
+#define LIB_HAMMING_USED     // 汉明码纠错（标准 / 扩展缩短 SECDED，任意 bit 长度）
+#define DRV_COMM_USED        //
+#define LIB_FORMAT_USED      // 快速格式化（零除法整数转换，bsp_log 依赖）
+#define BSP_LOG_USED         // 日志输出
+#define GENERATE_DISASSEMBLY // 生成反汇编文件 .lst
+#define GENERATE_READELF     // 生成 readelf 输出文件
 #define DEVELOPMENT_BOARD DM_MC02
 #define HAL_CONFIG_NAME DM_MC02_HALF_RUDDER
 

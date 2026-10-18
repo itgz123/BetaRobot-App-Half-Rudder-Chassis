@@ -47,13 +47,10 @@ uint8_t g_gyro_prev_valid; // 0 = 还没有上一样本（首拍/掉线后）
 AppWheelFeedback_s g_wheel_fb[APP_WHEEL_NUM];
 
 /*============================ 力控 ============================*/
-/* 反馈增益为速度环 P 的初值；前馈三组系数（摩擦/惯性/重力）按用户要求先全 0。
+/* 反馈环参数已移到 app_chassis_force_def.h 的 CHASSIS_FORCE_* 宏（lib_pid 配置）。
+ * 前馈三组系数（摩擦/惯性/重力）按用户要求先全 0。
  * 标定后在这里改，或运行期用调试器改。 */
 ChassisForceCfg_s g_chassis_force_cfg = {
-    .kp_vx = 100.0f, // N/(m/s)
-    .kp_vy = 100.0f, // N/(m/s)
-    .kp_w = 10.0f,   // N·m/(rad/s)
-
     .friction_x = 0.0f, // N
     .friction_y = 0.0f, // N
     .friction_w = 0.0f, // N·m
@@ -65,10 +62,13 @@ ChassisForceCfg_s g_chassis_force_cfg = {
     .gravity_y = 0.0f, // N
 };
 
-vector3_t g_chassis_twist_fb; // 实测底盘速度 (vx, vy, w)
-vector3_t g_chassis_wrench;   // 力控输出 (fx, fy, mw)
+vector3_t g_chassis_twist_fb;        // 实测底盘速度 (vx, vy, w)
+vector3_t g_chassis_wrench;          // 力控输出 (fx, fy, mw)
 LibChassisTorque_s g_chassis_torque; // 力分配输出（轮缘力矩 + 侧向力），当前不下发
 vector3_t g_chassis_cmd_prev;        // 上一拍指令速度
+
+/* 换向决策：0 初始化 = combo 0（两轮都不反）、无历史方案、未锁定 */
+ChassisCostSel_s g_chassis_cost_sel;
 
 /*============================ 校准 / 状态机 ============================*/
 ChassisFsmCtx_s g_chassis_fsm_ctx;

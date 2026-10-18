@@ -11,12 +11,18 @@
 #include "drvlib_bmi088_kalman.h"
 #include "drvlib_motor.h"
 #include "lib_chassis_half_rudder.h"
+#include "lib_pid.h"
 
 #include "drv_comm.h"
 #include "comm_media_can_idseq.h"
+#include "drv_vofa.h"
 
 #include <math.h>
 #include <string.h>
+
+/* 换向决策里用 g_wheel_fb[i] 按舵轮序号取轮向反馈：两套轮序必须一致 */
+_Static_assert((int)LIB_CHASSIS_HALF_RUDDER_L == (int)APP_WHEEL_L, "wheel order mismatch: L");
+_Static_assert((int)LIB_CHASSIS_HALF_RUDDER_R == (int)APP_WHEEL_R, "wheel order mismatch: R");
 
 /* 日志实例（校准超时/故障上报；LOG_UART 未开时不发射代码） */
 LOG_INSTANCE_DEF(g_chassis_log, "chassis", 20);
@@ -92,13 +98,67 @@ static uint8_t GimbalCommIsOnline(void)
  * @param twist_fb 实测速度：vx/vy 来自轮速正解，w 来自 IMU 底盘系 z 轴角速度
  * @param dt_s     本拍步长 (s)
  * @return W = (fx [N], fy [N], mw [N·m])
- * @note 反馈只取 P（前馈已单独补偿摩擦，积分留到需要时再加）。
+ * @note 三个通道的反馈都由 lib_pid 计算；平动为 P，yaw 为 PI（消稳态偏航漂移）。
  * @note 前馈三项（摩擦/惯性/重力）系数当前全 0：代码路径已接通，填数即生效。
  *       - 摩擦：沿**指令**速度符号施加（指令过零不施加，避免静止抖动）；
  *       - 惯性：指令加速度 = 本拍指令 − 上一拍指令 的差分，乘 mass / inertia_z；
  *       - 重力：车体系固定分量，平面行驶为 0，坡道标定后填。
  * @note 指令加速度用纯差分，未做低通；系数为 0 时无影响，正式标定时再看是否需要滤波。
  */
+/* 力控反馈 PID 实例（只在 RUN 更新；离开 RUN 由 ChassisForceReset 清状态） */
+static PIDInstance s_force_pid_vx;
+static PIDInstance s_force_pid_vy;
+static PIDInstance s_force_pid_w;
+static uint8_t s_force_pid_inited;
+
+static const PID_Init_Config_s s_force_pid_cfg_vx = {
+    .kp = CHASSIS_FORCE_VX_KP,
+    .ki = 0.0f,
+    .kd = 0.0f,
+    .deadband = CHASSIS_FORCE_XY_DEADBAND,
+    .out_lpf_rc = CHASSIS_FORCE_XY_LPF_RC,
+    .config_mask = PID_ENABLE_DEADBAND | PID_ENABLE_OUTPUT_FILTER,
+};
+
+static const PID_Init_Config_s s_force_pid_cfg_vy = {
+    .kp = CHASSIS_FORCE_VY_KP,
+    .ki = 0.0f,
+    .kd = 0.0f,
+    .deadband = CHASSIS_FORCE_XY_DEADBAND,
+    .out_lpf_rc = CHASSIS_FORCE_XY_LPF_RC,
+    .config_mask = PID_ENABLE_DEADBAND | PID_ENABLE_OUTPUT_FILTER,
+};
+
+static const PID_Init_Config_s s_force_pid_cfg_w = {
+    .kp = CHASSIS_FORCE_W_KP,
+    .ki = CHASSIS_FORCE_W_KI,
+    .kd = 0.0f,
+    .integral_limit = CHASSIS_FORCE_W_INTEGRAL_LIMIT,
+    .out_lpf_rc = CHASSIS_FORCE_W_LPF_RC,
+    /* 不开 DEADBAND：它会把 i_out 清零（见 def.h 的说明） */
+    .config_mask = PID_ENABLE_INTEGRAL_LIMIT | PID_ENABLE_OUTPUT_FILTER,
+};
+
+static void ChassisForceReset(void)
+{
+    LibPIDReset(&s_force_pid_vx);
+    LibPIDReset(&s_force_pid_vy);
+    LibPIDReset(&s_force_pid_w);
+}
+
+/* 首次进 RUN 时初始化（配置是常量，重复初始化只会白清状态） */
+static void ChassisForcePidEnsureInit(void)
+{
+    if (s_force_pid_inited != 0u)
+    {
+        return;
+    }
+    LibPIDInit(&s_force_pid_vx, &s_force_pid_cfg_vx);
+    LibPIDInit(&s_force_pid_vy, &s_force_pid_cfg_vy);
+    LibPIDInit(&s_force_pid_w, &s_force_pid_cfg_w);
+    s_force_pid_inited = 1u;
+}
+
 static vector3_t ChassisForceSolve(const gimbal2chassis_data_t *cmd, const vector3_t *twist_fb, float dt_s)
 {
     const ChassisForceCfg_s *c = &g_chassis_force_cfg;
@@ -143,12 +203,202 @@ static vector3_t ChassisForceSolve(const gimbal2chassis_data_t *cmd, const vecto
         ff_w -= c->friction_w;
     }
 
-    /* 反馈：P × (指令 − 实测) */
+    /* 反馈：三个 lib_pid 统一计算（前馈作为 feedforward 参数传入）。
+     * 平动通道的死区/输出低通见 def.h：轮速正解在舵轮偏转/高转速下的噪声远大于
+     * 真实平移，不抑制会产生与偏航力同量级的假力。
+     * yaw 通道用 PI：纯 P 留下与偏航阻力成正比的稳态误差（实测 w 漂移）。 */
+    ChassisForcePidEnsureInit();
     vector3_t wrench;
-    wrench.x = c->kp_vx * (cmd->vx - twist_fb->x) + ff_x;
-    wrench.y = c->kp_vy * (cmd->vy - twist_fb->y) + ff_y;
-    wrench.z = c->kp_w * (cmd->w - twist_fb->z) + ff_w;
+    wrench.x = LibPIDCalculate(&s_force_pid_vx, cmd->vx, twist_fb->x, ff_x, dt_s);
+    wrench.y = LibPIDCalculate(&s_force_pid_vy, cmd->vy, twist_fb->y, ff_y, dt_s);
+    wrench.z = LibPIDCalculate(&s_force_pid_w, cmd->w, twist_fb->z, ff_w, dt_s);
     return wrench;
+}
+
+/*============================ 舵向换向决策（代价函数） ============================*/
+/**
+ * @brief 把力分配结果还原成"该轮的期望轮向 + 期望轮缘力矩大小"
+ * @param wheel 轮序（0=左舵，1=右舵）
+ * @param st    本拍状态（steer_angle 为舵轮侧连续角）
+ * @param alloc 力分配输出：力矩沿**当前**舵角 e_r，侧向力沿 e_t
+ * @param phi   输出：期望轮向 (rad，车体系，任意区间)
+ * @param tau   输出：所需轮缘力矩**大小** (N·m，≥0)
+ * @note 当前舵角 α 下接触点合力 F = f_drive·e_r + f_lat·e_t。
+ *       把舵轮转到 F 的方向后，同样的 F 只需驱动行承担（侧向力→0），故
+ *           φ_F = α + atan2(f_lat, f_drive)
+ *           τ_F = |F|·R = √(f_drive² + f_lat²)·R
+ *       （f_drive = alloc->wheel_torque / R）。
+ * @note φ_F 与 φ_F+180° 配 ±τ_F 是同一组力的两个等价解，选哪个由代价函数定。
+ */
+static void ChassisAllocToSteer(uint8_t wheel, const LibChassisState_s *st, const LibChassisTorque_s *alloc, float *phi, float *tau)
+{
+    const float f_drive = alloc->wheel_torque[wheel] / CHASSIS_WHEEL_RADIUS;
+    const float f_lat = alloc->lateral_force[wheel];
+
+    *phi = st->steer_angle[wheel] + atan2f(f_lat, f_drive);
+    *tau = sqrtf(f_drive * f_drive + f_lat * f_lat) * CHASSIS_WHEEL_RADIUS;
+}
+
+/**
+ * @brief 4 种换向组合的代价评估 + 迟滞/小力矩锁定/角度死区
+ * @param st    本拍底盘状态（舵角反馈）
+ * @param alloc 本拍力分配结果
+ * @note 组合枚举（combo 位）：bit0 = 左舵反向(φ+180°, −τ)，bit1 = 右舵反向。
+ *       每轮代价 = 角度误差×COST_RUDDER + 力矩误差×COST_WHEEL；
+ *       两舵**转动方向**相反（一逆一顺）时再加 CHASSIS_COST_DIFF。
+ * @note 迟滞：当前方案（combo）的代价每拍按当前状态重算，新方案必须便宜超过
+ *       CHASSIS_COST_SWITCH_MARGIN 才切换；平手保持现方案。
+ * @note 小力矩锁定：两轮期望力矩都低于 CHASSIS_COST_TORQUE_LOCK 时不重新决策，
+ *       目标角保持当前位置、输出力矩 0 —— 静止时力分配方向由噪声决定，
+ *       不锁会让舵向在 ±180° 两解间横跳。
+ * @note 单轮小力矩冻结：只有一轮低于阈值时，该轮不转舵、沿当前轮向出力；
+ *       力很小的轮子为了对齐方向而大幅转舵只会引入侧滑（见步骤 6 注释）。
+ * @note 角度死区：|Δθ| 先扣掉 CHASSIS_COST_ANGLE_DEADBAND 再算代价（舵向小幅
+ *       抖动不再影响决策）；同时也用它判定"这次转动属于哪个旋转方向"。
+ */
+static void ChassisCostSelect(const LibChassisState_s *st, const LibChassisTorque_s *alloc)
+{
+    ChassisCostSel_s *sel = &g_chassis_cost_sel;
+
+    /* 1. 两轮的期望轮向/力矩大小 */
+    float phi_f[LIB_CHASSIS_HALF_RUDDER_NUM];
+    float tau_f[LIB_CHASSIS_HALF_RUDDER_NUM];
+    uint8_t all_small = 1u;
+    for (uint8_t i = 0; i < LIB_CHASSIS_HALF_RUDDER_NUM; i++)
+    {
+        ChassisAllocToSteer(i, st, alloc, &phi_f[i], &tau_f[i]);
+        if (tau_f[i] >= CHASSIS_COST_TORQUE_LOCK)
+        {
+            all_small = 0u;
+        }
+    }
+
+    /* 2. 小力矩锁定：不重新决策，原地保持 */
+    if (all_small != 0u)
+    {
+        sel->locked = 1u;
+        for (uint8_t i = 0; i < LIB_CHASSIS_HALF_RUDDER_NUM; i++)
+        {
+            sel->angle_target[i] = st->steer_angle[i];
+            sel->angle_error[i] = 0.0f;
+            sel->wheel_torque[i] = 0.0f;
+            sel->wheel_align[i] = 1.0f; // 不出力，比例只是占位
+            /* 方案本身保持不变（下面的迟滞基准还要用它），只把给定锁在原地 */
+            sel->reverse[i] = (uint8_t)((sel->combo >> i) & 0x1u);
+        }
+        return;
+    }
+    sel->locked = 0u;
+
+    /* 3. 每轮两种等价解的代价 + 舵轮转动方向（+1 逆时针 / −1 顺时针 / 0 死区内） */
+    float cost[LIB_CHASSIS_HALF_RUDDER_NUM][2];
+    int8_t rot[LIB_CHASSIS_HALF_RUDDER_NUM][2];
+    for (uint8_t i = 0; i < LIB_CHASSIS_HALF_RUDDER_NUM; i++)
+    {
+        /* 实测力矩：电机轴 × 减速比 = 轮缘（MF7015 直驱，系数为 1） */
+        const float tau_now = g_wheel_fb[i].torque * CHASSIS_DRIVE_REDUCTION;
+        for (uint8_t rev = 0u; rev < 2u; rev++)
+        {
+            const float phi_t = phi_f[i] + ((rev != 0u) ? M_PI : 0.0f);
+            const float tau_t = (rev != 0u) ? -tau_f[i] : tau_f[i];
+
+            /* 目标角与当前角的最短差（wrap 到 (−π, π]），再扣角度死区 */
+            const float dphi = Lib_Math_WrapAngleNegPIToPI(phi_t - st->steer_angle[i]);
+            float theta_e = fabsf(dphi) - CHASSIS_COST_ANGLE_DEADBAND;
+            if (theta_e < 0.0f)
+            {
+                theta_e = 0.0f;
+            }
+            const float tau_e = fabsf(tau_t - tau_now);
+
+            cost[i][rev] = theta_e * CHASSIS_COST_RUDDER + tau_e * CHASSIS_COST_WHEEL;
+
+            if (dphi > CHASSIS_COST_ANGLE_DEADBAND)
+            {
+                rot[i][rev] = 1;
+            }
+            else if (dphi < -CHASSIS_COST_ANGLE_DEADBAND)
+            {
+                rot[i][rev] = -1;
+            }
+            else
+            {
+                rot[i][rev] = 0;
+            }
+        }
+    }
+
+    /* 4. 四种组合的总代价 */
+    uint8_t best = 0u;
+    for (uint8_t combo = 0u; combo < 4u; combo++)
+    {
+        const uint8_t bl = (uint8_t)(combo & 0x1u);        // bit0 = 左舵反向
+        const uint8_t br = (uint8_t)((combo >> 1) & 0x1u); // bit1 = 右舵反向
+
+        float c = cost[LIB_CHASSIS_HALF_RUDDER_L][bl] + cost[LIB_CHASSIS_HALF_RUDDER_R][br];
+        if ((rot[LIB_CHASSIS_HALF_RUDDER_L][bl] != 0) && (rot[LIB_CHASSIS_HALF_RUDDER_R][br] != 0) &&
+            (rot[LIB_CHASSIS_HALF_RUDDER_L][bl] != rot[LIB_CHASSIS_HALF_RUDDER_R][br]))
+        {
+            c += CHASSIS_COST_DIFF; // 两舵轮转向相反
+        }
+        sel->cost[combo] = c;
+
+        if (c < sel->cost[best])
+        {
+            best = combo;
+        }
+    }
+
+    /* 5. 迟滞：当前执行方案的代价按本拍状态重算，新方案须便宜超过
+     *    CHASSIS_COST_SWITCH_MARGIN 才切换；平手保持现方案。
+     *    舵轮从一个等价解转到另一个要几百毫秒，期间两解在 |Δθ|≈90° 附近的角度
+     *    代价几乎相等，实测力矩/目标方向噪声会让方案在 ±90° 边界来回翻
+     *    （2026-10-18 日志：67 次切换、36% 间隔 <100ms；51% 的弱出力帧落在切换后
+     *    300ms 内；弱出力时 |w| p95 6.15 vs 对齐时 2.68）。迟滞裕量本身就承担了
+     *    这个消抖作用，另加固定 150ms 保持会在需要换向时把舵轮按在原方向。 */
+    if (sel->valid == 0u)
+    {
+        sel->combo = best;
+        sel->valid = 1u;
+    }
+    else if ((best != sel->combo) && ((sel->cost[sel->combo] - sel->cost[best]) > CHASSIS_COST_SWITCH_MARGIN))
+    {
+        sel->combo = best;
+    }
+
+    /* 6. 输出给定量：目标角取与当前角连续的表示（等价于 φ_t，模 2π） */
+    for (uint8_t i = 0; i < LIB_CHASSIS_HALF_RUDDER_NUM; i++)
+    {
+        const uint8_t rev = (uint8_t)((sel->combo >> i) & 0x1u); // i=0 左舵 / i=1 右舵
+
+        /* 单轮小力矩不转舵：该轮接触力很小时，"转到力方向"的收益可以忽略，
+         * 但舵角一动 align 就掉、力矩投影跟着抖。2026-10-18 原地旋转日志：
+         * 平移力 fx 把左轮偏航推力抵消到 ~0（左轮 |τ|<0.2 占 35.8%），左轮为
+         * 对齐 1~2 N 的小力转了 60~120°，侧滑让偏航力矩塌陷，形成 0.9 Hz 振荡。
+         * 力小时直接沿当前轮向输出分配出的驱动力矩（alloc->wheel_torque 已带符号），
+         * 目标角保持不动；只有两轮都小时才走上面的整体锁定（出力 0）。 */
+        if (tau_f[i] < CHASSIS_COST_TORQUE_LOCK)
+        {
+            sel->angle_target[i] = st->steer_angle[i];
+            sel->angle_error[i] = 0.0f;
+            sel->wheel_torque[i] = alloc->wheel_torque[i];
+            sel->wheel_align[i] = 1.0f;
+            sel->reverse[i] = rev;
+            continue;
+        }
+
+        const float phi_t = phi_f[i] + ((rev != 0u) ? M_PI : 0.0f);
+        const float dphi = Lib_Math_WrapAngleNegPIToPI(phi_t - st->steer_angle[i]);
+
+        /* 角度死区：已在死区内就不再动舵（目标 = 当前角），避免 1° 级的来回修正 */
+        sel->angle_target[i] = (fabsf(dphi) <= CHASSIS_COST_ANGLE_DEADBAND) ? st->steer_angle[i] : (st->steer_angle[i] + dphi);
+        sel->angle_error[i] = fabsf(dphi);
+        sel->wheel_torque[i] = (rev != 0u) ? -tau_f[i] : tau_f[i];
+        /* 出力比例：cos 是 2π 周期，直接对连续角差取余弦即可（不必先归一化）。
+         * 反向解已在 wheel_torque 里带负号，两者相乘后与分支无关。 */
+        sel->wheel_align[i] = Lib_Math_Cos(dphi);
+        sel->reverse[i] = rev;
+    }
 }
 
 /*============================ 舵向零点标定 ============================*/
@@ -207,7 +457,7 @@ static void ChassisCalibPollGate(void)
  *   CAL   上电校准：两舵轮扫描找光电门零点（此时不理会云台在线与否）
  *   FAULT 校准失败（连续超时）：失能 + 给定清零，终态（需复位重启再标）
  *   SAFE  已标定但不可动：云台掉线 或 云台下发 stop
- *   RUN   已标定且可动：力控/解算入口（当前控制尚未接入，舵向保持当前位置、轮向 0 力矩）
+ *   RUN   已标定且可动：力控/解算入口（正解 → 广义力 → 分配 → 换向决策 → 下发）
  * 事件只有一个"每拍更新"：状态完全由 (是否标定, 是否超时, 是否在线, 是否 stop) 决定。
  * ⚠ 校准是"上电即可做、与云台无关"的第一步：云台常没上电，故 CAL 不受 online 影响。 */
 
@@ -402,7 +652,8 @@ void AppChassisInit(void)
 
     /* ---- 舵向控制核（drvlib_motor）：左右舵同参数 ----
      * loop_type   ANGLE|SPEED 两环都建（校准期临时收窄成 SPEED，进 RUN 时恢复）
-     * 位置模式    WRAP，归一化范围 ±π×减速比（舵轮一周 = 电机 8 圈）
+     * 位置模式    WRAP 360°：窗口 ±π×减速比，跨度 = 舵轮整圈 2π（电机 16π）
+     *             换向决策的 φ/φ+180° 两个等价解都在窗口内，可连续绕整圈
      * position_span 单圈 2π（M3508 编码器跨度），供多圈累加
      * 方向        见 CHASSIS_RUDDER_x_DIR（motor/feedback 成对）
      * 低通        速度/电流 20ms（沿用旧整定）
@@ -412,10 +663,10 @@ void AppChassisInit(void)
         .motor_direction = (DrvlibMotorDirection_e)CHASSIS_RUDDER_L_DIR,    // 输出方向
         .feedback_direction = (DrvlibMotorDirection_e)CHASSIS_RUDDER_L_DIR, // 反馈方向
         .position_mode = DRVLIB_MOTOR_POS_WRAP,
-        .angle_limit_min = -M_PI * CHASSIS_STEER_GEAR_RATIO,
-        .angle_limit_max = M_PI * CHASSIS_STEER_GEAR_RATIO,
-        .position_span = 6.2831853f, // 单圈 2π
-        .position_offset = 0.0f,     // 光电门标定时由 RudderCalibrateOffset 改写
+        .angle_limit_min = CHASSIS_STEER_WRAP_MIN, // 舵轮 −180°（电机侧 −8π）
+        .angle_limit_max = CHASSIS_STEER_WRAP_MAX, // 舵轮 +180°（电机侧 +8π）
+        .position_span = M_2PI,                    // 单圈 2π，供多圈累加
+        .position_offset = 0.0f,                   // 光电门标定时由 RudderCalibrateOffset 改写
         .lpf_enable = DRVLIB_MOTOR_LPF_ENABLE,
         .lpf_rc = 0.02f,
         .angle_feedforward_src = DRVLIB_MOTOR_FF_DISABLE,
@@ -458,8 +709,14 @@ void AppChassisInit(void)
                         .error_normalize_range = CHASSIS_RUDDER_PID_ANGLE_ERR_NORM_RANGE,
                         .out_max = CHASSIS_RUDDER_PID_ANGLE_OUT_MAX,
                         .out_min = CHASSIS_RUDDER_PID_ANGLE_OUT_MIN,
-                        .config_mask = PID_ENABLE_ERROR_NORMALIZE | // 启用误差归一化
-                                       PID_ENABLE_OUTPUT_LIMIT,     // 输出限幅
+                        /* 微分先行的测量值：drvlib_motor 在 WRAP 下用连续位置，
+                         * 跨 ±180° 不会因整周期跳变打出 D 冲击；再加一阶滤波压编码器噪声。
+                         * 用 D-on-measure 而不是 D-on-error：换向决策会让目标角阶跃
+                         * ±180°，D-on-error 会对这个阶跃打一拳。 */
+                        .config_mask = PID_ENABLE_ERROR_NORMALIZE |    // 启用误差归一化
+                                       PID_ENABLE_OUTPUT_LIMIT |       // 输出限幅
+                                       PID_ENABLE_DERIVATIVE_ON_MEAS | // 微分先行
+                                       PID_ENABLE_DERIVATIVE_FILTER,   // 微分滤波
                     },
             },
         .dt_max = 0.01f,  // 单帧 dt 上限 (s)
@@ -534,10 +791,10 @@ void AppChassisInit(void)
         .r_tilt = 4e-4f,
         .dt_max = 0.01f,
         .temp_lpf_alpha = 0.01f,
-        /* 1 = 模块每帧把 CH1~CH15 写好并自己发帧（布局见 drvlib_bmi088_kalman.h）。
-         * 该布局就是标定脚本 drvlib/drvlib_bmi088_calib/bmi088_calib.py 的输入：
-         * CH4~6 是扣掉旧零偏后的残差，脚本按"新零偏 = CH13~15 + CH4~6 均值"迭代。 */
-        .vofa_enable = 1,
+        /* IMU 自己发 VOFA 会占用 CH1~CH15（标定脚本布局）。当前遥测改成
+         * 底盘数据（舵向/轮向，100Hz，见 AppChassisRun 末尾），通道只能给一方；
+         * 需要重新标定 IMU 时把这里改回 1，并同时去掉底盘 VOFA 发送。 */
+        .vofa_enable = 0,
     };
     BSP_ASSERT_APP_CALL(BMI088KalmanConfig(&bmi088, &bmi088_cfg));
 
@@ -631,10 +888,12 @@ void AppChassisRun(float dt, uint64_t time_stamp)
     const DrvsLKMotorBroadcastData_s wheel_l_data = DrvsLKMotorBroadcastGetData(&wheel_l_motor);
     const DrvsLKMotorBroadcastData_s wheel_r_data = DrvsLKMotorBroadcastGetData(&wheel_r_motor);
     g_wheel_fb[APP_WHEEL_L].speed = wheel_l_data.speed * (float)CHASSIS_WHEEL_L_DIR;
+    g_wheel_fb[APP_WHEEL_L].torque = wheel_l_data.torque * (float)CHASSIS_WHEEL_L_DIR;
     g_wheel_fb[APP_WHEEL_L].current = wheel_l_data.current * (float)CHASSIS_WHEEL_L_DIR;
     g_wheel_fb[APP_WHEEL_L].temperature = wheel_l_data.temperature;
     g_wheel_fb[APP_WHEEL_L].error = wheel_l_data.echo;
     g_wheel_fb[APP_WHEEL_R].speed = wheel_r_data.speed * (float)CHASSIS_WHEEL_R_DIR;
+    g_wheel_fb[APP_WHEEL_R].torque = wheel_r_data.torque * (float)CHASSIS_WHEEL_R_DIR;
     g_wheel_fb[APP_WHEEL_R].current = wheel_r_data.current * (float)CHASSIS_WHEEL_R_DIR;
     g_wheel_fb[APP_WHEEL_R].temperature = wheel_r_data.temperature;
     g_wheel_fb[APP_WHEEL_R].error = wheel_r_data.echo;
@@ -665,14 +924,35 @@ void AppChassisRun(float dt, uint64_t time_stamp)
 
     case CHASSIS_STATE_RUN:
         /* 已校准 + 云台在线且使能（守卫保证）。
-         * 舵向暂时保持在标定零点（0 = 正前方）；驱动轮力矩等力分配接入后再下发，
-         * 当前先只做力矩计算（g_chassis_wrench），输出仍为 0。 */
+         * 给定取**上一拍**的换向决策（正解/力控/分配/决策在本函数后半段，晚于 SetRef）；
+         * 2ms 滞后对 500Hz 控制可忽略。
+         * ⚠ 首次进入 RUN 时决策还是 0 初始化（angle_target=0 是电机侧 0 rad，
+         *   不是标定零点），不能直接下发；valid==0 时保持当前舵角、轮向 0 力矩，
+         *   本拍后半段算出的决策从下一拍开始生效。 */
         rudder_l_ctrl.cfg.loop_type = DRVLIB_MOTOR_LOOP_ANGLE | DRVLIB_MOTOR_LOOP_SPEED;
         rudder_r_ctrl.cfg.loop_type = DRVLIB_MOTOR_LOOP_ANGLE | DRVLIB_MOTOR_LOOP_SPEED;
         DrvlibMotorEnable(&rudder_l_ctrl);
         DrvlibMotorEnable(&rudder_r_ctrl);
-        rudder_l_ref = 0.0f; // 电机侧位置 0（标定后的零点）
-        rudder_r_ref = 0.0f;
+
+        if (g_chassis_cost_sel.valid != 0u)
+        {
+            /* 舵向：决策给的是舵轮侧 rad，控制核要电机侧 rad */
+            rudder_l_ref = g_chassis_cost_sel.angle_target[LIB_CHASSIS_HALF_RUDDER_L] * CHASSIS_STEER_GEAR_RATIO;
+            rudder_r_ref = g_chassis_cost_sel.angle_target[LIB_CHASSIS_HALF_RUDDER_R] * CHASSIS_STEER_GEAR_RATIO;
+
+            /* 轮向：带符号轮缘力矩 × cos(目标−实际)（投影到目标轮面方向）。
+             * 比例取上一拍决策算好的值（2ms 滞后可忽略）；不钳负，见 def.h 说明。 */
+            g_wheel_l_setref = g_chassis_cost_sel.wheel_torque[LIB_CHASSIS_HALF_RUDDER_L] * g_chassis_cost_sel.wheel_align[LIB_CHASSIS_HALF_RUDDER_L] /
+                               CHASSIS_DRIVE_REDUCTION;
+            g_wheel_r_setref = g_chassis_cost_sel.wheel_torque[LIB_CHASSIS_HALF_RUDDER_R] * g_chassis_cost_sel.wheel_align[LIB_CHASSIS_HALF_RUDDER_R] /
+                               CHASSIS_DRIVE_REDUCTION;
+        }
+        else
+        {
+            /* 决策尚未产生：舵向保持当前电机侧位置（data.position 是上一拍刷新的），轮向不出力 */
+            rudder_l_ref = (float)rudder_l_ctrl.data.position;
+            rudder_r_ref = (float)rudder_r_ctrl.data.position;
+        }
         break;
 
     case CHASSIS_STATE_FAULT:
@@ -734,20 +1014,31 @@ void AppChassisRun(float dt, uint64_t time_stamp)
     /* 速度指令 → 广义力 → 各轮力矩。
      * 只在 RUN（已校准且云台使能）计算，其余状态输出清零。
      * 力分配用同一份几何与**当前舵角**：W → (JᵀJ)⁻¹·W → 行力 → 驱动行 × 轮半径。
-     * 输出 wheel_torque 是轮缘力矩 [N·m]（沿当前舵角），当前只算不下发。 */
+     * 输出 wheel_torque 是轮缘力矩 [N·m]（沿**当前**舵角）；随后交给换向决策
+     * 变成"目标舵角 + 带符号轮缘力矩"，由主循环下发。 */
     if (state == CHASSIS_STATE_RUN)
     {
         g_chassis_wrench = ChassisForceSolve(&g_gimbal2chassis_data, &g_chassis_twist_fb, dt_s);
         if (LibChassisAllocateTorque(&s_chassis, &chassis_state, g_chassis_wrench, &g_chassis_torque) != 0)
         {
-            /* 几何退化（JᵀJ 奇异）：输出清零，不保留上一拍结果 */
+            /* 几何退化（JᵀJ 奇异）：输出清零，不保留上一拍结果；换向决策一并作废 */
             g_chassis_torque = (LibChassisTorque_s){0};
+            g_chassis_cost_sel = (ChassisCostSel_s){0};
+        }
+        else
+        {
+            /* 两种等价解 × 左右 = 4 种组合，按代价选；结果见 g_chassis_cost_sel，
+             * 下一拍由状态给定的 RUN 分支下发（见函数开头）。 */
+            ChassisCostSelect(&chassis_state, &g_chassis_torque);
         }
     }
     else
     {
         g_chassis_wrench = (vector3_t){0.0f, 0.0f, 0.0f};
         g_chassis_torque = (LibChassisTorque_s){0};
+        /* 离开运行态即作废换向历史：下次使能重新决策（不沿用急停前的方案） */
+        g_chassis_cost_sel = (ChassisCostSel_s){0};
+        ChassisForceReset(); // 三个速度环 PID 的积分/滤波状态都从 0 重新起
     }
     g_chassis_cmd_prev = (vector3_t){g_gimbal2chassis_data.vx, g_gimbal2chassis_data.vy, g_gimbal2chassis_data.w};
 
@@ -768,7 +1059,53 @@ void AppChassisRun(float dt, uint64_t time_stamp)
     DrvsLKMotorBroadcastSetRef(&wheel_r_motor, g_wheel_r_setref * (float)CHASSIS_WHEEL_R_DIR);
     DrvsLKMotorBroadcastGroupSend(&wheel_motor_group);
 
-    /* 云台通信：每周期回一帧。当前还没有正解，vx/vy/w 反馈先保持 0；
-     * 接入轮速正解后再填写。即使全 0 也必须发——云台侧靠这帧维持链路在线。 */
+    /* 云台通信：每周期回一帧（vx/vy 来自轮速正解，w 来自 IMU，见上面回传段）。
+     * 即使全 0 也必须发——云台侧靠这帧维持链路在线。 */
     CommSend(&gimbal_comm, (uint8_t *)&g_chassis2gimbal_data);
+
+    /*============================ VOFA 遥测：100Hz ============================*/
+    /* 500Hz 任务按时间累计，每满 10ms 发一帧（不依赖任务周期整除）。
+     * 通道布局见 app_cfg.h；IMU 自己的 VOFA 已关（通道只够一方）。 */
+    static float s_vofa_accum_ms = 0.0f;
+    s_vofa_accum_ms += dt;
+    if (s_vofa_accum_ms >= 10.0f)
+    {
+        s_vofa_accum_ms -= 10.0f;
+
+        const float r2d = 180.0f / M_PI;
+        /* 目标角内部是连续表达（可能 >180°），遥测统一折到 (−180°,180°] 与实测同系；
+         * 遥控判换向时看角度差即可（wrap 差），不要直接减。 */
+        VofaSetChannel(1, Lib_Math_WrapAngleNegPIToPI(g_chassis_cost_sel.angle_target[LIB_CHASSIS_HALF_RUDDER_L]) * r2d); // 左舵目标 (deg)
+        VofaSetChannel(2, chassis_state.steer_angle[LIB_CHASSIS_HALF_RUDDER_L] * r2d);                                    // 左舵实际 (deg)
+        VofaSetChannel(3, Lib_Math_WrapAngleNegPIToPI(g_chassis_cost_sel.angle_target[LIB_CHASSIS_HALF_RUDDER_R]) * r2d); // 右舵目标 (deg)
+        VofaSetChannel(4, chassis_state.steer_angle[LIB_CHASSIS_HALF_RUDDER_R] * r2d);                                    // 右舵实际 (deg)
+        VofaSetChannel(5, g_chassis_cost_sel.wheel_torque[LIB_CHASSIS_HALF_RUDDER_L]);                                    // 左轮目标 (N·m)
+        VofaSetChannel(6, g_wheel_fb[APP_WHEEL_L].torque * CHASSIS_DRIVE_REDUCTION);                                      // 左轮实测 (N·m)
+        VofaSetChannel(7, g_chassis_cost_sel.wheel_torque[LIB_CHASSIS_HALF_RUDDER_R]);                                    // 右轮目标 (N·m)
+        VofaSetChannel(8, g_wheel_fb[APP_WHEEL_R].torque * CHASSIS_DRIVE_REDUCTION);                                      // 右轮实测 (N·m)
+        VofaSetChannel(9, (float)g_chassis_cost_sel.combo);                                                               // 换向方案 0~3
+        VofaSetChannel(10, g_chassis_cost_sel.cost[0]);                                                                   // 组合代价 (s)
+        VofaSetChannel(11, g_chassis_cost_sel.cost[1]);
+        VofaSetChannel(12, g_chassis_cost_sel.cost[2]);
+        VofaSetChannel(13, g_chassis_cost_sel.cost[3]);
+        VofaSetChannel(14, (float)g_chassis_cost_sel.locked);                          // 小力矩锁定
+        VofaSetChannel(15, (float)state);                                              // 状态机状态
+        VofaSetChannel(16, g_chassis_cost_sel.wheel_align[LIB_CHASSIS_HALF_RUDDER_L]); // 左轮出力比例 cos(目标−实际)
+        VofaSetChannel(17, g_chassis_cost_sel.wheel_align[LIB_CHASSIS_HALF_RUDDER_R]); // 右轮出力比例 cos(目标−实际)
+        /* CH18~28：命令 / 反馈 / 力控中间量。换向乱转的定位关键是
+         * "期望力方向为什么转" —— 对比 CH18~20（指令）与 CH21~23（反馈），
+         * 再看 CH24~26 是否跟着转，就能区分指令在转、反馈在转还是分配在转。 */
+        VofaSetChannel(18, g_gimbal2chassis_data.vx);                                // 指令 vx (m/s)
+        VofaSetChannel(19, g_gimbal2chassis_data.vy);                                // 指令 vy (m/s)
+        VofaSetChannel(20, g_gimbal2chassis_data.w);                                 // 指令 w (rad/s)
+        VofaSetChannel(21, g_chassis_twist_fb.x);                                    // 反馈 vx (m/s，轮速正解)
+        VofaSetChannel(22, g_chassis_twist_fb.y);                                    // 反馈 vy (m/s，轮速正解)
+        VofaSetChannel(23, g_chassis_twist_fb.z);                                    // 反馈 w (rad/s，IMU)
+        VofaSetChannel(24, g_chassis_wrench.x);                                      // 期望力 fx (N)
+        VofaSetChannel(25, g_chassis_wrench.y);                                      // 期望力 fy (N)
+        VofaSetChannel(26, g_chassis_wrench.z);                                      // 期望力矩 mw (N·m)
+        VofaSetChannel(27, g_wheel_fb[APP_WHEEL_L].speed / CHASSIS_DRIVE_REDUCTION); // 左驱动轮轮速 (rad/s)
+        VofaSetChannel(28, g_wheel_fb[APP_WHEEL_R].speed / CHASSIS_DRIVE_REDUCTION); // 右驱动轮轮速 (rad/s)
+        VofaSend();
+    }
 }

@@ -20,9 +20,10 @@
 #include "robot_def.h" // IMU 安装方向与位置宏
 #include "lib_math.h"
 #include "lib_fsm_table.h"
-#include "lib_chassis.h" // LibChassisTorque_s（力分配输出）
-#include "drvlib_bmi088_kalman.h" // BMI088_Calib_s
-#include "drv_comm.h"             // CommInstance
+#include "lib_chassis.h"             // LibChassisTorque_s（力分配输出）
+#include "lib_chassis_half_rudder.h" // LIB_CHASSIS_HALF_RUDDER_NUM / 轮序
+#include "drvlib_bmi088_kalman.h"    // BMI088_Calib_s
+#include "drv_comm.h"                // CommInstance
 
 /*============================================
  *              电机方向（2026-10-18 实测）
@@ -45,6 +46,13 @@
 #define CHASSIS_STEER_GEAR_RATIO (8.0f)
 #define CHASSIS_STEER_GEAR_RATIO_INV (0.125f)
 
+/* 舵向位置环 WRAP 窗口 = 舵轮整圈 360°（电机侧 ±π×减速比，跨度 16π = 舵轮 2π）。
+ * 换向决策会在 φ 与 φ+180° 两个等价解之间选，两者都落在这个窗口内：
+ * 舵轮可以连续绕整圈，不会被 ±180° 的"机械端点"挡住。
+ * 窗口端点取 ±180° 是为了让 0（车体正前方）落在窗口正中，跨窗次数最少。 */
+#define CHASSIS_STEER_WRAP_MIN (-M_PI * CHASSIS_STEER_GEAR_RATIO)
+#define CHASSIS_STEER_WRAP_MAX (M_PI * CHASSIS_STEER_GEAR_RATIO)
+
 /* 上电校准（光电门找零点）：两舵轮以恒定速度扫描，捕捉下降沿。
  * 单次超时只重试（漏采一圈很常见），连续 CHASSIS_CAL_MAX_RETRIES 次才判故障。
  * 5000 拍 × 2ms = 10s。 */
@@ -64,7 +72,8 @@
  * 这里给的是 app 正方向，下发时仍会乘 CHASSIS_WHEEL_x_DIR，走完整符号链。 */
 #define CHASSIS_WHEEL_CAL_TORQUE (0.5f)
 
-/* 舵向环路 PID（整定值沿用旧 app；力控阶段未接入前只有校准速度环真正生效） */
+/* 舵向环路 PID：数值原样取自旧 app（app_chassis/app_chassis_def.h），
+ * 包括角度环的"无积分、D 不加滤波"。力控阶段未接入前只有校准速度环真正生效。 */
 #define CHASSIS_RUDDER_PID_SPEED_KP (0.10f)
 #define CHASSIS_RUDDER_PID_SPEED_KI (0.20f)
 #define CHASSIS_RUDDER_PID_SPEED_KD (0.002f)
@@ -84,7 +93,9 @@
 #define CHASSIS_RUDDER_PID_ANGLE_INTEGRAL_LIMIT (0.0f)
 #define CHASSIS_RUDDER_PID_ANGLE_COEF_A (0.0f)
 #define CHASSIS_RUDDER_PID_ANGLE_COEF_B (0.0f)
-#define CHASSIS_RUDDER_PID_ANGLE_D_LPF_RC (0.0f)
+/* 位置环微分滤波：舵角反馈带编码器量化噪声，不滤会让 D 项放大噪声。
+ * 只在 PID 打开 DERIVATIVE_ON_MEAS + DERIVATIVE_FILTER 时生效，见下面的 config_mask。 */
+#define CHASSIS_RUDDER_PID_ANGLE_D_LPF_RC (0.008f)
 #define CHASSIS_RUDDER_PID_ANGLE_OUT_LPF_RC (0.0f)
 #define CHASSIS_RUDDER_PID_ANGLE_DEADBAND (0.0f)
 #define CHASSIS_RUDDER_PID_ANGLE_ERR_NORM_RANGE (0.0f) /* WRAP 下 Config 自动填 */
@@ -116,6 +127,7 @@ typedef enum : uint8_t
 typedef struct
 {
     float speed;        // 轮速 (rad/s)，app 正方向（沿当前舵角推动车体为正）
+    float torque;       // 电机轴力矩 (N·m)= iq×Kt，app 正方向（换向代价用）
     float current;      // 电流 (A)
     int8_t temperature; // 温度 (℃)
     uint8_t error;      // 错误码（LK 为 echo，DJI 为 error）
@@ -128,7 +140,7 @@ typedef struct
  *   CAL   上电校准：两舵轮扫描找光电门零点（此时不理会云台在线与否）
  *   FAULT 校准失败（连续超时）：失能 + 给定清零，终态（需复位重启再标）
  *   SAFE  已标定但不可动：云台掉线 或 云台下发 stop —— 失能 + 给定清零 + 作废指令
- *   RUN   已标定且可动：力控/解算入口（当前控制尚未接入，舵向保持当前位置、轮向 0 力矩） */
+ *   RUN   已标定且可动：力控/解算入口（正解 → 广义力 → 分配 → 换向决策 → 下发） */
 typedef enum : uint8_t
 {
     CHASSIS_STATE_CAL = 0, // 上电校准中
@@ -159,16 +171,11 @@ typedef struct
  *============================================*/
 /* 输入：云台速度指令 (vx, vy, w) 与实测速度。
  * 输出：底盘广义力 W = (fx [N], fy [N], mw [N·m])，车体系 x+前 / y+左 / w+逆时针。
- *   反馈：kp × (指令 − 实测)
+ *   反馈：三个 lib_pid 实例（参数见下方 CHASSIS_FORCE_* 宏）
  *   前馈：摩擦（沿指令速度方向）+ 惯性/惯量（指令加速度）+ 重力/坡道分量。
  *   三组前馈系数当前全部为 0，结构先留好，标定后直接填数。 */
 typedef struct
 {
-    /* 反馈增益（初值，待整定） */
-    float kp_vx; // N/(m/s)
-    float kp_vy; // N/(m/s)
-    float kp_w;  // N·m/(rad/s)
-
     /* 前馈：摩擦（Coulomb，沿指令速度方向；指令为 0 时不施加） */
     float friction_x; // N
     float friction_y; // N
@@ -190,10 +197,85 @@ extern vector3_t g_chassis_twist_fb;
 /* 力控输出广义力 (fx, fy, mw) */
 extern vector3_t g_chassis_wrench;
 /* 力分配输出：wheel_torque = 各轮**轮缘**驱动力矩 [N·m]（沿当前舵角，正=沿轮向+），
- * lateral_force = 舵轮侧向接触力 [N]。当前只计算、不下发电机；轮序 = 左/右舵。 */
+ * lateral_force = 舵轮侧向接触力 [N]。轮序 = 左/右舵；下发前还要经换向决策。 */
 extern LibChassisTorque_s g_chassis_torque;
 /* 上一拍速度指令（算惯性前馈的指令加速度） */
 extern vector3_t g_chassis_cmd_prev;
+
+/*============================================
+ *              舵向换向决策（代价函数）
+ *============================================*/
+/* 每组舵轮的驱动方向有 ±180° 两个等价解：
+ *     (φ_F, +τ_F)  或  (φ_F+180°, −τ_F)
+ * 两解产生的车体合力完全相同，只是舵向要多转多少、轮向力矩要变多少不同。
+ * 左右两组各 2 种，共 4 种组合，取总代价最小者。
+ *
+ *   cost_i = max(|Δθ| − 死区, 0) × COST_RUDDER      // 舵向要走的角度（时间）
+ *          + |τ_target − τ_now| × COST_WHEEL          // 轮向力矩要变的量（时间）
+ *   cost_all = cost_L + cost_R + c_diff               // 两舵反向转时加 c_diff
+ *
+ * 系数单位都是"秒"：把角度/力矩折成时间，量纲统一后才能相加。
+ * 数值是初值，按实车手感/机构速度再整定。 */
+#define CHASSIS_COST_RUDDER (0.35f)           // 舵向代价系数 (s/rad，舵轮侧)
+#define CHASSIS_COST_WHEEL (0.20f)            // 轮向代价系数 (s/(N·m)，轮缘力矩)
+#define CHASSIS_COST_DIFF (0.15f)             // 两舵轮转向相反时的额外代价 (s)
+#define CHASSIS_COST_SWITCH_MARGIN (0.15f)    // 切换迟滞 (s)：新方案须便宜超过此值才换（≈25° 舵角）
+#define CHASSIS_COST_TORQUE_LOCK (0.20f)      // 力矩锁定阈值 (N·m)：两轮都小于它不重新决策；单轮小于它时该轮不转舵
+#define CHASSIS_COST_ANGLE_DEADBAND (0.0175f) // 舵向角度死区 (rad，舵轮侧 ≈1°)
+
+/* 驱动轮出力比例：cos(目标舵角 − 实际舵角)
+ * 力矩沿**当前轮面**出力，舵角差 d 时真正落在目标方向上的分量只有 cos d，
+ * 故下发前乘 cos d，**不钳负**：
+ *   - 反向解自带负号，乘 cos 后的物理推力与分支无关（与旧 app 的余弦优化同式）；
+ *   - 钳 0 会在 |d|>90° 留出一段无力死区，180° 换向被切成两段。
+ * 2026-10-18 日志：原来的 0/1 硬门控在横移段 00 占 24%，最长 1.8 s 两轮都不出力，
+ * 车在无控状态下继续偏航（实测 w 到 −2.45 rad/s），故改为连续投影。 */
+
+/* 反馈环参数（lib_pid）。
+ * 平动：P + 死区 + 输出低通（积分保持 0：轮速正解的偏置主要来自侧滑，
+ *       积分会把假平移也积进去）。
+ * yaw：PI。纯 P 时指令 w 与实际 w 始终差一个由偏航阻力决定的稳态误差
+ *      （实测 w ≈ 0.186·vx + 0.053 rad/s，P 只能把它压小、压不到 0），
+ *      故加积分消除稳态漂移。Ki 与调用周期无关（i_term = Ki·e·dt）。
+ *
+ * ⚠ yaw 不能开 PID_ENABLE_DEADBAND：lib_pid 的死区分支会把 i_out 清零并
+ *   直接返回 0，积分永远攒不起来，死区变成"松手不管"。w 的噪声只有
+ *   ±0.005 rad/s，P 项贡献 ±0.01 N·m，不加死区即可。
+ * ⚠ 平动的死区同样会在死区内把前馈一起清零；当前三组前馈系数为 0，
+ *   标定摩擦/重力前馈时须重新评估（可改为只对误差扣减的死区）。 */
+#define CHASSIS_FORCE_VX_KP (50.0f)       // N/(m/s)
+#define CHASSIS_FORCE_VY_KP (50.0f)       // N/(m/s)
+#define CHASSIS_FORCE_XY_DEADBAND (0.02f) // m/s，平移速度误差死区
+#define CHASSIS_FORCE_XY_LPF_RC (0.020f)  // s，输出一阶低通
+
+#define CHASSIS_FORCE_W_KP (6.0f)             // N·m/(rad/s)
+#define CHASSIS_FORCE_W_KI (12.0f)            // N·m/(rad/s)/s（每秒累积，与调用频率无关）
+#define CHASSIS_FORCE_W_INTEGRAL_LIMIT (0.6f) // N·m，积分限幅（实测偏航阻力约 0.35 N·m）
+#define CHASSIS_FORCE_W_LPF_RC (0.030f)       // s，输出一阶低通
+
+/**
+ * @brief 换向决策结果（每拍在 RUN 态更新）
+ * @note angle_target/wheel_torque 是"如果要把分配结果执行下去"的给定量：
+ *       angle_target 为舵轮侧连续角 (rad)，下发前 ×CHASSIS_STEER_GEAR_RATIO；
+ *       wheel_torque 为沿目标舵向的**带符号轮缘力矩** (N·m)，下发电机前
+ *       ÷CHASSIS_DRIVE_REDUCTION 再乘 CHASSIS_WHEEL_x_DIR。
+ * @note reverse[i] = 1 表示该轮选了 φ+180° 的反向等价解（驱动轮反转）。
+ * @note combo 位定义：bit0 = 左舵反向，bit1 = 右舵反向（0..3）。
+ * @note RUN 态用这些量驱动舵向与轮向（舵向 100Hz 遥测见 app_cfg.h 通道表）。 */
+typedef struct
+{
+    float angle_target[LIB_CHASSIS_HALF_RUDDER_NUM]; // 目标舵角 (rad，舵轮侧)
+    float wheel_torque[LIB_CHASSIS_HALF_RUDDER_NUM]; // 带符号轮缘力矩 (N·m)
+    float angle_error[LIB_CHASSIS_HALF_RUDDER_NUM];  // 本拍选中的方案还差多少角度 (rad)
+    float cost[4];                                   // 四种组合本拍的总代价 (s)
+    float wheel_align[LIB_CHASSIS_HALF_RUDDER_NUM];  // 轮向力矩比例 cos(目标−实际)，带符号 (−1~1)
+    uint8_t reverse[LIB_CHASSIS_HALF_RUDDER_NUM];    // 1 = 选反向解
+    uint8_t combo;                                   // 当前方案（迟滞后的结果）
+    uint8_t valid;                                   // 1 = 已有历史方案（迟滞基准有效）
+    uint8_t locked;                                  // 1 = 本拍小力矩锁定（保持原方案/位置）
+} ChassisCostSel_s;
+
+extern ChassisCostSel_s g_chassis_cost_sel;
 
 /*============================================
  *              常量
