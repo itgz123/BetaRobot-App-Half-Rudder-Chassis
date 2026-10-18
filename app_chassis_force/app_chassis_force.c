@@ -582,13 +582,19 @@ void AppChassisRun(float dt, uint64_t time_stamp)
         break;
 
     case CHASSIS_STATE_RUN:
-        // 力控/解算尚未接入：舵向保持当前位置（位置环），驱动轮 0 力矩
+        /* 已校准 + 云台在线且使能（守卫保证）。
+         * 力控/解算尚未接入：两舵向位置环归零（0 = 光电门标定后的零点，按 robot_def
+         * 约定应指向车体正前方），两驱动轮同时给 app 正方向的小力矩，用于核对轮向与
+         * 舵向零点（见 CHASSIS_WHEEL_CAL_TORQUE）。轮向不对改 CHASSIS_WHEEL_x_DIR；
+         * 舵轮没指向正前方就改 RUDDER_ZERO_OFFSET_x_DEG。 */
         rudder_l_ctrl.cfg.loop_type = DRVLIB_MOTOR_LOOP_ANGLE | DRVLIB_MOTOR_LOOP_SPEED;
         rudder_r_ctrl.cfg.loop_type = DRVLIB_MOTOR_LOOP_ANGLE | DRVLIB_MOTOR_LOOP_SPEED;
         DrvlibMotorEnable(&rudder_l_ctrl);
         DrvlibMotorEnable(&rudder_r_ctrl);
-        rudder_l_ref = (float)rudder_l_ctrl.data.position;
-        rudder_r_ref = (float)rudder_r_ctrl.data.position;
+        rudder_l_ref = 0.0f; // 电机侧位置 0（标定后的零点）
+        rudder_r_ref = 0.0f;
+        g_wheel_l_setref = CHASSIS_WHEEL_CAL_TORQUE;
+        g_wheel_r_setref = CHASSIS_WHEEL_CAL_TORQUE;
         break;
 
     case CHASSIS_STATE_FAULT:

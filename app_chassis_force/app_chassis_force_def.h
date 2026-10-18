@@ -55,6 +55,14 @@
  * M3508 空载约 50rad/s，再大只会把速度环按在饱和里。 */
 #define CHASSIS_STEER_VMAX_MOTOR (50.0f)
 
+/* 校准后方向验证（云台使能时生效）：
+ * 两驱动轮同时给 app 正方向的**小力矩** (Nm)，用来核对轮向与舵向零点：
+ *   两轮同号且 DIR 正确 ⇒ 车沿舵轮正前方直行；
+ *   原地打转 ⇒ 某一轮 CHASSIS_WHEEL_x_DIR 反了；
+ *   后退/斜行 ⇒ 舵向零点偏置（RUDDER_ZERO_OFFSET_x_DEG）或舵向方向有问题。
+ * 这里给的是 app 正方向，下发时仍会乘 CHASSIS_WHEEL_x_DIR，走完整符号链。 */
+#define CHASSIS_WHEEL_CAL_TORQUE (0.5f)
+
 /* 舵向环路 PID（整定值沿用旧 app；力控阶段未接入前只有校准速度环真正生效） */
 #define CHASSIS_RUDDER_PID_SPEED_KP (0.10f)
 #define CHASSIS_RUDDER_PID_SPEED_KI (0.20f)

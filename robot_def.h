@@ -10,8 +10,9 @@
  * 标定：上电校准完成、舵轮停在光电门处后，手工把舵轮摆到正前方，读此时的位置
  *       （电机侧 rad，看 VOFA 通道 1），则
  *       偏置(°) = 位置(rad) / STEER_GEAR_RATIO * 180 / π */
-#define RUDDER_ZERO_OFFSET_L_DEG (180.0f)
-#define RUDDER_ZERO_OFFSET_R_DEG (-120.0f)
+// 当前位置下，舵轮朝向0的位置，2个轮向给正力矩，向底盘系的x正方向（前）走
+#define RUDDER_ZERO_OFFSET_L_DEG (0.0f)
+#define RUDDER_ZERO_OFFSET_R_DEG (60.0f)
 
 /*============================ 半舵底盘 运动学参数 ============================*/
 /* 坐标系：x+ 向前，y+ 向左，w+ 逆时针（俯视）。
