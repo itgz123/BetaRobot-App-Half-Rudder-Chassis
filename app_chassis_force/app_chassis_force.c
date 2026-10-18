@@ -10,6 +10,7 @@
 #include "drvs_lkmotor_broadcast.h"
 #include "drvlib_bmi088_kalman.h"
 #include "drvlib_motor.h"
+#include "lib_chassis_half_rudder.h"
 
 #include "drv_comm.h"
 #include "comm_media_can_idseq.h"
@@ -34,6 +35,9 @@ DRVS_LKMOTOR_BROADCAST_GROUP_DEF(wheel_motor_group);
 // 舵向控制核：位置/速度两级级联（drvlib_motor 只算控制量，不碰协议）
 DRVLIB_MOTOR_INSTANCE_DEF(rudder_l_ctrl);
 DRVLIB_MOTOR_INSTANCE_DEF(rudder_r_ctrl);
+
+// 半舵运动学内核：正解（轮速+舵角 → vx/vy）与后续的力分配共用
+static LibChassisInstance_s s_chassis;
 
 /*============================ 光电门 ============================*/
 /* 左舵 PA0 → GPIO_PWM_1，右舵 PA2 → GPIO_PWM_2（DM_MC02 映射，见旧 app 的实机注释）。
@@ -79,6 +83,72 @@ static uint8_t GimbalCommIsOnline(void)
 {
     const CommMedia *media = (const CommMedia *)gimbal_comm.media; // 首成员即 CommMedia 基类
     return (uint8_t)((media != NULL && media->daemon != NULL) ? DaemonIsOnline(media->daemon) : 1);
+}
+
+/*============================ 力控：速度误差 → 广义力 ============================*/
+/**
+ * @brief 由速度指令与实测速度算出底盘广义力 (fx, fy, mw)
+ * @param cmd      云台速度指令（车体系 vx 前 / vy 左 / w 逆时针）
+ * @param twist_fb 实测速度：vx/vy 来自轮速正解，w 来自 IMU 底盘系 z 轴角速度
+ * @param dt_s     本拍步长 (s)
+ * @return W = (fx [N], fy [N], mw [N·m])
+ * @note 反馈只取 P（前馈已单独补偿摩擦，积分留到需要时再加）。
+ * @note 前馈三项（摩擦/惯性/重力）系数当前全 0：代码路径已接通，填数即生效。
+ *       - 摩擦：沿**指令**速度符号施加（指令过零不施加，避免静止抖动）；
+ *       - 惯性：指令加速度 = 本拍指令 − 上一拍指令 的差分，乘 mass / inertia_z；
+ *       - 重力：车体系固定分量，平面行驶为 0，坡道标定后填。
+ * @note 指令加速度用纯差分，未做低通；系数为 0 时无影响，正式标定时再看是否需要滤波。
+ */
+static vector3_t ChassisForceSolve(const gimbal2chassis_data_t *cmd, const vector3_t *twist_fb, float dt_s)
+{
+    const ChassisForceCfg_s *c = &g_chassis_force_cfg;
+
+    /* 指令加速度（惯性前馈）：dt 非正时置 0，避免除零/首拍尖峰 */
+    float a_vx = 0.0f;
+    float a_vy = 0.0f;
+    float a_w = 0.0f;
+    if (dt_s > 0.0f)
+    {
+        a_vx = (cmd->vx - g_chassis_cmd_prev.x) / dt_s;
+        a_vy = (cmd->vy - g_chassis_cmd_prev.y) / dt_s;
+        a_w = (cmd->w - g_chassis_cmd_prev.z) / dt_s;
+    }
+
+    /* 前馈：摩擦（沿指令方向）+ 惯性 + 重力/坡道 */
+    float ff_x = c->mass * a_vx + c->gravity_x;
+    float ff_y = c->mass * a_vy + c->gravity_y;
+    float ff_w = c->inertia_z * a_w;
+    if (cmd->vx > 0.0f)
+    {
+        ff_x += c->friction_x;
+    }
+    else if (cmd->vx < 0.0f)
+    {
+        ff_x -= c->friction_x;
+    }
+    if (cmd->vy > 0.0f)
+    {
+        ff_y += c->friction_y;
+    }
+    else if (cmd->vy < 0.0f)
+    {
+        ff_y -= c->friction_y;
+    }
+    if (cmd->w > 0.0f)
+    {
+        ff_w += c->friction_w;
+    }
+    else if (cmd->w < 0.0f)
+    {
+        ff_w -= c->friction_w;
+    }
+
+    /* 反馈：P × (指令 − 实测) */
+    vector3_t wrench;
+    wrench.x = c->kp_vx * (cmd->vx - twist_fb->x) + ff_x;
+    wrench.y = c->kp_vy * (cmd->vy - twist_fb->y) + ff_y;
+    wrench.z = c->kp_w * (cmd->w - twist_fb->z) + ff_w;
+    return wrench;
 }
 
 /*============================ 舵向零点标定 ============================*/
@@ -266,6 +336,18 @@ static void ChassisFsmUpdate(void)
 
 void AppChassisInit(void)
 {
+    /* ---- 半舵运动学内核：几何尺寸全部来自 robot_def.h ----
+     * 内侧按"每组 1 个舵轮 2 行约束"组装，2 组共 4 行 3 未知量；
+     * 正解即最小二乘里程计，后续力分配共用同一份几何。 */
+    LibChassisHalfRudderGeom_s chassis_geom = {
+        .l_pos_x = CHASSIS_RUDDER_L_POS_X,
+        .l_pos_y = CHASSIS_RUDDER_L_POS_Y,
+        .r_pos_x = CHASSIS_RUDDER_R_POS_X,
+        .r_pos_y = CHASSIS_RUDDER_R_POS_Y,
+        .radius = CHASSIS_WHEEL_RADIUS,
+    };
+    BSP_ASSERT_APP_CALL(LibChassisHalfRudderInit(&s_chassis, &chassis_geom));
+
     /* ---- 舵向：DJI 广播 ---- */
     BSP_ASSERT_APP_CALL(DrvsDJIMotorBroadcastRegister(&rudder_l_motor));
     BSP_ASSERT_APP_CALL(DrvsDJIMotorBroadcastRegister(&rudder_r_motor));
@@ -583,18 +665,14 @@ void AppChassisRun(float dt, uint64_t time_stamp)
 
     case CHASSIS_STATE_RUN:
         /* 已校准 + 云台在线且使能（守卫保证）。
-         * 力控/解算尚未接入：两舵向位置环归零（0 = 光电门标定后的零点，按 robot_def
-         * 约定应指向车体正前方），两驱动轮同时给 app 正方向的小力矩，用于核对轮向与
-         * 舵向零点（见 CHASSIS_WHEEL_CAL_TORQUE）。轮向不对改 CHASSIS_WHEEL_x_DIR；
-         * 舵轮没指向正前方就改 RUDDER_ZERO_OFFSET_x_DEG。 */
+         * 舵向暂时保持在标定零点（0 = 正前方）；驱动轮力矩等力分配接入后再下发，
+         * 当前先只做力矩计算（g_chassis_wrench），输出仍为 0。 */
         rudder_l_ctrl.cfg.loop_type = DRVLIB_MOTOR_LOOP_ANGLE | DRVLIB_MOTOR_LOOP_SPEED;
         rudder_r_ctrl.cfg.loop_type = DRVLIB_MOTOR_LOOP_ANGLE | DRVLIB_MOTOR_LOOP_SPEED;
         DrvlibMotorEnable(&rudder_l_ctrl);
         DrvlibMotorEnable(&rudder_r_ctrl);
         rudder_l_ref = 0.0f; // 电机侧位置 0（标定后的零点）
         rudder_r_ref = 0.0f;
-        g_wheel_l_setref = CHASSIS_WHEEL_CAL_TORQUE;
-        g_wheel_r_setref = CHASSIS_WHEEL_CAL_TORQUE;
         break;
 
     case CHASSIS_STATE_FAULT:
@@ -630,6 +708,53 @@ void AppChassisRun(float dt, uint64_t time_stamp)
 
     // 采样四个条件 + 变化才派发；状态变化从下一拍生效
     ChassisFsmUpdate();
+
+    /*============================ 正解 + 力控 ============================*/
+    /* 轮速正解：舵角取本拍 SetRef 刚刷新的 data.position（电机侧 rad），换算到舵轮侧；
+     * 轮速用 app 正方向（= 沿当前舵角推动车体），与内核驱动行的符号约定一致。 */
+    LibChassisState_s chassis_state = {0};
+    chassis_state.steer_angle[LIB_CHASSIS_HALF_RUDDER_L] = (float)rudder_l_ctrl.data.position * CHASSIS_STEER_GEAR_RATIO_INV;
+    chassis_state.steer_angle[LIB_CHASSIS_HALF_RUDDER_R] = (float)rudder_r_ctrl.data.position * CHASSIS_STEER_GEAR_RATIO_INV;
+    chassis_state.wheel_speed[LIB_CHASSIS_HALF_RUDDER_L] = g_wheel_fb[APP_WHEEL_L].speed / CHASSIS_DRIVE_REDUCTION;
+    chassis_state.wheel_speed[LIB_CHASSIS_HALF_RUDDER_R] = g_wheel_fb[APP_WHEEL_R].speed / CHASSIS_DRIVE_REDUCTION;
+
+    vector3_t twist;
+    if (LibChassisForward(&s_chassis, &chassis_state, &twist) == 0)
+    {
+        g_chassis_twist_fb = twist;
+    }
+    else
+    {
+        /* 几何退化（JᵀJ 奇异）：不喂假反馈 */
+        g_chassis_twist_fb = (vector3_t){0.0f, 0.0f, 0.0f};
+    }
+    /* w 反馈用 IMU 底盘系 z 轴角速度（与轮速正解解耦；IMU 不可用时置 0） */
+    g_chassis_twist_fb.z = (g_imu_chassis.valid != 0u) ? g_imu_chassis.gyro.z : 0.0f;
+
+    /* 速度指令 → 广义力 → 各轮力矩。
+     * 只在 RUN（已校准且云台使能）计算，其余状态输出清零。
+     * 力分配用同一份几何与**当前舵角**：W → (JᵀJ)⁻¹·W → 行力 → 驱动行 × 轮半径。
+     * 输出 wheel_torque 是轮缘力矩 [N·m]（沿当前舵角），当前只算不下发。 */
+    if (state == CHASSIS_STATE_RUN)
+    {
+        g_chassis_wrench = ChassisForceSolve(&g_gimbal2chassis_data, &g_chassis_twist_fb, dt_s);
+        if (LibChassisAllocateTorque(&s_chassis, &chassis_state, g_chassis_wrench, &g_chassis_torque) != 0)
+        {
+            /* 几何退化（JᵀJ 奇异）：输出清零，不保留上一拍结果 */
+            g_chassis_torque = (LibChassisTorque_s){0};
+        }
+    }
+    else
+    {
+        g_chassis_wrench = (vector3_t){0.0f, 0.0f, 0.0f};
+        g_chassis_torque = (LibChassisTorque_s){0};
+    }
+    g_chassis_cmd_prev = (vector3_t){g_gimbal2chassis_data.vx, g_gimbal2chassis_data.vy, g_gimbal2chassis_data.w};
+
+    /* 实测速度回传云台（线协议方向与车体系一致：vx 前 / vy 左 / w 逆时针） */
+    g_chassis2gimbal_data.vx = g_chassis_twist_fb.x;
+    g_chassis2gimbal_data.vy = g_chassis_twist_fb.y;
+    g_chassis2gimbal_data.w = g_chassis_twist_fb.z;
 
     /*============================ 下发 ============================*/
     // 舵向：drvs 纯协议。两个 SetRef 必须都在 GroupSend 之前完成（一帧组两台）。

@@ -20,6 +20,7 @@
 #include "robot_def.h" // IMU 安装方向与位置宏
 #include "lib_math.h"
 #include "lib_fsm_table.h"
+#include "lib_chassis.h" // LibChassisTorque_s（力分配输出）
 #include "drvlib_bmi088_kalman.h" // BMI088_Calib_s
 #include "drv_comm.h"             // CommInstance
 
@@ -152,6 +153,47 @@ typedef struct
     uint32_t cal_ticks;  // 本轮校准已持续拍数（单次超时判据）
     uint8_t key_last;    // 上次派发时的条件打包（变化才派发）
 } ChassisFsmCtx_s;
+
+/*============================================
+ *              力控：速度误差 → 广义力
+ *============================================*/
+/* 输入：云台速度指令 (vx, vy, w) 与实测速度。
+ * 输出：底盘广义力 W = (fx [N], fy [N], mw [N·m])，车体系 x+前 / y+左 / w+逆时针。
+ *   反馈：kp × (指令 − 实测)
+ *   前馈：摩擦（沿指令速度方向）+ 惯性/惯量（指令加速度）+ 重力/坡道分量。
+ *   三组前馈系数当前全部为 0，结构先留好，标定后直接填数。 */
+typedef struct
+{
+    /* 反馈增益（初值，待整定） */
+    float kp_vx; // N/(m/s)
+    float kp_vy; // N/(m/s)
+    float kp_w;  // N·m/(rad/s)
+
+    /* 前馈：摩擦（Coulomb，沿指令速度方向；指令为 0 时不施加） */
+    float friction_x; // N
+    float friction_y; // N
+    float friction_w; // N·m
+
+    /* 前馈：惯性 / 转动惯量（用指令差分加速度） */
+    float mass;      // kg
+    float inertia_z; // kg·m²
+
+    /* 前馈：重力/坡道在车体系的等效力（平面默认 0） */
+    float gravity_x; // N
+    float gravity_y; // N
+} ChassisForceCfg_s;
+
+extern ChassisForceCfg_s g_chassis_force_cfg;
+
+/* 实测底盘速度：vx/vy 来自轮速正解，w 由 IMU 底盘系 z 轴角速度覆盖 */
+extern vector3_t g_chassis_twist_fb;
+/* 力控输出广义力 (fx, fy, mw) */
+extern vector3_t g_chassis_wrench;
+/* 力分配输出：wheel_torque = 各轮**轮缘**驱动力矩 [N·m]（沿当前舵角，正=沿轮向+），
+ * lateral_force = 舵轮侧向接触力 [N]。当前只计算、不下发电机；轮序 = 左/右舵。 */
+extern LibChassisTorque_s g_chassis_torque;
+/* 上一拍速度指令（算惯性前馈的指令加速度） */
+extern vector3_t g_chassis_cmd_prev;
 
 /*============================================
  *              常量
