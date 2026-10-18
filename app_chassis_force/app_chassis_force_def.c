@@ -42,3 +42,20 @@ AppChassisImu_s g_imu_chassis; // 底盘系观测，供力控使用
 vector3_t g_gyro_prev;     // 上一有效陀螺样本（底盘系）
 vector3_t g_alpha_lpf;     // 低通后的角加速度（底盘系）
 uint8_t g_gyro_prev_valid; // 0 = 还没有上一样本（首拍/掉线后）
+
+/* 驱动轮反馈（每拍更新，失能也更新） */
+AppWheelFeedback_s g_wheel_fb[APP_WHEEL_NUM];
+
+/*============================ 校准 / 状态机 ============================*/
+ChassisFsmCtx_s g_chassis_fsm_ctx;
+LibFsmTableInstance_s g_chassis_fsm;
+
+uint8_t g_rudder_l_gate_state; // 上一拍光电门电平
+uint8_t g_rudder_r_gate_state;
+uint8_t g_rudder_l_inited; // 1 = 左舵已标定
+uint8_t g_rudder_r_inited;
+
+float g_rudder_l_setref;
+float g_rudder_r_setref;
+float g_wheel_l_setref;
+float g_wheel_r_setref;
