@@ -216,6 +216,12 @@ extern vector3_t g_chassis_cmd_prev;
  *
  * 系数单位都是"秒"：把角度/力矩折成时间，量纲统一后才能相加。
  * 数值是初值，按实车手感/机构速度再整定。 */
+/* 舵向换向决策方式（2026-10-18 实验开关）：
+ *   1 = 逐轮各自在 (φ_F, +τ) / (φ_F+180°, −τ) 两个等价解里选**转角更小**的；
+ *       不做 4 组合代价、c_diff、组合迟滞 —— 用于排除代价函数对摆舵振荡的干扰。
+ *   0 = 4 组合代价函数（下面的 CHASSIS_COST_* 参数生效，原逻辑完整保留）。 */
+#define CHASSIS_STEER_SELECT_SHORTEST (1)
+
 #define CHASSIS_COST_RUDDER (0.35f)           // 舵向代价系数 (s/rad，舵轮侧)
 #define CHASSIS_COST_WHEEL (0.20f)            // 轮向代价系数 (s/(N·m)，轮缘力矩)
 #define CHASSIS_COST_DIFF (0.15f)             // 两舵轮转向相反时的额外代价 (s)
@@ -251,7 +257,12 @@ extern vector3_t g_chassis_cmd_prev;
 #define CHASSIS_FORCE_W_KP (6.0f)             // N·m/(rad/s)
 #define CHASSIS_FORCE_W_KI (12.0f)            // N·m/(rad/s)/s（每秒累积，与调用频率无关）
 #define CHASSIS_FORCE_W_INTEGRAL_LIMIT (0.6f) // N·m，积分限幅（实测偏航阻力约 0.35 N·m）
-#define CHASSIS_FORCE_W_LPF_RC (0.030f)       // s，输出一阶低通
+/* mw 输出低通：30 → 70 ms。
+ * 纯 vy 日志实测 yaw 环在 ~4 Hz 自持（舵 ±90° 时 ∂φ/∂Mw ≈ 20~35°/N·m），
+ * 30 ms 对 4 Hz 只衰减到 0.80，几乎没作用；70 ms 衰减到 ~0.50。
+ * 注意一阶低通在 4 Hz 会再引入 ~60° 相位滞后，可能把极限环频率压低而非消除，
+ * 本值先作为对照实验，日志确认后再决定是否换成更高阶或直接限幅。 */
+#define CHASSIS_FORCE_W_LPF_RC (0.070f) // s，输出一阶低通
 
 /**
  * @brief 换向决策结果（每拍在 RUN 态更新）

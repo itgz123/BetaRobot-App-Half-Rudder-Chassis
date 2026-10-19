@@ -239,10 +239,79 @@ static void ChassisAllocToSteer(uint8_t wheel, const LibChassisState_s *st, cons
     *tau = sqrtf(f_drive * f_drive + f_lat * f_lat) * CHASSIS_WHEEL_RADIUS;
 }
 
+#if CHASSIS_STEER_SELECT_SHORTEST
+/**
+ * @brief 逐轮最短路径：在 (φ_F, +τ_F) 与 (φ_F+180°, −τ_F) 两个等价解里
+ *        各自选**转角更小**的那个
+ * @note 逐轮独立决策，不枚举 4 组合、不算力代价、不加 c_diff、无组合迟滞。
+ *       两解转角相差不超过 CHASSIS_COST_ANGLE_DEADBAND 时视为平手，保持该轮
+ *       上一拍分支，避免目标在 90° 边界逐拍翻转。
+ * @note 小力矩规则与代价函数路径保持一致：两轮都小走上面的整体锁定；单轮小
+ *       不转舵，直接沿当前轮向输出 alloc 的带符号驱动力矩。
+ * @note 本路径不产生组合代价，遥测 ch10~13 恒为 0；ch9 仍按 reverse 位组合。
+ */
+static void ChassisShortestSelect(const LibChassisState_s *st, const LibChassisTorque_s *alloc, const float *phi_f, const float *tau_f)
+{
+    ChassisCostSel_s *sel = &g_chassis_cost_sel;
+
+    sel->locked = 0u;
+    for (uint8_t i = 0; i < LIB_CHASSIS_HALF_RUDDER_NUM; i++)
+    {
+        if (tau_f[i] < CHASSIS_COST_TORQUE_LOCK)
+        {
+            /* 单轮小力矩：不转舵，沿当前轮向出力；reverse 保持上一拍（仅遥测用） */
+            sel->angle_target[i] = st->steer_angle[i];
+            sel->angle_error[i] = 0.0f;
+            sel->wheel_torque[i] = alloc->wheel_torque[i];
+            sel->wheel_align[i] = 1.0f;
+            continue;
+        }
+
+        const float dphi_fwd = Lib_Math_WrapAngleNegPIToPI(phi_f[i] - st->steer_angle[i]);
+        const float dphi_rev = Lib_Math_WrapAngleNegPIToPI(phi_f[i] + M_PI - st->steer_angle[i]);
+        const float abs_fwd = fabsf(dphi_fwd);
+        const float abs_rev = fabsf(dphi_rev);
+
+        uint8_t rev;
+        if (abs_rev < (abs_fwd - CHASSIS_COST_ANGLE_DEADBAND))
+        {
+            rev = 1u;
+        }
+        else if (abs_fwd < (abs_rev - CHASSIS_COST_ANGLE_DEADBAND))
+        {
+            rev = 0u;
+        }
+        else
+        {
+            /* 平手：保持上一拍分支；首次决策（valid=0）取正向 */
+            rev = (sel->valid != 0u) ? sel->reverse[i] : 0u;
+        }
+
+        const float phi_t = phi_f[i] + ((rev != 0u) ? M_PI : 0.0f);
+        const float dphi = Lib_Math_WrapAngleNegPIToPI(phi_t - st->steer_angle[i]);
+
+        sel->angle_target[i] = (fabsf(dphi) <= CHASSIS_COST_ANGLE_DEADBAND) ? st->steer_angle[i] : (st->steer_angle[i] + dphi);
+        sel->angle_error[i] = fabsf(dphi);
+        sel->wheel_torque[i] = (rev != 0u) ? -tau_f[i] : tau_f[i];
+        sel->wheel_align[i] = Lib_Math_Cos(dphi);
+        sel->reverse[i] = rev;
+    }
+
+    sel->combo = (uint8_t)((sel->reverse[LIB_CHASSIS_HALF_RUDDER_L] & 0x1u) | ((sel->reverse[LIB_CHASSIS_HALF_RUDDER_R] & 0x1u) << 1));
+    for (uint8_t k = 0u; k < 4u; k++)
+    {
+        sel->cost[k] = 0.0f; // 本路径不算代价，遥测通道置 0
+    }
+    sel->valid = 1u;
+}
+#endif
+
 /**
  * @brief 4 种换向组合的代价评估 + 迟滞/小力矩锁定/角度死区
  * @param st    本拍底盘状态（舵角反馈）
  * @param alloc 本拍力分配结果
+ * @note 决策方式由 CHASSIS_STEER_SELECT_SHORTEST 编译期切换：=1 走逐轮最短路径
+ *       （ChassisShortestSelect，不做组合代价）；=0 才走下面描述的代价函数。
  * @note 组合枚举（combo 位）：bit0 = 左舵反向(φ+180°, −τ)，bit1 = 右舵反向。
  *       每轮代价 = 角度误差×COST_RUDDER + 力矩误差×COST_WHEEL；
  *       两舵**转动方向**相反（一逆一顺）时再加 CHASSIS_COST_DIFF。
@@ -290,6 +359,9 @@ static void ChassisCostSelect(const LibChassisState_s *st, const LibChassisTorqu
     }
     sel->locked = 0u;
 
+#if CHASSIS_STEER_SELECT_SHORTEST
+    ChassisShortestSelect(st, alloc, phi_f, tau_f);
+#else
     /* 3. 每轮两种等价解的代价 + 舵轮转动方向（+1 逆时针 / −1 顺时针 / 0 死区内） */
     float cost[LIB_CHASSIS_HALF_RUDDER_NUM][2];
     int8_t rot[LIB_CHASSIS_HALF_RUDDER_NUM][2];
@@ -399,6 +471,7 @@ static void ChassisCostSelect(const LibChassisState_s *st, const LibChassisTorqu
         sel->wheel_align[i] = Lib_Math_Cos(dphi);
         sel->reverse[i] = rev;
     }
+#endif
 }
 
 /*============================ 舵向零点标定 ============================*/
@@ -1027,8 +1100,8 @@ void AppChassisRun(float dt, uint64_t time_stamp)
         }
         else
         {
-            /* 两种等价解 × 左右 = 4 种组合，按代价选；结果见 g_chassis_cost_sel，
-             * 下一拍由状态给定的 RUN 分支下发（见函数开头）。 */
+            /* 换向决策（模式见 CHASSIS_STEER_SELECT_SHORTEST）：逐轮最短路径
+             * 或 4 组合代价；结果见 g_chassis_cost_sel，下一拍由 RUN 分支下发。 */
             ChassisCostSelect(&chassis_state, &g_chassis_torque);
         }
     }
