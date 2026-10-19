@@ -12,6 +12,7 @@
 #include "drvlib_motor.h"
 #include "lib_chassis_half_rudder.h"
 #include "lib_pid.h"
+#include "appdrvlib_chassis.h"
 
 #include "drv_comm.h"
 #include "comm_media_can_idseq.h"
@@ -44,6 +45,12 @@ DRVLIB_MOTOR_INSTANCE_DEF(rudder_r_ctrl);
 
 // 半舵运动学内核：正解（轮速+舵角 → vx/vy）与后续的力分配共用
 static LibChassisInstance_s s_chassis;
+
+#if CHASSIS_LAYERED_ALLOC_ENABLE
+/* 分层分配器：状态含 mz 慢分量/toe trim/共用分支；几何在 Init 里填 */
+static AppDrvlibChassisState_s s_layered_alloc;
+static AppDrvlibChassisCfg_s s_layered_cfg;
+#endif
 
 /*============================ 光电门 ============================*/
 /* 左舵 PA0 → GPIO_PWM_1，右舵 PA2 → GPIO_PWM_2（DM_MC02 映射，见旧 app 的实机注释）。
@@ -230,6 +237,9 @@ static vector3_t ChassisForceSolve(const gimbal2chassis_data_t *cmd, const vecto
  *       （f_drive = alloc->wheel_torque / R）。
  * @note φ_F 与 φ_F+180° 配 ±τ_F 是同一组力的两个等价解，选哪个由代价函数定。
  */
+#if !CHASSIS_LAYERED_ALLOC_ENABLE
+/* 旧路径专用：lib_chassis 分配结果 → 换向决策。分层路径不调用这些函数，
+ * 条件编译避免 -Wunused-function；CHASSIS_LAYERED_ALLOC_ENABLE=0 时完整保留。 */
 static void ChassisAllocToSteer(uint8_t wheel, const LibChassisState_s *st, const LibChassisTorque_s *alloc, float *phi, float *tau)
 {
     const float f_drive = alloc->wheel_torque[wheel] / CHASSIS_WHEEL_RADIUS;
@@ -473,6 +483,7 @@ static void ChassisCostSelect(const LibChassisState_s *st, const LibChassisTorqu
     }
 #endif
 }
+#endif // !CHASSIS_LAYERED_ALLOC_ENABLE
 
 /*============================ 舵向零点标定 ============================*/
 /**
@@ -670,6 +681,12 @@ void AppChassisInit(void)
         .radius = CHASSIS_WHEEL_RADIUS,
     };
     BSP_ASSERT_APP_CALL(LibChassisHalfRudderInit(&s_chassis, &chassis_geom));
+
+#if CHASSIS_LAYERED_ALLOC_ENABLE
+    s_layered_cfg.pos_y = CHASSIS_RUDDER_L_POS_Y;
+    s_layered_cfg.wheel_radius = CHASSIS_WHEEL_RADIUS;
+    AppDrvlibChassisReset(&s_layered_alloc);
+#endif
 
     /* ---- 舵向：DJI 广播 ---- */
     BSP_ASSERT_APP_CALL(DrvsDJIMotorBroadcastRegister(&rudder_l_motor));
@@ -1009,7 +1026,8 @@ void AppChassisRun(float dt, uint64_t time_stamp)
 
         if (g_chassis_cost_sel.valid != 0u)
         {
-            /* 舵向：决策给的是舵轮侧 rad，控制核要电机侧 rad */
+            /* 舵向：决策给的是舵轮侧 rad，控制核要电机侧 rad。
+             * 角速度上限由位置环输出限幅（CHASSIS_RUDDER_PID_ANGLE_OUT_MAX）保证。 */
             rudder_l_ref = g_chassis_cost_sel.angle_target[LIB_CHASSIS_HALF_RUDDER_L] * CHASSIS_STEER_GEAR_RATIO;
             rudder_r_ref = g_chassis_cost_sel.angle_target[LIB_CHASSIS_HALF_RUDDER_R] * CHASSIS_STEER_GEAR_RATIO;
 
@@ -1084,14 +1102,46 @@ void AppChassisRun(float dt, uint64_t time_stamp)
     /* w 反馈用 IMU 底盘系 z 轴角速度（与轮速正解解耦；IMU 不可用时置 0） */
     g_chassis_twist_fb.z = (g_imu_chassis.valid != 0u) ? g_imu_chassis.gyro.z : 0.0f;
 
-    /* 速度指令 → 广义力 → 各轮力矩。
+    /* 速度指令 → 广义力 → 舵角/轮向给定。
      * 只在 RUN（已校准且云台使能）计算，其余状态输出清零。
-     * 力分配用同一份几何与**当前舵角**：W → (JᵀJ)⁻¹·W → 行力 → 驱动行 × 轮半径。
-     * 输出 wheel_torque 是轮缘力矩 [N·m]（沿**当前**舵角）；随后交给换向决策
-     * 变成"目标舵角 + 带符号轮缘力矩"，由主循环下发。 */
+     *   CHASSIS_LAYERED_ALLOC_ENABLE=1：appdrvlib_chassis 分层分配（不再调用
+     *     LibChassisAllocateTorque）：快层按平移力方向分配驱动、差模承担快速 yaw，
+     *     慢层用限幅限速的 toe trim 承担低通后的 yaw，两轮共用一个 ±180° 分支。
+     *   =0：lib_chassis 4 行最小范数 + 换向决策（旧路径完整保留）。
+     * 两条路径都写进 g_chassis_cost_sel，下一拍由 RUN 分支统一下发。 */
     if (state == CHASSIS_STATE_RUN)
     {
         g_chassis_wrench = ChassisForceSolve(&g_gimbal2chassis_data, &g_chassis_twist_fb, dt_s);
+#if CHASSIS_LAYERED_ALLOC_ENABLE
+        AppDrvlibChassisOut_s alloc_out;
+        if (AppDrvlibChassisAllocate(&s_layered_alloc, &s_layered_cfg, chassis_state.steer_angle,
+                                     g_chassis_wrench.x, g_chassis_wrench.y, g_chassis_wrench.z,
+                                     dt_s, &alloc_out) != 0)
+        {
+            /* 参数/几何非法：输出清零，不保留上一拍结果 */
+            g_chassis_torque = (LibChassisTorque_s){0};
+            g_chassis_cost_sel = (ChassisCostSel_s){0};
+        }
+        else
+        {
+            ChassisCostSel_s *sel = &g_chassis_cost_sel;
+            for (uint8_t i = 0u; i < LIB_CHASSIS_HALF_RUDDER_NUM; i++)
+            {
+                sel->angle_target[i] = alloc_out.angle_target[i];
+                sel->wheel_torque[i] = alloc_out.wheel_torque[i];
+                sel->wheel_align[i] = alloc_out.wheel_align[i];
+                sel->angle_error[i] = fabsf(Lib_Math_WrapAngleNegPIToPI(alloc_out.angle_target[i] - chassis_state.steer_angle[i]));
+                sel->reverse[i] = alloc_out.reverse;
+            }
+            for (uint8_t k = 0u; k < 4u; k++)
+            {
+                sel->cost[k] = 0.0f; // 分层路径不算换向代价，遥测占位
+            }
+            sel->combo = (uint8_t)((alloc_out.reverse & 1u) | ((alloc_out.reverse & 1u) << 1));
+            sel->locked = 0u;
+            sel->valid = alloc_out.valid;
+        }
+#else
         if (LibChassisAllocateTorque(&s_chassis, &chassis_state, g_chassis_wrench, &g_chassis_torque) != 0)
         {
             /* 几何退化（JᵀJ 奇异）：输出清零，不保留上一拍结果；换向决策一并作废 */
@@ -1104,6 +1154,7 @@ void AppChassisRun(float dt, uint64_t time_stamp)
              * 或 4 组合代价；结果见 g_chassis_cost_sel，下一拍由 RUN 分支下发。 */
             ChassisCostSelect(&chassis_state, &g_chassis_torque);
         }
+#endif
     }
     else
     {
@@ -1111,6 +1162,9 @@ void AppChassisRun(float dt, uint64_t time_stamp)
         g_chassis_torque = (LibChassisTorque_s){0};
         /* 离开运行态即作废换向历史：下次使能重新决策（不沿用急停前的方案） */
         g_chassis_cost_sel = (ChassisCostSel_s){0};
+#if CHASSIS_LAYERED_ALLOC_ENABLE
+        AppDrvlibChassisReset(&s_layered_alloc);
+#endif
         ChassisForceReset(); // 三个速度环 PID 的积分/滤波状态都从 0 重新起
     }
     g_chassis_cmd_prev = (vector3_t){g_gimbal2chassis_data.vx, g_gimbal2chassis_data.vy, g_gimbal2chassis_data.w};

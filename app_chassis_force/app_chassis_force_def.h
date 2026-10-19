@@ -60,9 +60,16 @@
 #define CHASSIS_CAL_TIMEOUT_TICKS (5000u)
 #define CHASSIS_CAL_MAX_RETRIES (3u)
 
-/* 舵向位置环输出限幅 = 速度给定上限（电机侧 rad/s）。
- * M3508 空载约 50rad/s，再大只会把速度环按在饱和里。 */
+/* 舵向速度上限（电机侧 rad/s）：M3508 空载约 50rad/s。 */
 #define CHASSIS_STEER_VMAX_MOTOR (50.0f)
+
+/* 舵向目标角速度限幅（2026-10-19 第一步实验）：
+ * 位置环的输出就是速度环给定，所以**直接限位置环输出**等价于限制舵角变化率，
+ * 不需要在下发路径上再做目标角斜率限制。
+ *   200°/s（舵轮侧）= 3.4906585 rad/s × 8 = 27.925268 rad/s（电机侧）
+ * 原值 50 rad/s（≈358°/s 舵轮侧）在力分配目标逐拍跳变时会让速度环长期饱和，
+ * 与 yaw 环形成 ~4 Hz 极限环。 */
+#define CHASSIS_STEER_CMD_MAX_MOTOR (27.925268f) // rad/s，电机侧（舵轮侧 200°/s）
 
 /* 校准后方向验证（云台使能时生效）：
  * 两驱动轮同时给 app 正方向的**小力矩** (Nm)，用来核对轮向与舵向零点：
@@ -99,8 +106,8 @@
 #define CHASSIS_RUDDER_PID_ANGLE_OUT_LPF_RC (0.0f)
 #define CHASSIS_RUDDER_PID_ANGLE_DEADBAND (0.0f)
 #define CHASSIS_RUDDER_PID_ANGLE_ERR_NORM_RANGE (0.0f) /* WRAP 下 Config 自动填 */
-#define CHASSIS_RUDDER_PID_ANGLE_OUT_MAX (CHASSIS_STEER_VMAX_MOTOR)
-#define CHASSIS_RUDDER_PID_ANGLE_OUT_MIN (-CHASSIS_STEER_VMAX_MOTOR)
+#define CHASSIS_RUDDER_PID_ANGLE_OUT_MAX (CHASSIS_STEER_CMD_MAX_MOTOR)
+#define CHASSIS_RUDDER_PID_ANGLE_OUT_MIN (-CHASSIS_STEER_CMD_MAX_MOTOR)
 
 /*============================================
  *              类型
@@ -222,6 +229,14 @@ extern vector3_t g_chassis_cmd_prev;
  *   0 = 4 组合代价函数（下面的 CHASSIS_COST_* 参数生效，原逻辑完整保留）。 */
 #define CHASSIS_STEER_SELECT_SHORTEST (1)
 
+/* 力分配方式（2026-10-19 第二步实验）：
+ *   1 = appdrvlib_chassis 分层分配：快层按平移力方向分配驱动、差模承担快速 yaw；
+ *       慢层用限幅限速的 toe trim 承担低通后的 yaw；两轮共用一个 ±180° 分支。
+ *   0 = lib_chassis 4 行最小范数 + 上面的换向决策（旧路径完整保留）。
+ * 旧路径把 mz 分给侧向力再代数换算成舵角，目标角逐拍跳变；新路径不再调用
+ * LibChassisAllocateTorque。 */
+#define CHASSIS_LAYERED_ALLOC_ENABLE (1)
+
 #define CHASSIS_COST_RUDDER (0.35f)           // 舵向代价系数 (s/rad，舵轮侧)
 #define CHASSIS_COST_WHEEL (0.20f)            // 轮向代价系数 (s/(N·m)，轮缘力矩)
 #define CHASSIS_COST_DIFF (0.15f)             // 两舵轮转向相反时的额外代价 (s)
@@ -254,15 +269,15 @@ extern vector3_t g_chassis_cmd_prev;
 #define CHASSIS_FORCE_XY_DEADBAND (0.02f) // m/s，平移速度误差死区
 #define CHASSIS_FORCE_XY_LPF_RC (0.020f)  // s，输出一阶低通
 
-#define CHASSIS_FORCE_W_KP (6.0f)             // N·m/(rad/s)
-#define CHASSIS_FORCE_W_KI (12.0f)            // N·m/(rad/s)/s（每秒累积，与调用频率无关）
+#define CHASSIS_FORCE_W_KP (3.0f)             // N·m/(rad/s)
+#define CHASSIS_FORCE_W_KI (6.0f)             // N·m/(rad/s)/s（每秒累积，与调用频率无关）
 #define CHASSIS_FORCE_W_INTEGRAL_LIMIT (0.6f) // N·m，积分限幅（实测偏航阻力约 0.35 N·m）
-/* mw 输出低通：30 → 70 ms。
- * 纯 vy 日志实测 yaw 环在 ~4 Hz 自持（舵 ±90° 时 ∂φ/∂Mw ≈ 20~35°/N·m），
- * 30 ms 对 4 Hz 只衰减到 0.80，几乎没作用；70 ms 衰减到 ~0.50。
- * 注意一阶低通在 4 Hz 会再引入 ~60° 相位滞后，可能把极限环频率压低而非消除，
- * 本值先作为对照实验，日志确认后再决定是否换成更高阶或直接限幅。 */
-#define CHASSIS_FORCE_W_LPF_RC (0.070f) // s，输出一阶低通
+/* mw 输出低通：30 → 70 → 20 ms。
+ * 纯 vy 日志实测 yaw 环在 ~4 Hz 自持（舵 ±90° 时 ∂φ/∂Mw ≈ 20~35°/N·m）。
+ * 70 ms 在 4 Hz 衰减到 ~0.50，但同时引入 ~60° 相位滞后，极限环没有消失；
+ * 2026-10-19 第一步实验改为 20 ms + 降增益 + 舵向目标 200°/s 限速，三者一起验证
+ * "振荡是线性环路的增益/相位问题"还是"分配器把侧向力当瞬时执行器"的结构问题。 */
+#define CHASSIS_FORCE_W_LPF_RC (0.020f) // s，输出一阶低通
 
 /**
  * @brief 换向决策结果（每拍在 RUN 态更新）
