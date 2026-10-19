@@ -1,0 +1,13 @@
+{
+  "promptDelete": false,
+  "settingsPopoutWindow": false,
+  "showInlineTitle": false,
+  "readableLineLength": false,
+  "strictLineBreaks": true,
+  "foldHeading": true,
+  "foldIndent": true,
+  "showLineNumber": true,
+  "showIndentGuide": true,
+  "spellcheck": false,
+  "autoPairBrackets": false
+}
