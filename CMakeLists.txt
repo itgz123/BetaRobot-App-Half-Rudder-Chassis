@@ -4,6 +4,7 @@ set(MODULE_SOURCES
     app_chassis_force/app_chassis_feedback.c
     app_chassis_force/app_chassis_fsm.c
     app_chassis_force/app_chassis_force_loop.c
+    app_chassis_force/app_chassis_output.c
 )
 
 set(MODULE_INCLUDE_DIRS

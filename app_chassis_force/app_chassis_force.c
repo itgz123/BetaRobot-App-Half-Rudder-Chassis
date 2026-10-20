@@ -4,6 +4,7 @@
 #include "app_chassis_feedback.h"
 #include "app_chassis_fsm.h"
 #include "app_chassis_force_loop.h"
+#include "app_chassis_output.h"
 //
 #include "app.h"       // gimbal2chassis_data_t / chassis2gimbal_data_t / robot_mode
 #include "robot_def.h" // IMU 安装方向与位置宏
@@ -15,7 +16,7 @@
 #include "drvs_lkmotor_broadcast.h"
 #include "drvlib_bmi088_kalman.h"
 #include "drvlib_motor.h"
-#include "lib_chassis.h" // LibChassisTorque_s
+#include "lib_chassis.h" // LibChassisInstance_s / 半舵几何
 #include "lib_chassis_half_rudder.h"
 
 #include "drv_comm.h"
@@ -96,12 +97,9 @@ ChassisForceCfg_s g_chassis_force_cfg = {
 vector3_t g_chassis_twist_fb;
 /* 力控输出广义力 (fx, fy, mw) */
 vector3_t g_chassis_wrench;
-/* 力分配输出：wheel_torque = 各轮**轮缘**驱动力矩 [N·m]（沿当前舵角，正=沿轮向+），
- * lateral_force = 舵轮侧向接触力 [N]。轮序 = 左/右舵；下发前还要经换向决策。 */
-LibChassisTorque_s g_chassis_torque;
-
-/* 换向决策：0 初始化 = combo 0（两轮都不反）、无历史方案、未锁定 */
-ChassisCostSel_s g_chassis_cost_sel;
+/* 输出：速度逆解目标、±180° 分支状态、轮缘力矩分配结果。
+ * 几何/分配计算在 app_chassis_output.c，这里只保存结果供下发与遥测。 */
+ChassisOutput_s g_chassis_output;
 
 /*---------------- 校准 ----------------*/
 
@@ -168,134 +166,6 @@ static uint8_t GimbalCommIsOnline(void)
 {
     const CommMedia *media = (const CommMedia *)gimbal_comm.media; // 首成员即 CommMedia 基类
     return (uint8_t)((media != NULL && media->daemon != NULL) ? DaemonIsOnline(media->daemon) : 1);
-}
-
-/*============================ 舵角：速度逆解 + 力投影 ============================*/
-/**
- * @brief 余弦优化系数：max(cos(目标舵角 − 实际舵角), 0)
- * @param angle_error 舵向误差绝对值 (rad)
- * @return 驱动轮力矩降额系数，0~1；误差 ≥90° 时钳 0，不反向出力
- * @note 与旧代码 Steer_Motor_Kinematics_Nearest_Transposition 的
- *       Target_Wheel_Omega *= max(cos(Δ), 0) 对齐。
- */
-static float ChassisCosineAlign(float angle_error)
-{
-    const float c = Lib_Math_Cos(angle_error);
-    return (c > 0.0f) ? c : 0.0f;
-}
-
-/**
- * @brief 在 φ 与 φ+180° 两个等价轮向中，选离当前舵角最近的解
- * @param wheel   轮序
- * @param phi_des 速度逆解给出的期望轮向 (rad，任意区间)
- * @param phi_cur 当前舵角 (rad，连续)
- * @return 目标舵角 (rad，与 phi_cur 连续的表示)
- * @note 角度死区 CHASSIS_COST_ANGLE_DEADBAND 用于平手时保持上一拍分支，
- *       避免在 |Δθ|≈90° 边界逐拍翻转。
- */
-static float ChassisNearestSteer(uint8_t wheel, float phi_des, float phi_cur)
-{
-    ChassisCostSel_s *sel = &g_chassis_cost_sel;
-    const float d_fwd = Lib_Math_WrapAngleNegPIToPI(phi_des - phi_cur);
-    const float d_rev = Lib_Math_WrapAngleNegPIToPI(phi_des + M_PI - phi_cur);
-    const float abs_fwd = Lib_Math_Fabs(d_fwd);
-    const float abs_rev = Lib_Math_Fabs(d_rev);
-
-    uint8_t rev;
-    if (abs_rev < (abs_fwd - CHASSIS_COST_ANGLE_DEADBAND))
-    {
-        rev = 1u;
-    }
-    else if (abs_fwd < (abs_rev - CHASSIS_COST_ANGLE_DEADBAND))
-    {
-        rev = 0u;
-    }
-    else
-    {
-        /* 平手：保持上一拍分支；首次决策（valid=0）取正向 */
-        rev = (sel->valid != 0u) ? sel->reverse[wheel] : 0u;
-    }
-
-    sel->reverse[wheel] = rev;
-    const float dphi = (rev != 0u) ? d_rev : d_fwd;
-    sel->angle_error[wheel] = Lib_Math_Fabs(dphi);
-    return phi_cur + dphi;
-}
-
-/**
- * @brief 速度逆解定舵角 + 把广义力投影到这两个轮向，只更新轮向力矩
- * @param cmd    云台速度指令（车体系 vx 前 / vy 左 / w 逆时针）
- * @param st     本拍实际状态（舵角反馈）
- * @param wrench 期望广义力 W = (fx [N], fy [N], mw [N·m])
- * @note 架构：舵角完全由 (vx,vy,w) 的速度逆解决定；力分配不再用
- *       atan2(f_lat, f_drive) 改舵角，也不使用侧向力。
- * @note 力分配用**目标舵角**构造 J 的驱动行，输出的 wheel_torque 是沿目标
- *       轮向的带符号轮缘力矩；侧向行仍参与最小范数分配，但结果被丢弃。
- * @note 两轮中某一轮的回转中心速度低于 LIB_CHASSIS_STEER_SPEED_EPS 时，
- *       速度逆解不给方向：该轮保持当前舵角，力仍沿当前轮向出力。
- * @note 分支：φ 与 φ+180° 等价，选离当前角更近的；目标角与当前角连续。
- */
-static void ChassisVelocitySteerSelect(const gimbal2chassis_data_t *cmd, const LibChassisState_s *st, vector3_t wrench)
-{
-    ChassisCostSel_s *sel = &g_chassis_cost_sel;
-    LibChassisRef_s ref;
-    const vector3_t twist_cmd = {cmd->vx, cmd->vy, cmd->w};
-
-    /* 1) 速度逆解：期望轮向 = 该轮回转中心的接触点速度方向 */
-    LibChassisInverse(&s_chassis, twist_cmd, &ref);
-
-    LibChassisState_s st_target = *st;
-    for (uint8_t i = 0; i < LIB_CHASSIS_HALF_RUDDER_NUM; i++)
-    {
-        if (ref.wheel_speed[i] <= 0.0f)
-        {
-            /* 回转中心速度≈0：速度逆解不定义方向，保持当前舵角 */
-            st_target.steer_angle[i] = st->steer_angle[i];
-            sel->angle_target[i] = st->steer_angle[i];
-            sel->angle_error[i] = 0.0f;
-            sel->reverse[i] = (sel->valid != 0u) ? sel->reverse[i] : 0u;
-        }
-        else
-        {
-            const float phi_t = ChassisNearestSteer(i, ref.steer_target[i], st->steer_angle[i]);
-            st_target.steer_angle[i] = phi_t;
-            sel->angle_target[i] = phi_t;
-        }
-    }
-
-    /* 2) 力分解：用目标舵向构造驱动行，只取驱动行力矩。
-     *    侧向行只是让 (JᵀJ) 可逆、保持最小范数分配的形状；其输出 lateral_force
-     *    在本架构里不参与舵向，也不再换算成舵向电机力矩。 */
-    LibChassisTorque_s alloc;
-    if (LibChassisAllocateTorque(&s_chassis, &st_target, wrench, &alloc) != 0)
-    {
-        /* 几何退化：本轮不出力，但舵向仍按速度逆解走 */
-        g_chassis_torque = (LibChassisTorque_s){0};
-        for (uint8_t i = 0; i < LIB_CHASSIS_HALF_RUDDER_NUM; i++)
-        {
-            sel->wheel_torque[i] = 0.0f;
-            sel->wheel_align[i] = ChassisCosineAlign(sel->angle_error[i]);
-        }
-    }
-    else
-    {
-        g_chassis_torque = alloc;
-        for (uint8_t i = 0; i < LIB_CHASSIS_HALF_RUDDER_NUM; i++)
-        {
-            sel->wheel_torque[i] = alloc.wheel_torque[i];
-            /* 余弦优化：力按目标舵向分配，舵向还没追上时按误差余弦降额，
-             * 避免驱动轮在错误方向上顶满力。90° 及以上钳 0（不反向出力）。 */
-            sel->wheel_align[i] = ChassisCosineAlign(sel->angle_error[i]);
-        }
-    }
-
-    sel->locked = 0u;
-    sel->valid = 1u;
-    for (uint8_t k = 0u; k < 4u; k++)
-    {
-        sel->cost[k] = 0.0f; // 不再做组合代价，遥测通道保留
-    }
-    sel->combo = (uint8_t)((sel->reverse[LIB_CHASSIS_HALF_RUDDER_L] & 0x1u) | ((sel->reverse[LIB_CHASSIS_HALF_RUDDER_R] & 0x1u) << 1));
 }
 
 /*============================ 舵向零点标定 ============================*/
@@ -435,6 +305,12 @@ void AppChassisInit(void)
         .radius = CHASSIS_WHEEL_RADIUS,
     };
     BSP_ASSERT_APP_CALL(LibChassisHalfRudderInit(&s_chassis, &chassis_geom));
+
+    /* ---- 输出：速度逆解 + 力投影（复用同一份几何内核） ---- */
+    const ChassisOutputCfg_s output_cfg = {
+        .chassis = &s_chassis,
+    };
+    ChassisOutputInit(&output_cfg);
 
     /* ---- 舵向：DJI 广播 ---- */
     BSP_ASSERT_APP_CALL(DrvsDJIMotorBroadcastRegister(&rudder_l_motor));
@@ -767,17 +643,17 @@ void AppChassisRun(float dt, uint64_t time_stamp)
         DrvlibMotorEnable(&rudder_l_ctrl);
         DrvlibMotorEnable(&rudder_r_ctrl);
 
-        if (g_chassis_cost_sel.valid != 0u)
+        if (g_chassis_output.sel.valid != 0u)
         {
             /* 舵向：决策给的是舵轮侧 rad，控制核要电机侧 rad */
-            rudder_l_ref = g_chassis_cost_sel.angle_target[LIB_CHASSIS_HALF_RUDDER_L] * CHASSIS_STEER_GEAR_RATIO;
-            rudder_r_ref = g_chassis_cost_sel.angle_target[LIB_CHASSIS_HALF_RUDDER_R] * CHASSIS_STEER_GEAR_RATIO;
+            rudder_l_ref = g_chassis_output.sel.angle_target[LIB_CHASSIS_HALF_RUDDER_L] * CHASSIS_STEER_GEAR_RATIO;
+            rudder_r_ref = g_chassis_output.sel.angle_target[LIB_CHASSIS_HALF_RUDDER_R] * CHASSIS_STEER_GEAR_RATIO;
 
             /* 轮向：带符号轮缘力矩 × max(cos(目标−实际), 0)（余弦优化）。
              * 比例取上一拍决策算好的值（2ms 滞后可忽略）；误差 ≥90° 时降为 0。 */
-            g_wheel_l_setref = g_chassis_cost_sel.wheel_torque[LIB_CHASSIS_HALF_RUDDER_L] * g_chassis_cost_sel.wheel_align[LIB_CHASSIS_HALF_RUDDER_L] /
+            g_wheel_l_setref = g_chassis_output.sel.wheel_torque[LIB_CHASSIS_HALF_RUDDER_L] * g_chassis_output.sel.wheel_align[LIB_CHASSIS_HALF_RUDDER_L] /
                                CHASSIS_DRIVE_REDUCTION;
-            g_wheel_r_setref = g_chassis_cost_sel.wheel_torque[LIB_CHASSIS_HALF_RUDDER_R] * g_chassis_cost_sel.wheel_align[LIB_CHASSIS_HALF_RUDDER_R] /
+            g_wheel_r_setref = g_chassis_output.sel.wheel_torque[LIB_CHASSIS_HALF_RUDDER_R] * g_chassis_output.sel.wheel_align[LIB_CHASSIS_HALF_RUDDER_R] /
                                CHASSIS_DRIVE_REDUCTION;
         }
         else
@@ -837,7 +713,7 @@ void AppChassisRun(float dt, uint64_t time_stamp)
      * 但每拍仍记录指令供下一拍算惯性前馈。
      * 舵角：由 (vx,vy,w) 的速度逆解直接给出，力分配不再改变它；
      * 轮向：用目标舵向构造 J 的驱动行，把 3 个广义力投影到这两个方向上，
-     *       只下发驱动行力矩，侧向力丢弃。结果见 g_chassis_cost_sel，
+     *       只下发驱动行力矩，侧向力丢弃。结果见 g_chassis_output.sel，
      *       下一拍由 RUN 分支下发。 */
     const ChassisForceLoopInput_s force_loop_in = {
         .cmd = {g_gimbal2chassis_data.vx, g_gimbal2chassis_data.vy, g_gimbal2chassis_data.w},
@@ -847,13 +723,22 @@ void AppChassisRun(float dt, uint64_t time_stamp)
     g_chassis_wrench = ChassisForceLoopUpdate(&force_loop_in, (uint8_t)(state == CHASSIS_STATE_RUN));
     if (state == CHASSIS_STATE_RUN)
     {
-        ChassisVelocitySteerSelect(&g_gimbal2chassis_data, &g_chassis_feedback.state, g_chassis_wrench);
+        const ChassisOutputInput_s output_in = {
+            .twist_cmd = {g_gimbal2chassis_data.vx, g_gimbal2chassis_data.vy, g_gimbal2chassis_data.w},
+            .state = g_chassis_feedback.state,
+            .wrench = g_chassis_wrench,
+            /* 代价函数的力矩误差用实测轮缘力矩（app 正方向 → 舵轮侧） */
+            .wheel_torque_fb = {
+                [LIB_CHASSIS_HALF_RUDDER_L] = g_chassis_feedback.wheel[APP_WHEEL_L].torque * CHASSIS_DRIVE_REDUCTION,
+                [LIB_CHASSIS_HALF_RUDDER_R] = g_chassis_feedback.wheel[APP_WHEEL_R].torque * CHASSIS_DRIVE_REDUCTION,
+            },
+        };
+        ChassisOutputUpdate(&output_in, &g_chassis_output);
     }
     else
     {
-        g_chassis_torque = (LibChassisTorque_s){0};
         /* 离开运行态即作废换向历史：下次使能重新决策（不沿用急停前的方案） */
-        g_chassis_cost_sel = (ChassisCostSel_s){0};
+        ChassisOutputReset(&g_chassis_output);
     }
 
     /* 实测速度回传云台（线协议方向与车体系一致：vx 前 / vy 左 / w 逆时针） */
@@ -889,23 +774,23 @@ void AppChassisRun(float dt, uint64_t time_stamp)
         const float r2d = 180.0f / M_PI;
         /* 目标角内部是连续表达（可能 >180°），遥测统一折到 (−180°,180°] 与实测同系；
          * 遥控判换向时看角度差即可（wrap 差），不要直接减。 */
-        VofaSetChannel(1, Lib_Math_WrapAngleNegPIToPI(g_chassis_cost_sel.angle_target[LIB_CHASSIS_HALF_RUDDER_L]) * r2d); // 左舵目标 (deg)
-        VofaSetChannel(2, g_chassis_feedback.state.steer_angle[LIB_CHASSIS_HALF_RUDDER_L] * r2d);                         // 左舵实际 (deg)
-        VofaSetChannel(3, Lib_Math_WrapAngleNegPIToPI(g_chassis_cost_sel.angle_target[LIB_CHASSIS_HALF_RUDDER_R]) * r2d); // 右舵目标 (deg)
-        VofaSetChannel(4, g_chassis_feedback.state.steer_angle[LIB_CHASSIS_HALF_RUDDER_R] * r2d);                         // 右舵实际 (deg)
-        VofaSetChannel(5, g_chassis_cost_sel.wheel_torque[LIB_CHASSIS_HALF_RUDDER_L]);                                    // 左轮目标 (N·m)
-        VofaSetChannel(6, g_chassis_feedback.wheel[APP_WHEEL_L].torque * CHASSIS_DRIVE_REDUCTION);                        // 左轮实测 (N·m)
-        VofaSetChannel(7, g_chassis_cost_sel.wheel_torque[LIB_CHASSIS_HALF_RUDDER_R]);                                    // 右轮目标 (N·m)
-        VofaSetChannel(8, g_chassis_feedback.wheel[APP_WHEEL_R].torque * CHASSIS_DRIVE_REDUCTION);                        // 右轮实测 (N·m)
-        VofaSetChannel(9, (float)g_chassis_cost_sel.combo);                                                               // 换向方案 0~3
-        VofaSetChannel(10, g_chassis_cost_sel.cost[0]);                                                                   // 组合代价 (s)
-        VofaSetChannel(11, g_chassis_cost_sel.cost[1]);
-        VofaSetChannel(12, g_chassis_cost_sel.cost[2]);
-        VofaSetChannel(13, g_chassis_cost_sel.cost[3]);
-        VofaSetChannel(14, (float)g_chassis_cost_sel.locked);                          // 历史力矩锁定（当前恒 0）
-        VofaSetChannel(15, (float)state);                                              // 状态机状态
-        VofaSetChannel(16, g_chassis_cost_sel.wheel_align[LIB_CHASSIS_HALF_RUDDER_L]); // 左轮余弦优化系数
-        VofaSetChannel(17, g_chassis_cost_sel.wheel_align[LIB_CHASSIS_HALF_RUDDER_R]); // 右轮余弦优化系数
+        VofaSetChannel(1, Lib_Math_WrapAngleNegPIToPI(g_chassis_output.sel.angle_target[LIB_CHASSIS_HALF_RUDDER_L]) * r2d); // 左舵目标 (deg)
+        VofaSetChannel(2, g_chassis_feedback.state.steer_angle[LIB_CHASSIS_HALF_RUDDER_L] * r2d);                           // 左舵实际 (deg)
+        VofaSetChannel(3, Lib_Math_WrapAngleNegPIToPI(g_chassis_output.sel.angle_target[LIB_CHASSIS_HALF_RUDDER_R]) * r2d); // 右舵目标 (deg)
+        VofaSetChannel(4, g_chassis_feedback.state.steer_angle[LIB_CHASSIS_HALF_RUDDER_R] * r2d);                           // 右舵实际 (deg)
+        VofaSetChannel(5, g_chassis_output.sel.wheel_torque[LIB_CHASSIS_HALF_RUDDER_L]);                                    // 左轮目标 (N·m)
+        VofaSetChannel(6, g_chassis_feedback.wheel[APP_WHEEL_L].torque * CHASSIS_DRIVE_REDUCTION);                          // 左轮实测 (N·m)
+        VofaSetChannel(7, g_chassis_output.sel.wheel_torque[LIB_CHASSIS_HALF_RUDDER_R]);                                    // 右轮目标 (N·m)
+        VofaSetChannel(8, g_chassis_feedback.wheel[APP_WHEEL_R].torque * CHASSIS_DRIVE_REDUCTION);                          // 右轮实测 (N·m)
+        VofaSetChannel(9, (float)g_chassis_output.sel.combo);                                                               // 换向方案 0~3
+        VofaSetChannel(10, g_chassis_output.sel.cost[0]);                                                                   // 组合代价 (s，方案 1)
+        VofaSetChannel(11, g_chassis_output.sel.cost[1]);
+        VofaSetChannel(12, g_chassis_output.sel.cost[2]);
+        VofaSetChannel(13, g_chassis_output.sel.cost[3]);
+        VofaSetChannel(14, (float)g_chassis_output.sel.locked);                          // 无力向小力矩锁定（方案 1）
+        VofaSetChannel(15, (float)state);                                                // 状态机状态
+        VofaSetChannel(16, g_chassis_output.sel.wheel_align[LIB_CHASSIS_HALF_RUDDER_L]); // 左轮余弦优化系数
+        VofaSetChannel(17, g_chassis_output.sel.wheel_align[LIB_CHASSIS_HALF_RUDDER_R]); // 右轮余弦优化系数
         /* CH18~28：命令 / 反馈 / 力控中间量。换向乱转的定位关键是
          * "期望力方向为什么转" —— 对比 CH18~20（指令）与 CH21~23（反馈），
          * 再看 CH24~26 是否跟着转，就能区分指令在转、反馈在转还是分配在转。 */

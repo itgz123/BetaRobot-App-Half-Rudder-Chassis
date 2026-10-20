@@ -32,6 +32,11 @@
  *   1 = 反馈 + RLS/功率约束的整体规划（预留，尚未实现，编译会报错提醒） */
 #define CHASSIS_CLOSED_LOOP_SCHEME 0
 
+/* 输出方案（±180° 等价解怎么选）：
+ *   0 = 直接最短路径：φ / φ+180° 里选离当前舵角更近的，平手保持上一拍分支
+ *   1 = 4 组合代价函数：角度误差 + 力矩误差 + 两舵反向惩罚，带切换迟滞 */
+#define CHASSIS_OUTPUT_SCHEME 0
+
 /*============================================
  *              校准/整定参数
  *============================================*/
@@ -202,19 +207,18 @@ typedef struct
  * 每组舵轮的驱动方向仍有 ±180° 两个等价解：
  *     (φ, +τ)  或  (φ+180°, −τ)
  * 两解产生的车体合力完全相同，只是舵向要多转多少、轮向力矩要变多少不同。
- * 现在只选**离当前舵角更近**的那个；平手时保持上一拍分支。
+ * 分支选择由 CHASSIS_OUTPUT_SCHEME 切换：
+ *   - 0：选**离当前舵角更近**的解（平手保持上一拍分支）；
+ *   - 1：对 4 种反向组合做代价比较，角度/力矩/两舵反向都计入。
  *
- * 下面这组代价系数是 2026-10-18 的 4 组合代价函数遗留下来的；
- * 当前架构只有 CHASSIS_COST_ANGLE_DEADBAND 还用于分支平手迟滞，
- * 其余宏保留是为了不打断历史文档/遥测对照，代码已不再读取。 */
-#define CHASSIS_STEER_SELECT_SHORTEST (1) // 历史开关：当前架构不再使用
-
-#define CHASSIS_COST_RUDDER (0.35f)           // 历史：舵向代价系数 (s/rad)
-#define CHASSIS_COST_WHEEL (0.20f)            // 历史：轮向代价系数 (s/(N·m))
-#define CHASSIS_COST_DIFF (0.15f)             // 历史：两舵轮转向相反的额外代价 (s)
-#define CHASSIS_COST_SWITCH_MARGIN (0.15f)    // 历史：切换迟滞 (s)
-#define CHASSIS_COST_TORQUE_LOCK (0.20f)      // 历史：力矩锁定阈值 (N·m)
-#define CHASSIS_COST_ANGLE_DEADBAND (0.0175f) // 仍在用：±180° 分支平手迟滞 (rad，舵轮侧 ≈1°)
+ * 下面这组代价系数在 CHASSIS_OUTPUT_SCHEME=1 时生效；
+ * CHASSIS_COST_ANGLE_DEADBAND 在两种方案里都用于分支平手迟滞。 */
+#define CHASSIS_COST_RUDDER (0.35f)           // 舵向代价系数 (s/rad)
+#define CHASSIS_COST_WHEEL (0.20f)            // 轮向力矩误差代价系数 (s/(N·m))
+#define CHASSIS_COST_DIFF (0.15f)             // 两舵轮转向相反的额外代价 (s)
+#define CHASSIS_COST_SWITCH_MARGIN (0.15f)    // 组合切换迟滞 (s)
+#define CHASSIS_COST_TORQUE_LOCK (0.20f)      // 两轮均无力向时的力矩锁定阈值 (N·m)
+#define CHASSIS_COST_ANGLE_DEADBAND (0.0175f) // ±180° 分支平手迟滞/角度死区 (rad，舵轮侧 ≈1°)
 
 /* 驱动轮出力比例 wheel_align = max(cos(目标舵角 − 实际舵角), 0)。
  * 力分配按**目标**舵向算轮缘力矩；舵向位置环追上之前，实际轮向与目标有偏差，
@@ -256,20 +260,21 @@ typedef struct
  *       下发电机前 ÷CHASSIS_DRIVE_REDUCTION 再乘 CHASSIS_WHEEL_x_DIR。
  * @note reverse[i] = 1 表示该轮选了 φ+180° 的反向等价解（驱动轮反转）。
  * @note combo 位定义：bit0 = 左舵反向，bit1 = 右舵反向（0..3）。
- * @note cost[] 是 4 组合代价函数的遗留遥测通道，当前架构恒 0。
- * @note locked 是力矩锁定逻辑的遗留标志，当前架构恒 0。
+ * @note cost[] 是 4 组合代价（CHASSIS_OUTPUT_SCHEME=1 时有效，=0 时恒 0）。
+ * @note locked = 1 表示两轮都无力向且力矩很小，保持当前舵角、不出力
+ *       （仅 CHASSIS_OUTPUT_SCHEME=1 使用）。
  * @note RUN 态用这些量驱动舵向与轮向（舵向 100Hz 遥测见 app_cfg.h 通道表）。 */
 typedef struct
 {
     float angle_target[LIB_CHASSIS_HALF_RUDDER_NUM]; // 目标舵角 (rad，舵轮侧，速度逆解)
     float wheel_torque[LIB_CHASSIS_HALF_RUDDER_NUM]; // 沿目标舵向的带符号轮缘力矩 (N·m)
     float angle_error[LIB_CHASSIS_HALF_RUDDER_NUM];  // 本拍目标与当前舵角之差 (rad)
-    float cost[4];                                   // 历史代价遥测（当前恒 0）
+    float cost[4];                                   // 4 组合代价（方案 1）
     float wheel_align[LIB_CHASSIS_HALF_RUDDER_NUM];  // 余弦优化系数 max(cos(目标−实际舵角), 0)
     uint8_t reverse[LIB_CHASSIS_HALF_RUDDER_NUM];    // 1 = 选反向解
     uint8_t combo;                                   // 反向位组合（0..3）
     uint8_t valid;                                   // 1 = 至少完成过一次决策
-    uint8_t locked;                                  // 历史力矩锁定标志（当前恒 0）
+    uint8_t locked;                                  // 1 = 无力向且小力矩锁定（方案 1）
 } ChassisCostSel_s;
 
 /* 以上类型的实体均定义在 app_chassis_force.c。 */
