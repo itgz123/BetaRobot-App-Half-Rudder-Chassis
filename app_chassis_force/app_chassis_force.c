@@ -2,6 +2,7 @@
 #include "app_cfg.h"
 #include "app_chassis_force_def.h" // 宏 + 类型（实体定义在本文件）
 #include "app_chassis_feedback.h"
+#include "app_chassis_fsm.h"
 //
 #include "app.h"       // gimbal2chassis_data_t / chassis2gimbal_data_t / robot_mode
 #include "robot_def.h" // IMU 安装方向与位置宏
@@ -15,7 +16,6 @@
 #include "drvlib_motor.h"
 #include "lib_chassis.h" // LibChassisTorque_s
 #include "lib_chassis_half_rudder.h"
-#include "lib_fsm_table.h"
 #include "lib_pid.h"
 
 #include "drv_comm.h"
@@ -104,9 +104,7 @@ vector3_t g_chassis_cmd_prev;
 /* 换向决策：0 初始化 = combo 0（两轮都不反）、无历史方案、未锁定 */
 ChassisCostSel_s g_chassis_cost_sel;
 
-/*---------------- 校准 / 状态机 ----------------*/
-ChassisFsmCtx_s g_chassis_fsm_ctx;
-LibFsmTableInstance_s g_chassis_fsm;
+/*---------------- 校准 ----------------*/
 
 uint8_t g_rudder_l_gate_state; // 上一拍光电门电平（判 1→0 下降沿）
 uint8_t g_rudder_r_gate_state;
@@ -476,79 +474,63 @@ static void ChassisCalibPollGate(void)
     g_rudder_r_gate_state = (uint8_t)GPIORead(&rudder_r_gate_io);
 }
 
-/*============================ 顶层状态机（lib_fsm_table） ============================*/
-/* 状态 = 底盘"现在能干的事"，不是云台下发的档位：
+/*============================ 顶层状态机回调（app 侧动作） ============================*/
+/* 状态迁移/计时/派发在 app_chassis_fsm.c；这里只提供四个条件采样和进入动作，
+ * 模块不直接碰电机/通信实例。
+ *
+ * 状态 = 底盘"现在能干的事"，不是云台下发的档位：
  *   CAL   上电校准：两舵轮扫描找光电门零点（此时不理会云台在线与否）
  *   FAULT 校准失败（连续超时）：失能 + 给定清零，终态（需复位重启再标）
- *   SAFE  已标定但不可动：云台掉线 或 云台下发 stop
+ *   SAFE  已标定但不可动：云台掉线 或 云台下发 stop —— 失能 + 给定清零 + 作废指令
  *   RUN   已标定且可动：力控/解算入口（正解 → 广义力 → 分配 → 换向决策 → 下发）
- * 事件只有一个"每拍更新"：状态完全由 (是否标定, 是否超时, 是否在线, 是否 stop) 决定。
  * ⚠ 校准是"上电即可做、与云台无关"的第一步：云台常没上电，故 CAL 不受 online 影响。 */
 
-/*---------------- 守卫 ----------------*/
-/* 守卫必须无副作用且幂等；四个条件互斥，表内先后只决定"故障优先、校准次之"。 */
-static bool ChassisGuardFault(void *ctx, const void *event_data)
+/*---------------- 状态条件采样 ----------------*/
+static uint8_t ChassisInputCalibrated(void *user)
 {
-    (void)event_data;
-    return ((ChassisFsmCtx_s *)ctx)->cal_fault != 0;
+    (void)user;
+    return (uint8_t)(g_rudder_l_inited && g_rudder_r_inited);
 }
 
-static bool ChassisGuardCal(void *ctx, const void *event_data)
+static uint8_t ChassisInputOnline(void *user)
 {
-    (void)event_data;
-    const ChassisFsmCtx_s *c = (const ChassisFsmCtx_s *)ctx;
-    return (c->cal_done == 0) && (c->cal_fault == 0);
+    (void)user;
+    return (uint8_t)GimbalCommIsOnline();
 }
 
-static bool ChassisGuardSafe(void *ctx, const void *event_data)
+static uint8_t ChassisInputStopped(void *user)
 {
-    (void)event_data;
-    const ChassisFsmCtx_s *c = (const ChassisFsmCtx_s *)ctx;
-    return (c->cal_done != 0) && ((c->online == 0) || (c->stopped != 0));
+    (void)user;
+    /* 档位取 g_rudder_mode_rx（接收回调写的原始副本），**不能取 g_gimbal2chassis_data.enabled**：
+     * 采样发生在状态动作之后（SAFE 先把指令清零作废，再走到这里），若判据用同一份数据，
+     * SAFE 每拍都会读到自己刚写下的 stop ⇒ stopped 恒 1 ⇒ 永远出不去。
+     * 档位是"对端说了什么"，只能由接收回调更新，与"本拍要不要执行"必须分开存。 */
+    return (uint8_t)(g_gimbal_mode_rx == robot_mode_stop);
 }
 
-static bool ChassisGuardRun(void *ctx, const void *event_data)
-{
-    (void)event_data;
-    const ChassisFsmCtx_s *c = (const ChassisFsmCtx_s *)ctx;
-    return (c->cal_done != 0) && (c->online != 0) && (c->stopped == 0);
-}
-
-/*---------------- 转移表 ----------------*/
-/* 源状态一律通配：四条守卫已把 (标定 × 在线 × stop) 完全划分，落点唯一；
- * 表顺序 = 优先级，故障排最前。 */
-static const LibFsmTableTransition_s chassis_fsm_table[] = {
-    {LIB_FSM_TABLE_ANY_STATE, CHASSIS_EV_UPDATE, CHASSIS_STATE_FAULT, ChassisGuardFault, NULL, LIB_FSM_TABLE_TRANS_EXTERNAL},
-    {LIB_FSM_TABLE_ANY_STATE, CHASSIS_EV_UPDATE, CHASSIS_STATE_CAL, ChassisGuardCal, NULL, LIB_FSM_TABLE_TRANS_EXTERNAL},
-    {LIB_FSM_TABLE_ANY_STATE, CHASSIS_EV_UPDATE, CHASSIS_STATE_SAFE, ChassisGuardSafe, NULL, LIB_FSM_TABLE_TRANS_EXTERNAL},
-    {LIB_FSM_TABLE_ANY_STATE, CHASSIS_EV_UPDATE, CHASSIS_STATE_RUN, ChassisGuardRun, NULL, LIB_FSM_TABLE_TRANS_EXTERNAL},
-};
-LIB_FSM_TABLE_CHECK_TABLE(chassis_fsm_table);
-
-/*---------------- 状态动作 ----------------*/
+/*---------------- 状态进入动作 ----------------*/
 /* 进入运行态：舵向从"纯速度环扫描"切回"位置+速度环"（只改掩码，不重配 PID）。 */
-static void ChassisRunEntry(void *ctx)
+static void ChassisActionRunEntry(void *user)
 {
-    (void)ctx;
+    (void)user;
     rudder_l_ctrl.cfg.loop_type = DRVLIB_MOTOR_LOOP_ANGLE | DRVLIB_MOTOR_LOOP_SPEED;
     rudder_r_ctrl.cfg.loop_type = DRVLIB_MOTOR_LOOP_ANGLE | DRVLIB_MOTOR_LOOP_SPEED;
 }
 
 /* 进入故障（终态）：上报一次。失能 + 给定清零在主循环 FAULT 分支里做。 */
-static void ChassisFaultEntry(void *ctx)
+static void ChassisActionFaultEntry(void *user)
 {
-    (void)ctx;
+    (void)user;
     BSPLOG(&g_chassis_log, LOG_LEVEL_ERROR, "cal fault: no photogate edge after %u retries x %u ticks; chassis disabled, reset MCU to retry",
            (unsigned)CHASSIS_CAL_MAX_RETRIES, (unsigned)CHASSIS_CAL_TIMEOUT_TICKS);
 }
 
-static const LibFsmTableStateActions_s chassis_fsm_actions[] = {
-    [CHASSIS_STATE_CAL] = {NULL, NULL},
-    [CHASSIS_STATE_FAULT] = {ChassisFaultEntry, NULL},
-    [CHASSIS_STATE_SAFE] = {NULL, NULL},
-    [CHASSIS_STATE_RUN] = {ChassisRunEntry, NULL},
-};
-LIB_FSM_TABLE_CHECK_ACTIONS(chassis_fsm_actions, CHASSIS_STATE_COUNT);
+/* 单次校准超时：只重试，不判死。 */
+static void ChassisActionCalTimeout(uint8_t retries, void *user)
+{
+    (void)user;
+    BSPLOG(&g_chassis_log, LOG_LEVEL_WARNING, "cal timeout #%u/%u, keep scanning", (unsigned)retries, (unsigned)CHASSIS_CAL_MAX_RETRIES);
+}
 
 /*---------------- 电机使能 ----------------*/
 /* 驱动轮是纯力矩协议（无使能开关），"失能"= 每拍 SetRef(0)+GroupSend；
@@ -563,49 +545,6 @@ static void ChassisRudderDisable(void)
     {
         DrvlibMotorDisable(&rudder_r_ctrl);
     }
-}
-
-/**
- * @brief 每拍汇总条件，仅在条件变化时派发一次更新事件
- * @note 状态完全由四个布尔量决定；若每拍都派发，同状态也会走一次外部自转移
- *       （退出 + 进入各跑一遍），将来挂上状态动作就会每拍重跑，故只在变化时派发。
- * @note 故障为终态：进入后不再派发（需复位重启才能重标）。
- */
-static void ChassisFsmUpdate(void)
-{
-    ChassisFsmCtx_s *c = &g_chassis_fsm_ctx;
-
-    /* 校准计时：仅在校准态累加。单次超时只重试（重新计时 + 计数 + 上报），不直接判死——
-     * 上电找不到零点最常见的失败是漏采到某一圈的光电门沿，下一圈就能补上；
-     * 连续 CHASSIS_CAL_MAX_RETRIES 次才判故障（那时基本是传感器/线束/挡片真坏了）。 */
-    if (LibFsmTableCurrent(&g_chassis_fsm) == CHASSIS_STATE_CAL)
-    {
-        c->cal_ticks++;
-        if ((c->cal_done == 0) && (c->cal_ticks >= CHASSIS_CAL_TIMEOUT_TICKS))
-        {
-            c->cal_ticks = 0;
-            c->cal_retries++;
-            BSPLOG(&g_chassis_log, LOG_LEVEL_WARNING, "cal timeout #%u/%u, keep scanning", (unsigned)c->cal_retries, (unsigned)CHASSIS_CAL_MAX_RETRIES);
-        }
-    }
-
-    // 采样四个条件
-    c->cal_done = (uint8_t)(g_rudder_l_inited && g_rudder_r_inited);
-    c->cal_fault = (uint8_t)((c->cal_done == 0) && (c->cal_retries >= CHASSIS_CAL_MAX_RETRIES));
-    c->online = GimbalCommIsOnline();
-    /* 档位取 g_rudder_mode_rx（接收回调写的原始副本），**不能取 g_gimbal2chassis_data.enabled**：
-     * 采样发生在状态动作之后（SAFE 先把指令清零作废，再走到这里），若判据用同一份数据，
-     * SAFE 每拍都会读到自己刚写下的 stop ⇒ stopped 恒 1 ⇒ 永远出不去。
-     * 档位是"对端说了什么"，只能由接收回调更新，与"本拍要不要执行"必须分开存。 */
-    c->stopped = (uint8_t)(g_gimbal_mode_rx == robot_mode_stop);
-
-    // 打包成一个字节比较：任一条件变化就派发一次
-    const uint8_t key = (uint8_t)(c->cal_done | (c->cal_fault << 1) | (c->online << 2) | (c->stopped << 3));
-    if ((key != c->key_last) && (LibFsmTableCurrent(&g_chassis_fsm) != CHASSIS_STATE_FAULT))
-    {
-        LibFsmTableDispatch(&g_chassis_fsm, CHASSIS_EV_UPDATE, NULL);
-    }
-    c->key_last = key;
 }
 
 void AppChassisInit(void)
@@ -833,18 +772,18 @@ void AppChassisInit(void)
     };
     ChassisFeedbackInit(&feedback_cfg);
 
-    /* ---- 顶层状态机：上电从校准起，等两个光电门标定完再判在线/使能 ---- */
-    LibFsmTableConfig_s chassis_fsm_cfg = {
-        .initial_state = CHASSIS_STATE_CAL,
-        .transitions = chassis_fsm_table,
-        .transition_count = sizeof(chassis_fsm_table) / sizeof(chassis_fsm_table[0]),
-        .state_actions = chassis_fsm_actions,
-        .state_count = CHASSIS_STATE_COUNT,
-        .ctx = &g_chassis_fsm_ctx,
-        .trace_fn = NULL,
+    /* ---- 顶层状态机：上电从校准起，等两个光电门标定完再判在线/使能 ----
+     * 迁移/计时/派发在 app_chassis_fsm.c，这里只提供条件采样与进入动作。 */
+    const ChassisFsmCfg_s chassis_fsm_cfg = {
+        .is_calibrated = ChassisInputCalibrated,
+        .is_online = ChassisInputOnline,
+        .is_stopped = ChassisInputStopped,
+        .on_cal_timeout = ChassisActionCalTimeout,
+        .on_run_entry = ChassisActionRunEntry,
+        .on_fault_entry = ChassisActionFaultEntry,
+        .user = NULL,
     };
-    LibFsmTableInit(&g_chassis_fsm, &chassis_fsm_cfg);
-    LibFsmTableStart(&g_chassis_fsm);
+    ChassisFsmInit(&chassis_fsm_cfg);
 }
 
 void AppChassisRun(float dt, uint64_t time_stamp)
@@ -914,7 +853,7 @@ void AppChassisRun(float dt, uint64_t time_stamp)
     /* 顺序约定：① 状态给定（舵向在本拍喂反馈 + 算下发量）→ ② 校准判光电门（用 ① 刚刷新
      * 的 data.position）→ ③ 采样条件并（变化时）派发 → ④ 下发。
      * ⚠ 每拍每个舵向只跑一次 SetRef；状态变化从下一拍生效。 */
-    const ChassisState_e state = (ChassisState_e)LibFsmTableCurrent(&g_chassis_fsm);
+    const ChassisState_e state = ChassisFsmCurrent();
     const float dt_s = dt * 0.001f; // APP_TASK_DEF 的 dt 是 ms，drvlib 要秒
 
     float rudder_l_ref = 0.0f;
