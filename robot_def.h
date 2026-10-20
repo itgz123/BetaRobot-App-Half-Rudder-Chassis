@@ -9,7 +9,7 @@
  * 单位：舵轮输出端角度（°）。左右舵镜像安装，符号/数值往往不同，务必分别标定。
  * 标定：上电校准完成、舵轮停在光电门处后，手工把舵轮摆到正前方，读此时的位置
  *       （电机侧 rad，看 VOFA 通道 1），则
- *       偏置(°) = 位置(rad) / STEER_GEAR_RATIO * 180 / π */
+ *       偏置(°) = 位置(rad) / CHASSIS_STEER_GEAR_RATIO * 180 / π */
 // 当前位置下，舵轮朝向0的位置，2个轮向给正力矩，向底盘系的x正方向（前）走
 #define RUDDER_ZERO_OFFSET_L_DEG (180.0f)
 #define RUDDER_ZERO_OFFSET_R_DEG (60.0f)
@@ -22,6 +22,11 @@
 // 驱动轮：LK MF7015 直驱，无减速箱（减速比 1），故驱动速度 = 接触点线速度 / 轮半径
 #define CHASSIS_WHEEL_RADIUS (0.05025f) // 驱动轮半径 (m)
 #define CHASSIS_DRIVE_REDUCTION (1.0f)  // 驱动电机减速比（MF7015 直驱 = 1）
+
+// 舵向传动：电机转 CHASSIS_STEER_GEAR_RATIO 圈 = 舵轮 1 圈。
+// 位置反馈在 drvlib_motor 里是"电机侧 rad"，换到舵轮侧时乘 INV。
+#define CHASSIS_STEER_GEAR_RATIO (8.0f)
+#define CHASSIS_STEER_GEAR_RATIO_INV (0.125f)
 
 // 舵轮组回转中心在车体系中的位置 (m)。解算槽位 [0]=左舵、[1]=右舵。
 // 两组前后位置相同（都装在中线附近）时 x 填同一个值，y 为 ±半轮距。
@@ -54,8 +59,23 @@
 #define CHASSIS_IMU_POS_Y (-0.0953f) // IMU 中心在底盘系的 y (m)
 #define CHASSIS_IMU_POS_Z (0.0f)     // IMU 中心在底盘系的 z (m)
 
+/*============================ 半舵底盘 电机参数 ============================*/
+/* 舵向位置环输出限幅 = 速度给定上限（电机侧 rad/s）。
+ * M3508 空载约 50rad/s，再大只会把速度环按在饱和里。 */
+#define CHASSIS_STEER_VMAX_MOTOR (50.0f)
+
 /*============================ 半舵底盘 电机方向 ============================*/
-// 舵向电机电流给正值，轮子以底盘参考系转向为正值（俯视逆时针）
-// 轮向方向和光电门有关
+/* 电机方向（2026-10-18 实测）
+ * 测试方法：四个电机分别发正力矩，观察反馈符号。
+ * 结果：四个电机正力矩方向一致；反馈只有 wheel_l 为负（左右驱动轮镜像安装）。
+ * 约定（与旧 app 相同，feedback/motor 必须成对取反，只反一个会变正反馈）：
+ *   舵向 +：舵轮俯视逆时针（与车体系 +w 同向）
+ *   轮向 +：沿当前舵角方向推动车体（不是"俯视逆时针"）
+ * 舵向电机电流给正值，轮子以底盘参考系转向为正值（俯视逆时针）；
+ * 轮向方向和光电门有关。 */
+#define CHASSIS_RUDDER_L_DIR (1)
+#define CHASSIS_RUDDER_R_DIR (1)
+#define CHASSIS_WHEEL_L_DIR (1)
+#define CHASSIS_WHEEL_R_DIR (1)
 
 #endif // !__ROBOT_DEF_H

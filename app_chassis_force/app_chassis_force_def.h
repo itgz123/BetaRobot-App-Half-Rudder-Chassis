@@ -1,14 +1,13 @@
 /**
  * @file app_chassis_force_def.h
- * @brief 力控底盘 app 的**类型声明 + 全局变量声明**
+ * @brief 力控底盘 app 的**宏 + 类型**
  *
- * app_chassis_force.c 只放业务逻辑（状态机、控制律、解算接线）；
- * 本文件与 app_chassis_force_def.c 集中放跨函数/跨文件共享的类型和状态：
- *   - 类型：IMU 观测结果 AppChassisImu_s；
- *   - 常量：IMU→底盘安装变换、BMI088 标定值；
- *   - 运行状态：底盘系 IMU 观测、杆臂补偿中间量、云台通信收发数据。
+ * 实体定义（常量、运行状态、通信实例）全部在 app_chassis_force.c；
+ * 本文件只保留：
+ *   - 控制/整定/方案相关的宏（机械/安装参数在 robot_def.h）；
+ *   - 跨函数共享的 plain struct / enum 类型。
  *
- * ⚠ 电机/IMU/通信的**驱动实例**仍留在 app_chassis_force.c：
+ * ⚠ 电机/IMU/通信的驱动实例仍在 app_chassis_force.c：
  *   Drvs*_INSTANCE_DEF / BMI088_KALMAN_INSTANCE_DEF 展开的是 static 对象，
  *   头文件里无法 extern 给别的编译单元用，只能用在使用它的那个 .c 里。
  */
@@ -16,36 +15,13 @@
 #ifndef __APP_CHASSIS_FORCE_DEF_H
 #define __APP_CHASSIS_FORCE_DEF_H
 
-#include "app.h"       // 板间线协议类型 gimbal2chassis_data_t / chassis2gimbal_data_t / robot_mode
-#include "robot_def.h" // IMU 安装方向与位置宏
-#include "lib_math.h"
-#include "lib_fsm_table.h"
-#include "lib_chassis.h"             // LibChassisTorque_s（力分配输出）
+#include "robot_def.h"               // 机械/传动参数（减速比、电机方向、速度上限）
+#include "lib_math.h"                // vector3_t / M_PI
 #include "lib_chassis_half_rudder.h" // LIB_CHASSIS_HALF_RUDDER_NUM / 轮序
-#include "drvlib_bmi088_kalman.h"    // BMI088_Calib_s
-#include "drv_comm.h"                // CommInstance
 
 /*============================================
- *              电机方向（2026-10-18 实测）
- *============================================
- * 测试方法：四个电机分别发正力矩，观察反馈符号。
- * 结果：四个电机正力矩方向一致；反馈只有 wheel_l 为负（左右驱动轮镜像安装）。
- * 约定（与旧 app 相同，feedback/motor 必须成对取反，只反一个会变正反馈）：
- *   舵向 +：舵轮俯视逆时针（与车体系 +w 同向）
- *   轮向 +：沿当前舵角方向推动车体（不是"俯视逆时针"） */
-#define CHASSIS_RUDDER_L_DIR (1)
-#define CHASSIS_RUDDER_R_DIR (1)
-#define CHASSIS_WHEEL_L_DIR (1)
-#define CHASSIS_WHEEL_R_DIR (1)
-
-/*============================================
- *              机械/整定参数
+ *              校准/整定参数
  *============================================*/
-/* 舵向减速比：电机转 CHASSIS_STEER_GEAR_RATIO 圈 = 舵轮 1 圈。
- * 位置反馈在 drvlib_motor 里是"电机侧 rad"；换到舵轮侧时乘 INV。 */
-#define CHASSIS_STEER_GEAR_RATIO (8.0f)
-#define CHASSIS_STEER_GEAR_RATIO_INV (0.125f)
-
 /* 舵向位置环 WRAP 窗口 = 舵轮整圈 360°（电机侧 ±π×减速比，跨度 16π = 舵轮 2π）。
  * 换向决策会在 φ 与 φ+180° 两个等价解之间选，两者都落在这个窗口内：
  * 舵轮可以连续绕整圈，不会被 ±180° 的"机械端点"挡住。
@@ -53,16 +29,16 @@
 #define CHASSIS_STEER_WRAP_MIN (-M_PI * CHASSIS_STEER_GEAR_RATIO)
 #define CHASSIS_STEER_WRAP_MAX (M_PI * CHASSIS_STEER_GEAR_RATIO)
 
+/* 舵轮侧角度（°）→ 电机侧 rad：位置反馈在 drvlib_motor 里是"电机侧 rad"，
+ * 机械偏置按舵轮角度标定，换算到电机侧要乘减速比。 */
+#define STEER_WHEEL_DEG_TO_MOTOR_RAD(deg) ((deg) * (M_PI / 180.0f) * CHASSIS_STEER_GEAR_RATIO)
+
 /* 上电校准（光电门找零点）：两舵轮以恒定速度扫描，捕捉下降沿。
  * 单次超时只重试（漏采一圈很常见），连续 CHASSIS_CAL_MAX_RETRIES 次才判故障。
  * 5000 拍 × 2ms = 10s。 */
 #define CHASSIS_STEER_ZERO_SCAN_SPEED (24.0f) // 扫描速度（电机侧 rad/s）
 #define CHASSIS_CAL_TIMEOUT_TICKS (5000u)
 #define CHASSIS_CAL_MAX_RETRIES (3u)
-
-/* 舵向位置环输出限幅 = 速度给定上限（电机侧 rad/s）。
- * M3508 空载约 50rad/s，再大只会把速度环按在饱和里。 */
-#define CHASSIS_STEER_VMAX_MOTOR (50.0f)
 
 /* 校准后方向验证（云台使能时生效）：
  * 两驱动轮同时给 app 正方向的**小力矩** (Nm)，用来核对轮向与舵向零点：
@@ -101,6 +77,16 @@
 #define CHASSIS_RUDDER_PID_ANGLE_ERR_NORM_RANGE (0.0f) /* WRAP 下 Config 自动填 */
 #define CHASSIS_RUDDER_PID_ANGLE_OUT_MAX (CHASSIS_STEER_VMAX_MOTOR)
 #define CHASSIS_RUDDER_PID_ANGLE_OUT_MIN (-CHASSIS_STEER_VMAX_MOTOR)
+
+/*============================================
+ *              IMU / 杆臂补偿参数
+ *============================================*/
+#ifndef CHASSIS_IMU_ALPHA_LPF_RC
+#define CHASSIS_IMU_ALPHA_LPF_RC 0.02f // 角加速度低通时间常数 (s)，≈20ms
+#endif
+#ifndef CHASSIS_IMU_ALPHA_LIMIT
+#define CHASSIS_IMU_ALPHA_LIMIT 100.0f // 角加速度限幅 (rad/s²)，防差分尖峰
+#endif
 
 /*============================================
  *              类型
@@ -190,17 +176,7 @@ typedef struct
     float gravity_y; // N
 } ChassisForceCfg_s;
 
-extern ChassisForceCfg_s g_chassis_force_cfg;
-
-/* 实测底盘速度：vx/vy 来自轮速正解，w 由 IMU 底盘系 z 轴角速度覆盖 */
-extern vector3_t g_chassis_twist_fb;
-/* 力控输出广义力 (fx, fy, mw) */
-extern vector3_t g_chassis_wrench;
-/* 力分配输出：wheel_torque = 各轮**轮缘**驱动力矩 [N·m]（沿当前舵角，正=沿轮向+），
- * lateral_force = 舵轮侧向接触力 [N]。轮序 = 左/右舵；下发前还要经换向决策。 */
-extern LibChassisTorque_s g_chassis_torque;
-/* 上一拍速度指令（算惯性前馈的指令加速度） */
-extern vector3_t g_chassis_cmd_prev;
+/* 实体定义在 app_chassis_force.c。 */
 
 /*============================================
  *              舵向：速度逆解 + ±180° 分支
@@ -283,63 +259,6 @@ typedef struct
     uint8_t locked;                                  // 历史力矩锁定标志（当前恒 0）
 } ChassisCostSel_s;
 
-extern ChassisCostSel_s g_chassis_cost_sel;
-
-/*============================================
- *              常量
- *============================================*/
-/* 4x4 齐次变换：p_chassis = R · p_imu + t。
- * R 的三列 = IMU 的 x/y/z 轴在底盘系中的方向（宏在 robot_def.h）：
- *     x_imu = (−1, 1, 0)/√2   y_imu = (1, 1, 0)/√2   z_imu = (0, 0, −1)
- *     t     = IMU 中心在底盘系的位置。
- * 陀螺/加速度是方向量，用 Lib_Math_Mat4MulDir（不带平移）；
- * 点是位置量，用 Lib_Math_Mat4MulPoint（带平移）。 */
-extern const matrix4_t g_imu_to_chassis;
-
-/* 底盘车架上那颗 BMI088 的静态零偏（2026-10-17，ignore/chassis_data/imu.csv）
- * 录制条件：静置 112s、约 33℃、IMU 倒装（+z 朝下）。地面轻微不平按水平处理；
- * 陀螺零偏与安装倾角无关，故这里只标零偏，acc 的六位置标定尚未做。 */
-extern const BMI088_Calib_s g_bmi088_calib;
-
-/*============================================
- *              云台↔底盘通信
- *============================================*/
-extern CommInstance gimbal_comm; // COMM_DEF 定义的实例（def.c）
-
-extern gimbal2chassis_data_t g_gimbal2chassis_data; // 云台→底盘：速度指令 + 档位
-extern volatile robot_mode g_gimbal_mode_rx;        // 接收回调写的档位原始副本
-extern chassis2gimbal_data_t g_chassis2gimbal_data; // 底盘→云台：速度反馈
-
-/*============================================
- *              运行状态
- *============================================*/
-extern AppChassisImu_s g_imu_chassis; // 底盘系观测，供力控使用
-
-/* 杆臂补偿状态：
- * a_imu = a_center + α×r + ω×(ω×r)（r = IMU 相对底盘中心的位置）
- * ⇒ a_center = a_imu − α×r − ω×(ω×r)
- * α 由底盘系 gyro 差分得到；差分对噪声敏感，先经一阶低通再乘 r。 */
-extern vector3_t g_gyro_prev;     // 上一有效陀螺样本（底盘系）
-extern vector3_t g_alpha_lpf;     // 低通后的角加速度（底盘系）
-extern uint8_t g_gyro_prev_valid; // 0 = 还没有上一样本（首拍/掉线后）
-
-/* 驱动轮反馈（每拍更新，失能也更新） */
-extern AppWheelFeedback_s g_wheel_fb[APP_WHEEL_NUM];
-
-/*============================================
- *              校准 / 状态机状态
- *============================================*/
-extern ChassisFsmCtx_s g_chassis_fsm_ctx;
-extern LibFsmTableInstance_s g_chassis_fsm;
-
-extern uint8_t g_rudder_l_gate_state; // 上一拍光电门电平（判 1→0 下降沿）
-extern uint8_t g_rudder_r_gate_state;
-extern uint8_t g_rudder_l_inited; // 1 = 左舵已在光电门沿完成零点标定
-extern uint8_t g_rudder_r_inited;
-
-extern float g_rudder_l_setref; // 本拍舵向给定（电机侧 rad 或速度，取决于状态）
-extern float g_rudder_r_setref;
-extern float g_wheel_l_setref; // 本拍驱动轮给定力矩 (Nm)
-extern float g_wheel_r_setref;
+/* 以上类型的实体均定义在 app_chassis_force.c。 */
 
 #endif // !__APP_CHASSIS_FORCE_DEF_H

@@ -1,7 +1,9 @@
 #include "app_chassis_force.h"
 #include "app_cfg.h"
-#include "app_chassis_force_def.h" // 类型 + 全局变量（实体在 .def.c）
+#include "app_chassis_force_def.h" // 宏 + 类型（实体定义在本文件）
 //
+#include "app.h"       // gimbal2chassis_data_t / chassis2gimbal_data_t / robot_mode
+#include "robot_def.h" // IMU 安装方向与位置宏
 #include "lib_math.h"
 #include "bsp_sys_status.h"
 #include "bsp_gpio.h"
@@ -10,11 +12,14 @@
 #include "drvs_lkmotor_broadcast.h"
 #include "drvlib_bmi088_kalman.h"
 #include "drvlib_motor.h"
+#include "lib_chassis.h" // LibChassisTorque_s
 #include "lib_chassis_half_rudder.h"
+#include "lib_fsm_table.h"
 #include "lib_pid.h"
 
 #include "drv_comm.h"
 #include "comm_media_can_idseq.h"
+#include "comm_proto_ext.h"
 #include "drv_vofa.h"
 
 #include <string.h>
@@ -25,6 +30,101 @@ _Static_assert((int)LIB_CHASSIS_HALF_RUDDER_R == (int)APP_WHEEL_R, "wheel order 
 
 /* 日志实例（校准超时/故障上报；LOG_UART 未开时不发射代码） */
 LOG_INSTANCE_DEF(g_chassis_log, "chassis", 20);
+
+/*============================ 全局变量 / 常量 ============================*/
+/* 原 app_chassis_force_def.c 的实体定义集中在这里：
+ * 类型与宏在 app_chassis_force_def.h，实体只在真正使用它们的 .c 中定义。 */
+
+/*---------------- 云台↔底盘通信 ----------------*/
+/* CAN1 / IDSEQ / PROTO_EXT。底盘 tx_id=0x110 段、rx_id=0x100 段（云台侧对调）；
+ * 线上帧 = [0xA5][seq][汉明编码区 E][CRC8][0x5A]，payload 就是下面两个业务结构体。
+ * CAN1 上还有经典 CAN 的 RS05，故介质必须 CLASSIC，不能开 FD。 */
+COMM_DEF(gimbal_comm, MEDIA_CAN_IDSEQ, EXT, EXT, gimbal2chassis_data_t, 13, chassis2gimbal_data_t, 12, UNPACK_IN_ISR);
+
+gimbal2chassis_data_t g_gimbal2chassis_data = {0};      // 云台→底盘：速度指令 + 档位
+volatile robot_mode g_gimbal_mode_rx = robot_mode_stop; // 接收回调写的档位原始副本
+chassis2gimbal_data_t g_chassis2gimbal_data = {0};      // 底盘→云台：速度反馈
+
+/*---------------- 常量 ----------------*/
+/* 4x4 齐次变换：p_chassis = R · p_imu + t。
+ * R 的三列 = IMU 的 x/y/z 轴在底盘系中的方向（宏在 robot_def.h）：
+ *     x_imu = (−1, 1, 0)/√2   y_imu = (1, 1, 0)/√2   z_imu = (0, 0, −1)
+ *     t     = IMU 中心在底盘系的位置。
+ * 陀螺/加速度是方向量，用 Lib_Math_Mat4MulDir（不带平移）；
+ * 点是位置量，用 Lib_Math_Mat4MulPoint（带平移）。 */
+const matrix4_t g_imu_to_chassis = {
+    .data =
+        {
+            {CHASSIS_IMU_X_AXIS_X, CHASSIS_IMU_Y_AXIS_X, CHASSIS_IMU_Z_AXIS_X, CHASSIS_IMU_POS_X},
+            {CHASSIS_IMU_X_AXIS_Y, CHASSIS_IMU_Y_AXIS_Y, CHASSIS_IMU_Z_AXIS_Y, CHASSIS_IMU_POS_Y},
+            {CHASSIS_IMU_X_AXIS_Z, CHASSIS_IMU_Y_AXIS_Z, CHASSIS_IMU_Z_AXIS_Z, CHASSIS_IMU_POS_Z},
+            {0.0f, 0.0f, 0.0f, 1.0f},
+        },
+};
+
+/* 底盘车架上那颗 BMI088 的静态零偏（2026-10-17，ignore/chassis_data/imu.csv）
+ * 录制条件：静置 112s、约 33℃、IMU 倒装（+z 朝下）。地面轻微不平按水平处理；
+ * 陀螺零偏与安装倾角无关，故这里只标零偏，acc 的六位置标定尚未做。 */
+const BMI088_Calib_s g_bmi088_calib = {
+    .gyro = {.bias = {-0.000721f, -0.000027f, -0.000445f}},
+};
+
+/*---------------- 运行状态 ----------------*/
+AppChassisImu_s g_imu_chassis; // 底盘系观测，供力控使用
+
+/* 杆臂补偿状态：
+ * a_imu = a_center + α×r + ω×(ω×r)（r = IMU 相对底盘中心的位置）
+ * ⇒ a_center = a_imu − α×r − ω×(ω×r)
+ * α 由底盘系 gyro 差分得到；差分对噪声敏感，先经一阶低通再乘 r。 */
+vector3_t g_gyro_prev;     // 上一有效陀螺样本（底盘系）
+vector3_t g_alpha_lpf;     // 低通后的角加速度（底盘系）
+uint8_t g_gyro_prev_valid; // 0 = 还没有上一样本（首拍/掉线后）
+
+/* 驱动轮反馈（每拍更新，失能也更新） */
+AppWheelFeedback_s g_wheel_fb[APP_WHEEL_NUM];
+
+/*---------------- 力控 ----------------*/
+/* 反馈环参数见 app_chassis_force_def.h 的 CHASSIS_FORCE_* 宏（lib_pid 配置）。
+ * 前馈三组系数（摩擦/惯性/重力）按用户要求先全 0；
+ * 标定后在这里改，或运行期用调试器改。 */
+ChassisForceCfg_s g_chassis_force_cfg = {
+    .friction_x = 0.0f, // N
+    .friction_y = 0.0f, // N
+    .friction_w = 0.0f, // N·m
+
+    .mass = 0.0f,      // kg
+    .inertia_z = 0.0f, // kg·m²
+
+    .gravity_x = 0.0f, // N
+    .gravity_y = 0.0f, // N
+};
+
+/* 实测底盘速度：vx/vy 来自轮速正解，w 由 IMU 底盘系 z 轴角速度覆盖 */
+vector3_t g_chassis_twist_fb;
+/* 力控输出广义力 (fx, fy, mw) */
+vector3_t g_chassis_wrench;
+/* 力分配输出：wheel_torque = 各轮**轮缘**驱动力矩 [N·m]（沿当前舵角，正=沿轮向+），
+ * lateral_force = 舵轮侧向接触力 [N]。轮序 = 左/右舵；下发前还要经换向决策。 */
+LibChassisTorque_s g_chassis_torque;
+/* 上一拍速度指令（算惯性前馈的指令加速度） */
+vector3_t g_chassis_cmd_prev;
+
+/* 换向决策：0 初始化 = combo 0（两轮都不反）、无历史方案、未锁定 */
+ChassisCostSel_s g_chassis_cost_sel;
+
+/*---------------- 校准 / 状态机 ----------------*/
+ChassisFsmCtx_s g_chassis_fsm_ctx;
+LibFsmTableInstance_s g_chassis_fsm;
+
+uint8_t g_rudder_l_gate_state; // 上一拍光电门电平（判 1→0 下降沿）
+uint8_t g_rudder_r_gate_state;
+uint8_t g_rudder_l_inited; // 1 = 左舵已在光电门沿完成零点标定
+uint8_t g_rudder_r_inited;
+
+float g_rudder_l_setref; // 本拍舵向给定（电机侧 rad 或速度，取决于状态）
+float g_rudder_r_setref;
+float g_wheel_l_setref; // 本拍驱动轮给定力矩 (Nm)
+float g_wheel_r_setref;
 
 /*============================ 电机实例 ============================*/
 // 舵向：DJI M3508（C620），id2 / id4，共用 0x200 广播帧
@@ -50,12 +150,8 @@ static LibChassisInstance_s s_chassis;
 GPIO_INSTANCE_DEF(rudder_l_gate_io);
 GPIO_INSTANCE_DEF(rudder_r_gate_io);
 
-/* 位置反馈是"电机侧 rad"（舵轮 1 圈 = 电机 CHASSIS_STEER_GEAR_RATIO 圈），
- * 机械偏置按舵轮角度标定，换算到电机侧要乘减速比。 */
-#define STEER_WHEEL_DEG_TO_MOTOR_RAD(deg) ((deg) * (M_PI / 180.0f) * CHASSIS_STEER_GEAR_RATIO)
-
 /*============================ 云台↔底盘通信 ============================*/
-/* 实例、收发数据与类型都在 app_chassis_force_def.h/.c；
+/* 实例、收发数据与类型都在本文件/def.h；
  * 这里只保留接收回调（ISR 上下文，必须短小）。 */
 static void GimbalRecvOnFrame(const uint8_t *payload)
 {
@@ -69,17 +165,12 @@ static void GimbalRecvOnFrame(const uint8_t *payload)
 /*============================ 底盘 IMU ============================*/
 BMI088_KALMAN_INSTANCE_DEF(bmi088);
 
-/*============================ 杆臂补偿参数 ============================*/
+/*============================ 杆臂补偿 ============================*/
 /* a_imu = a_center + α×r + ω×(ω×r)（r = IMU 相对底盘中心的位置）
  * ⇒ a_center = a_imu − α×r − ω×(ω×r)
  * α 由底盘系 gyro 差分得到；差分对噪声敏感，先经一阶低通再乘 r。
- * 安装矩阵/IMU 标定值/观测状态都在 app_chassis_force_def.c。 */
-#ifndef CHASSIS_IMU_ALPHA_LPF_RC
-#define CHASSIS_IMU_ALPHA_LPF_RC 0.02f // 角加速度低通时间常数 (s)，≈20ms
-#endif
-#ifndef CHASSIS_IMU_ALPHA_LIMIT
-#define CHASSIS_IMU_ALPHA_LIMIT 100.0f // 角加速度限幅 (rad/s²)，防差分尖峰
-#endif
+ * 滤波/限幅参数见 app_chassis_force_def.h 的 CHASSIS_IMU_ALPHA_*；
+ * 安装矩阵/IMU 标定值/观测状态都在本文件。 */
 
 /*============================ 云台链路在线 ============================*/
 /* 看门狗实例内嵌在 media 基类里，收帧时由 comm 层统一喂狗。
