@@ -1,6 +1,7 @@
 #include "app_chassis_force.h"
 #include "app_cfg.h"
 #include "app_chassis_force_def.h" // 宏 + 类型（实体定义在本文件）
+#include "app_chassis_feedback.h"
 //
 #include "app.h"       // gimbal2chassis_data_t / chassis2gimbal_data_t / robot_mode
 #include "robot_def.h" // IMU 安装方向与位置宏
@@ -24,7 +25,7 @@
 
 #include <string.h>
 
-/* 换向决策里用 g_wheel_fb[i] 按舵轮序号取轮向反馈：两套轮序必须一致 */
+/* 换向决策里用 g_chassis_feedback.wheel[i] 按舵轮序号取轮向反馈：两套轮序必须一致 */
 _Static_assert((int)LIB_CHASSIS_HALF_RUDDER_L == (int)APP_WHEEL_L, "wheel order mismatch: L");
 _Static_assert((int)LIB_CHASSIS_HALF_RUDDER_R == (int)APP_WHEEL_R, "wheel order mismatch: R");
 
@@ -70,18 +71,9 @@ const BMI088_Calib_s g_bmi088_calib = {
 };
 
 /*---------------- 运行状态 ----------------*/
-AppChassisImu_s g_imu_chassis; // 底盘系观测，供力控使用
-
-/* 杆臂补偿状态：
- * a_imu = a_center + α×r + ω×(ω×r)（r = IMU 相对底盘中心的位置）
- * ⇒ a_center = a_imu − α×r − ω×(ω×r)
- * α 由底盘系 gyro 差分得到；差分对噪声敏感，先经一阶低通再乘 r。 */
-vector3_t g_gyro_prev;     // 上一有效陀螺样本（底盘系）
-vector3_t g_alpha_lpf;     // 低通后的角加速度（底盘系）
-uint8_t g_gyro_prev_valid; // 0 = 还没有上一样本（首拍/掉线后）
-
-/* 驱动轮反馈（每拍更新，失能也更新） */
-AppWheelFeedback_s g_wheel_fb[APP_WHEEL_NUM];
+/* 反馈处理结果：底盘系 IMU、驱动轮反馈、正解状态、twist。
+ * 滤波/差分等内部状态封装在 app_chassis_feedback.c。 */
+ChassisFeedback_s g_chassis_feedback;
 
 /*---------------- 力控 ----------------*/
 /* 反馈环参数见 app_chassis_force_def.h 的 CHASSIS_FORCE_* 宏（lib_pid 配置）。
@@ -830,13 +822,16 @@ void AppChassisInit(void)
     };
     BSP_ASSERT_APP_CALL(BMI088KalmanConfig(&bmi088, &bmi088_cfg));
 
-    // IMU 原点 (0,0,0) 经齐次变换得到它在底盘系的位置（旋转 + 平移一起验证）
-    g_imu_chassis.pos = Lib_Math_Mat4MulPoint(g_imu_to_chassis, (vector3_t){0.0f, 0.0f, 0.0f});
-
-    // 杆臂补偿状态复位
-    g_gyro_prev = (vector3_t){0.0f, 0.0f, 0.0f};
-    g_alpha_lpf = (vector3_t){0.0f, 0.0f, 0.0f};
-    g_gyro_prev_valid = 0;
+    /* ---- 反馈处理：配置 + 复位 ----
+     * IMU 安装位置由模块从齐次变换算出（原点经旋转+平移），滤波/差分状态在模块内部。 */
+    ChassisFeedbackCfg_s feedback_cfg = {
+        .imu_to_chassis = &g_imu_to_chassis,
+        .chassis = &s_chassis,
+        .wheel_dir = {(float)CHASSIS_WHEEL_L_DIR, (float)CHASSIS_WHEEL_R_DIR},
+        .steer_gear_ratio_inv = CHASSIS_STEER_GEAR_RATIO_INV,
+        .drive_reduction = CHASSIS_DRIVE_REDUCTION,
+    };
+    ChassisFeedbackInit(&feedback_cfg);
 
     /* ---- 顶层状态机：上电从校准起，等两个光电门标定完再判在线/使能 ---- */
     LibFsmTableConfig_s chassis_fsm_cfg = {
@@ -861,47 +856,21 @@ void AppChassisRun(float dt, uint64_t time_stamp)
     BMI088KalmanUpdate(&bmi088);
     const BMI088Kalman_Data_t imu = BMI088KalmanGetData(&bmi088);
 
-    /* IMU 系 → 底盘系（方向量，不带平移） */
-    const vector3_t gyro_imu = {imu.gyro[0], imu.gyro[1], imu.gyro[2]};
-    const vector3_t acc_imu = {imu.acc[0], imu.acc[1], imu.acc[2]};
-    const vector3_t gyro = Lib_Math_Mat4MulDir(g_imu_to_chassis, gyro_imu);
-    const vector3_t acc_chassis = Lib_Math_Mat4MulDir(g_imu_to_chassis, acc_imu);
-
-    g_imu_chassis.gyro = gyro;
-    g_imu_chassis.yaw_rate = imu.yaw_rate; // world 竖直轴，与安装方向无关
-    g_imu_chassis.valid = imu.valid;
-
-    /* 角加速度：只在有新陀螺样本时差分（imu.dt == 0 = 本拍没新样本，保持上次 α）。
-     * 直接差分噪声大，先限幅再做一阶低通；RC 见 CHASSIS_IMU_ALPHA_LPF_RC。 */
-    if (imu.dt > 0.0f)
-    {
-        if (g_gyro_prev_valid)
-        {
-            const float dt_a = imu.dt;
-            vector3_t alpha = Lib_Math_Vec3Scale(Lib_Math_Vec3Sub(gyro, g_gyro_prev), 1.0f / dt_a);
-            alpha.x = Lib_Math_Clamp(alpha.x, -CHASSIS_IMU_ALPHA_LIMIT, CHASSIS_IMU_ALPHA_LIMIT);
-            alpha.y = Lib_Math_Clamp(alpha.y, -CHASSIS_IMU_ALPHA_LIMIT, CHASSIS_IMU_ALPHA_LIMIT);
-            alpha.z = Lib_Math_Clamp(alpha.z, -CHASSIS_IMU_ALPHA_LIMIT, CHASSIS_IMU_ALPHA_LIMIT);
-
-            const float k = dt_a / (CHASSIS_IMU_ALPHA_LPF_RC + dt_a);
-            g_alpha_lpf.x += (alpha.x - g_alpha_lpf.x) * k;
-            g_alpha_lpf.y += (alpha.y - g_alpha_lpf.y) * k;
-            g_alpha_lpf.z += (alpha.z - g_alpha_lpf.z) * k;
-        }
-        g_gyro_prev = gyro;
-        g_gyro_prev_valid = 1;
-    }
-
-    /* 杆臂补偿：a_center = a_imu − α×r − ω×(ω×r) */
-    const vector3_t centripetal = Lib_Math_Vec3Cross(gyro, Lib_Math_Vec3Cross(gyro, g_imu_chassis.pos));
-    const vector3_t tangential = Lib_Math_Vec3Cross(g_alpha_lpf, g_imu_chassis.pos);
-    g_imu_chassis.acc = Lib_Math_Vec3Sub(Lib_Math_Vec3Sub(acc_chassis, tangential), centripetal);
+    /* 反馈处理：IMU 安装矩阵旋转 → 底盘系、角加速度差分+低通、杆臂补偿到质心 */
+    const ChassisFeedbackImuInput_s feedback_imu = {
+        .gyro = {imu.gyro[0], imu.gyro[1], imu.gyro[2]},
+        .acc = {imu.acc[0], imu.acc[1], imu.acc[2]},
+        .yaw_rate = imu.yaw_rate,
+        .dt = imu.dt,
+        .valid = imu.valid,
+    };
+    ChassisFeedbackUpdateImu(&feedback_imu, &g_chassis_feedback);
 
     /*============================ 电机反馈 ============================*/
     /* 每拍都读、都喂给控制核：失能期间也必须持续处理反馈，否则手动转动舵向电机后
      * 多圈累加与真实位置脱节，再使能的第一拍位置会跳。
      * 方向：反馈一律先取协议原始量，舵向由 drvlib 的 feedback_direction 统一修正；
-     *       驱动轮不走 drvlib，这里按 CHASSIS_WHEEL_x_DIR 换算到 app 正方向。 */
+     *       驱动轮不走 drvlib，由 feedback 模块按 CHASSIS_WHEEL_x_DIR 换算到 app 正方向。 */
     const DrvsDJIMotorBroadcastData_s rudder_l_data = DrvsDJIMotorBroadcastGetData(&rudder_l_motor);
     const DrvsDJIMotorBroadcastData_s rudder_r_data = DrvsDJIMotorBroadcastGetData(&rudder_r_motor);
     const DrvlibMotorFeedback_s rudder_l_fb = {
@@ -919,16 +888,27 @@ void AppChassisRun(float dt, uint64_t time_stamp)
 
     const DrvsLKMotorBroadcastData_s wheel_l_data = DrvsLKMotorBroadcastGetData(&wheel_l_motor);
     const DrvsLKMotorBroadcastData_s wheel_r_data = DrvsLKMotorBroadcastGetData(&wheel_r_motor);
-    g_wheel_fb[APP_WHEEL_L].speed = wheel_l_data.speed * (float)CHASSIS_WHEEL_L_DIR;
-    g_wheel_fb[APP_WHEEL_L].torque = wheel_l_data.torque * (float)CHASSIS_WHEEL_L_DIR;
-    g_wheel_fb[APP_WHEEL_L].current = wheel_l_data.current * (float)CHASSIS_WHEEL_L_DIR;
-    g_wheel_fb[APP_WHEEL_L].temperature = wheel_l_data.temperature;
-    g_wheel_fb[APP_WHEEL_L].error = wheel_l_data.echo;
-    g_wheel_fb[APP_WHEEL_R].speed = wheel_r_data.speed * (float)CHASSIS_WHEEL_R_DIR;
-    g_wheel_fb[APP_WHEEL_R].torque = wheel_r_data.torque * (float)CHASSIS_WHEEL_R_DIR;
-    g_wheel_fb[APP_WHEEL_R].current = wheel_r_data.current * (float)CHASSIS_WHEEL_R_DIR;
-    g_wheel_fb[APP_WHEEL_R].temperature = wheel_r_data.temperature;
-    g_wheel_fb[APP_WHEEL_R].error = wheel_r_data.echo;
+    const ChassisFeedbackWheelInput_s feedback_wheel = {
+        .wheel = {
+            [APP_WHEEL_L] =
+                {
+                    .speed = wheel_l_data.speed,
+                    .torque = wheel_l_data.torque,
+                    .current = wheel_l_data.current,
+                    .temperature = wheel_l_data.temperature,
+                    .error = wheel_l_data.echo,
+                },
+            [APP_WHEEL_R] =
+                {
+                    .speed = wheel_r_data.speed,
+                    .torque = wheel_r_data.torque,
+                    .current = wheel_r_data.current,
+                    .temperature = wheel_r_data.temperature,
+                    .error = wheel_r_data.echo,
+                },
+        },
+    };
+    ChassisFeedbackUpdateWheels(&feedback_wheel, &g_chassis_feedback);
 
     /*============================ 按状态生成给定 ============================*/
     /* 顺序约定：① 状态给定（舵向在本拍喂反馈 + 算下发量）→ ② 校准判光电门（用 ① 刚刷新
@@ -1021,27 +1001,15 @@ void AppChassisRun(float dt, uint64_t time_stamp)
     // 采样四个条件 + 变化才派发；状态变化从下一拍生效
     ChassisFsmUpdate();
 
-    /*============================ 正解 + 力控 ============================*/
-    /* 轮速正解：舵角取本拍 SetRef 刚刷新的 data.position（电机侧 rad），换算到舵轮侧；
-     * 轮速用 app 正方向（= 沿当前舵角推动车体），与内核驱动行的符号约定一致。 */
-    LibChassisState_s chassis_state = {0};
-    chassis_state.steer_angle[LIB_CHASSIS_HALF_RUDDER_L] = (float)rudder_l_ctrl.data.position * CHASSIS_STEER_GEAR_RATIO_INV;
-    chassis_state.steer_angle[LIB_CHASSIS_HALF_RUDDER_R] = (float)rudder_r_ctrl.data.position * CHASSIS_STEER_GEAR_RATIO_INV;
-    chassis_state.wheel_speed[LIB_CHASSIS_HALF_RUDDER_L] = g_wheel_fb[APP_WHEEL_L].speed / CHASSIS_DRIVE_REDUCTION;
-    chassis_state.wheel_speed[LIB_CHASSIS_HALF_RUDDER_R] = g_wheel_fb[APP_WHEEL_R].speed / CHASSIS_DRIVE_REDUCTION;
-
-    vector3_t twist;
-    if (LibChassisForward(&s_chassis, &chassis_state, &twist) == 0)
-    {
-        g_chassis_twist_fb = twist;
-    }
-    else
-    {
-        /* 几何退化（JᵀJ 奇异）：不喂假反馈 */
-        g_chassis_twist_fb = (vector3_t){0.0f, 0.0f, 0.0f};
-    }
-    /* w 反馈用 IMU 底盘系 z 轴角速度（与轮速正解解耦；IMU 不可用时置 0） */
-    g_chassis_twist_fb.z = (g_imu_chassis.valid != 0u) ? g_imu_chassis.gyro.z : 0.0f;
+    /*============================ 反馈正解 + 力控 ============================*/
+    /* 轮速正解：舵角取本拍 SetRef 刚刷新的 data.position（电机侧 rad），
+     * 轮速用 app 正方向；w 由 IMU 覆盖，均在 feedback 模块内完成。 */
+    const float steer_motor_pos[LIB_CHASSIS_HALF_RUDDER_NUM] = {
+        [LIB_CHASSIS_HALF_RUDDER_L] = (float)rudder_l_ctrl.data.position,
+        [LIB_CHASSIS_HALF_RUDDER_R] = (float)rudder_r_ctrl.data.position,
+    };
+    ChassisFeedbackUpdateKinematics(steer_motor_pos, &g_chassis_feedback);
+    g_chassis_twist_fb = g_chassis_feedback.twist;
 
     /* 速度指令 → 广义力 → 舵角/轮向力矩。
      * 只在 RUN（已校准且云台使能）计算，其余状态输出清零。
@@ -1052,7 +1020,7 @@ void AppChassisRun(float dt, uint64_t time_stamp)
     if (state == CHASSIS_STATE_RUN)
     {
         g_chassis_wrench = ChassisForceSolve(&g_gimbal2chassis_data, &g_chassis_twist_fb, dt_s);
-        ChassisVelocitySteerSelect(&g_gimbal2chassis_data, &chassis_state, g_chassis_wrench);
+        ChassisVelocitySteerSelect(&g_gimbal2chassis_data, &g_chassis_feedback.state, g_chassis_wrench);
     }
     else
     {
@@ -1098,13 +1066,13 @@ void AppChassisRun(float dt, uint64_t time_stamp)
         /* 目标角内部是连续表达（可能 >180°），遥测统一折到 (−180°,180°] 与实测同系；
          * 遥控判换向时看角度差即可（wrap 差），不要直接减。 */
         VofaSetChannel(1, Lib_Math_WrapAngleNegPIToPI(g_chassis_cost_sel.angle_target[LIB_CHASSIS_HALF_RUDDER_L]) * r2d); // 左舵目标 (deg)
-        VofaSetChannel(2, chassis_state.steer_angle[LIB_CHASSIS_HALF_RUDDER_L] * r2d);                                    // 左舵实际 (deg)
+        VofaSetChannel(2, g_chassis_feedback.state.steer_angle[LIB_CHASSIS_HALF_RUDDER_L] * r2d);                         // 左舵实际 (deg)
         VofaSetChannel(3, Lib_Math_WrapAngleNegPIToPI(g_chassis_cost_sel.angle_target[LIB_CHASSIS_HALF_RUDDER_R]) * r2d); // 右舵目标 (deg)
-        VofaSetChannel(4, chassis_state.steer_angle[LIB_CHASSIS_HALF_RUDDER_R] * r2d);                                    // 右舵实际 (deg)
+        VofaSetChannel(4, g_chassis_feedback.state.steer_angle[LIB_CHASSIS_HALF_RUDDER_R] * r2d);                         // 右舵实际 (deg)
         VofaSetChannel(5, g_chassis_cost_sel.wheel_torque[LIB_CHASSIS_HALF_RUDDER_L]);                                    // 左轮目标 (N·m)
-        VofaSetChannel(6, g_wheel_fb[APP_WHEEL_L].torque * CHASSIS_DRIVE_REDUCTION);                                      // 左轮实测 (N·m)
+        VofaSetChannel(6, g_chassis_feedback.wheel[APP_WHEEL_L].torque * CHASSIS_DRIVE_REDUCTION);                        // 左轮实测 (N·m)
         VofaSetChannel(7, g_chassis_cost_sel.wheel_torque[LIB_CHASSIS_HALF_RUDDER_R]);                                    // 右轮目标 (N·m)
-        VofaSetChannel(8, g_wheel_fb[APP_WHEEL_R].torque * CHASSIS_DRIVE_REDUCTION);                                      // 右轮实测 (N·m)
+        VofaSetChannel(8, g_chassis_feedback.wheel[APP_WHEEL_R].torque * CHASSIS_DRIVE_REDUCTION);                        // 右轮实测 (N·m)
         VofaSetChannel(9, (float)g_chassis_cost_sel.combo);                                                               // 换向方案 0~3
         VofaSetChannel(10, g_chassis_cost_sel.cost[0]);                                                                   // 组合代价 (s)
         VofaSetChannel(11, g_chassis_cost_sel.cost[1]);
@@ -1117,17 +1085,17 @@ void AppChassisRun(float dt, uint64_t time_stamp)
         /* CH18~28：命令 / 反馈 / 力控中间量。换向乱转的定位关键是
          * "期望力方向为什么转" —— 对比 CH18~20（指令）与 CH21~23（反馈），
          * 再看 CH24~26 是否跟着转，就能区分指令在转、反馈在转还是分配在转。 */
-        VofaSetChannel(18, g_gimbal2chassis_data.vx);                                // 指令 vx (m/s)
-        VofaSetChannel(19, g_gimbal2chassis_data.vy);                                // 指令 vy (m/s)
-        VofaSetChannel(20, g_gimbal2chassis_data.w);                                 // 指令 w (rad/s)
-        VofaSetChannel(21, g_chassis_twist_fb.x);                                    // 反馈 vx (m/s，轮速正解)
-        VofaSetChannel(22, g_chassis_twist_fb.y);                                    // 反馈 vy (m/s，轮速正解)
-        VofaSetChannel(23, g_chassis_twist_fb.z);                                    // 反馈 w (rad/s，IMU)
-        VofaSetChannel(24, g_chassis_wrench.x);                                      // 期望力 fx (N)
-        VofaSetChannel(25, g_chassis_wrench.y);                                      // 期望力 fy (N)
-        VofaSetChannel(26, g_chassis_wrench.z);                                      // 期望力矩 mw (N·m)
-        VofaSetChannel(27, g_wheel_fb[APP_WHEEL_L].speed / CHASSIS_DRIVE_REDUCTION); // 左驱动轮轮速 (rad/s)
-        VofaSetChannel(28, g_wheel_fb[APP_WHEEL_R].speed / CHASSIS_DRIVE_REDUCTION); // 右驱动轮轮速 (rad/s)
+        VofaSetChannel(18, g_gimbal2chassis_data.vx);                                              // 指令 vx (m/s)
+        VofaSetChannel(19, g_gimbal2chassis_data.vy);                                              // 指令 vy (m/s)
+        VofaSetChannel(20, g_gimbal2chassis_data.w);                                               // 指令 w (rad/s)
+        VofaSetChannel(21, g_chassis_twist_fb.x);                                                  // 反馈 vx (m/s，轮速正解)
+        VofaSetChannel(22, g_chassis_twist_fb.y);                                                  // 反馈 vy (m/s，轮速正解)
+        VofaSetChannel(23, g_chassis_twist_fb.z);                                                  // 反馈 w (rad/s，IMU)
+        VofaSetChannel(24, g_chassis_wrench.x);                                                    // 期望力 fx (N)
+        VofaSetChannel(25, g_chassis_wrench.y);                                                    // 期望力 fy (N)
+        VofaSetChannel(26, g_chassis_wrench.z);                                                    // 期望力矩 mw (N·m)
+        VofaSetChannel(27, g_chassis_feedback.wheel[APP_WHEEL_L].speed / CHASSIS_DRIVE_REDUCTION); // 左驱动轮轮速 (rad/s)
+        VofaSetChannel(28, g_chassis_feedback.wheel[APP_WHEEL_R].speed / CHASSIS_DRIVE_REDUCTION); // 右驱动轮轮速 (rad/s)
         VofaSend();
     }
 }
