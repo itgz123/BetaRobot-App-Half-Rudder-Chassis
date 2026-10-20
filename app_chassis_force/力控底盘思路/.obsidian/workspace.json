@@ -4,27 +4,39 @@
     "type": "split",
     "children": [
       {
-        "id": "59cd69138354ebfe",
+        "id": "3e072ba9c82f3347",
         "type": "tabs",
         "children": [
           {
-            "id": "85e0db3a3ffa5c79",
+            "id": "2a35af7534f449fd",
             "type": "leaf",
             "state": {
-              "type": "canvas",
+              "type": "markdown",
               "state": {
-                "file": "简化方案/简化方案.canvas",
-                "viewState": {
-                  "x": -3916,
-                  "y": -1848,
-                  "zoom": -0.24441872766644712
-                }
+                "file": "方案/rls辨识.md",
+                "mode": "source",
+                "source": false
               },
-              "icon": "lucide-layout-dashboard",
-              "title": "简化方案"
+              "icon": "lucide-file",
+              "title": "rls辨识"
+            }
+          },
+          {
+            "id": "1f25ec37d87c5e80",
+            "type": "leaf",
+            "state": {
+              "type": "markdown",
+              "state": {
+                "file": "其他.md",
+                "mode": "source",
+                "source": false
+              },
+              "icon": "lucide-file",
+              "title": "其他"
             }
           }
-        ]
+        ],
+        "currentTab": 1
       }
     ],
     "direction": "vertical"
@@ -191,13 +203,30 @@
       "bases:新建数据库": false
     }
   },
-  "active": "85e0db3a3ffa5c79",
+  "active": "89a76c98ba5c7066",
   "lastOpenFiles": [
-    "简化方案/广义力分解.md",
+    "其他.md",
+    "方案/rls辨识.md",
+    "方案/check_list.md",
+    "方案/反馈处理.md",
+    "方案/思路.canvas",
+    "方案/反馈.md",
+    "方案/命令.md",
+    "方案/闭环.md",
+    "方案/输出.md",
     "简化方案/简化方案.canvas",
+    "简化方案/rls功率控制.md",
+    "简化方案/命令.md",
+    "简化方案/垃圾转向方案.md",
+    "简化方案/广义力分解.md",
+    "简化方案/给到电机.md",
+    "简化方案/反馈.md",
+    "简化方案/舵向转向方案.md",
+    "简化方案/闭环.md",
+    "方案",
+    "未命名 1.md",
     "简化方案优化/简化方案.canvas",
     "简化方案优化/垃圾转向方案.md",
-    "简化方案/垃圾转向方案.md",
     "简化方案优化/广义力分解.md",
     "简化方案优化/反馈.md",
     "简化方案优化/舵向转向方案.md",
@@ -205,17 +234,8 @@
     "舵轮策略.md",
     "简化方案优化/命令.md",
     "简化方案优化/rls功率控制.md",
-    "简化方案优化/给到电机.md",
     "简化方案优化",
-    "简化方案/闭环.md",
-    "未命名.md",
-    "简化方案/舵向转向方案.md",
-    "简化方案/命令.md",
-    "简化方案/rls功率控制.md",
-    "简化方案/给到电机.md",
-    "简化方案/反馈.md",
     "完整方案",
-    "简化方案",
-    "欢迎.md"
+    "简化方案"
   ]
 }

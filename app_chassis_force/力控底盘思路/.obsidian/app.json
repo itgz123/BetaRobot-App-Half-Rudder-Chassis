@@ -9,5 +9,6 @@
   "showLineNumber": true,
   "showIndentGuide": true,
   "spellcheck": false,
-  "autoPairBrackets": false
+  "autoPairBrackets": false,
+  "autoConvertHtml": true
 }
