@@ -3,6 +3,7 @@
 #include "app_chassis_force_def.h" // 宏 + 类型（实体定义在本文件）
 #include "app_chassis_feedback.h"
 #include "app_chassis_fsm.h"
+#include "app_chassis_force_loop.h"
 //
 #include "app.h"       // gimbal2chassis_data_t / chassis2gimbal_data_t / robot_mode
 #include "robot_def.h" // IMU 安装方向与位置宏
@@ -16,7 +17,6 @@
 #include "drvlib_motor.h"
 #include "lib_chassis.h" // LibChassisTorque_s
 #include "lib_chassis_half_rudder.h"
-#include "lib_pid.h"
 
 #include "drv_comm.h"
 #include "comm_media_can_idseq.h"
@@ -76,7 +76,8 @@ const BMI088_Calib_s g_bmi088_calib = {
 ChassisFeedback_s g_chassis_feedback;
 
 /*---------------- 力控 ----------------*/
-/* 反馈环参数见 app_chassis_force_def.h 的 CHASSIS_FORCE_* 宏（lib_pid 配置）。
+/* 闭环（PID + 前馈）在 app_chassis_force_loop.c，方案开关见 app_chassis_force_def.h 的
+ * CHASSIS_CLOSED_LOOP_SCHEME 与 CHASSIS_FORCE_* 宏。
  * 前馈三组系数（摩擦/惯性/重力）按用户要求先全 0；
  * 标定后在这里改，或运行期用调试器改。 */
 ChassisForceCfg_s g_chassis_force_cfg = {
@@ -98,8 +99,6 @@ vector3_t g_chassis_wrench;
 /* 力分配输出：wheel_torque = 各轮**轮缘**驱动力矩 [N·m]（沿当前舵角，正=沿轮向+），
  * lateral_force = 舵轮侧向接触力 [N]。轮序 = 左/右舵；下发前还要经换向决策。 */
 LibChassisTorque_s g_chassis_torque;
-/* 上一拍速度指令（算惯性前馈的指令加速度） */
-vector3_t g_chassis_cmd_prev;
 
 /* 换向决策：0 初始化 = combo 0（两轮都不反）、无历史方案、未锁定 */
 ChassisCostSel_s g_chassis_cost_sel;
@@ -169,130 +168,6 @@ static uint8_t GimbalCommIsOnline(void)
 {
     const CommMedia *media = (const CommMedia *)gimbal_comm.media; // 首成员即 CommMedia 基类
     return (uint8_t)((media != NULL && media->daemon != NULL) ? DaemonIsOnline(media->daemon) : 1);
-}
-
-/*============================ 力控：速度误差 → 广义力 ============================*/
-/**
- * @brief 由速度指令与实测速度算出底盘广义力 (fx, fy, mw)
- * @param cmd      云台速度指令（车体系 vx 前 / vy 左 / w 逆时针）
- * @param twist_fb 实测速度：vx/vy 来自轮速正解，w 来自 IMU 底盘系 z 轴角速度
- * @param dt_s     本拍步长 (s)
- * @return W = (fx [N], fy [N], mw [N·m])
- * @note 三个通道的反馈都由 lib_pid 计算；平动为 P，yaw 为 PI（消稳态偏航漂移）。
- * @note 前馈三项（摩擦/惯性/重力）系数当前全 0：代码路径已接通，填数即生效。
- *       - 摩擦：沿**指令**速度符号施加（指令过零不施加，避免静止抖动）；
- *       - 惯性：指令加速度 = 本拍指令 − 上一拍指令 的差分，乘 mass / inertia_z；
- *       - 重力：车体系固定分量，平面行驶为 0，坡道标定后填。
- * @note 指令加速度用纯差分，未做低通；系数为 0 时无影响，正式标定时再看是否需要滤波。
- */
-/* 力控反馈 PID 实例（只在 RUN 更新；离开 RUN 由 ChassisForceReset 清状态） */
-static PIDInstance s_force_pid_vx;
-static PIDInstance s_force_pid_vy;
-static PIDInstance s_force_pid_w;
-static uint8_t s_force_pid_inited;
-
-static const PID_Init_Config_s s_force_pid_cfg_vx = {
-    .kp = CHASSIS_FORCE_VX_KP,
-    .ki = 0.0f,
-    .kd = 0.0f,
-    .deadband = CHASSIS_FORCE_XY_DEADBAND,
-    .out_lpf_rc = CHASSIS_FORCE_XY_LPF_RC,
-    .config_mask = PID_ENABLE_DEADBAND | PID_ENABLE_OUTPUT_FILTER,
-};
-
-static const PID_Init_Config_s s_force_pid_cfg_vy = {
-    .kp = CHASSIS_FORCE_VY_KP,
-    .ki = 0.0f,
-    .kd = 0.0f,
-    .deadband = CHASSIS_FORCE_XY_DEADBAND,
-    .out_lpf_rc = CHASSIS_FORCE_XY_LPF_RC,
-    .config_mask = PID_ENABLE_DEADBAND | PID_ENABLE_OUTPUT_FILTER,
-};
-
-static const PID_Init_Config_s s_force_pid_cfg_w = {
-    .kp = CHASSIS_FORCE_W_KP,
-    .ki = CHASSIS_FORCE_W_KI,
-    .kd = 0.0f,
-    .integral_limit = CHASSIS_FORCE_W_INTEGRAL_LIMIT,
-    .out_lpf_rc = CHASSIS_FORCE_W_LPF_RC,
-    /* 不开 DEADBAND：它会把 i_out 清零（见 def.h 的说明） */
-    .config_mask = PID_ENABLE_INTEGRAL_LIMIT | PID_ENABLE_OUTPUT_FILTER,
-};
-
-static void ChassisForceReset(void)
-{
-    LibPIDReset(&s_force_pid_vx);
-    LibPIDReset(&s_force_pid_vy);
-    LibPIDReset(&s_force_pid_w);
-}
-
-/* 首次进 RUN 时初始化（配置是常量，重复初始化只会白清状态） */
-static void ChassisForcePidEnsureInit(void)
-{
-    if (s_force_pid_inited != 0u)
-    {
-        return;
-    }
-    LibPIDInit(&s_force_pid_vx, &s_force_pid_cfg_vx);
-    LibPIDInit(&s_force_pid_vy, &s_force_pid_cfg_vy);
-    LibPIDInit(&s_force_pid_w, &s_force_pid_cfg_w);
-    s_force_pid_inited = 1u;
-}
-
-static vector3_t ChassisForceSolve(const gimbal2chassis_data_t *cmd, const vector3_t *twist_fb, float dt_s)
-{
-    const ChassisForceCfg_s *c = &g_chassis_force_cfg;
-
-    /* 指令加速度（惯性前馈）：dt 非正时置 0，避免除零/首拍尖峰 */
-    float a_vx = 0.0f;
-    float a_vy = 0.0f;
-    float a_w = 0.0f;
-    if (dt_s > 0.0f)
-    {
-        a_vx = (cmd->vx - g_chassis_cmd_prev.x) / dt_s;
-        a_vy = (cmd->vy - g_chassis_cmd_prev.y) / dt_s;
-        a_w = (cmd->w - g_chassis_cmd_prev.z) / dt_s;
-    }
-
-    /* 前馈：摩擦（沿指令方向）+ 惯性 + 重力/坡道 */
-    float ff_x = c->mass * a_vx + c->gravity_x;
-    float ff_y = c->mass * a_vy + c->gravity_y;
-    float ff_w = c->inertia_z * a_w;
-    if (cmd->vx > 0.0f)
-    {
-        ff_x += c->friction_x;
-    }
-    else if (cmd->vx < 0.0f)
-    {
-        ff_x -= c->friction_x;
-    }
-    if (cmd->vy > 0.0f)
-    {
-        ff_y += c->friction_y;
-    }
-    else if (cmd->vy < 0.0f)
-    {
-        ff_y -= c->friction_y;
-    }
-    if (cmd->w > 0.0f)
-    {
-        ff_w += c->friction_w;
-    }
-    else if (cmd->w < 0.0f)
-    {
-        ff_w -= c->friction_w;
-    }
-
-    /* 反馈：三个 lib_pid 统一计算（前馈作为 feedforward 参数传入）。
-     * 平动通道的死区/输出低通见 def.h：轮速正解在舵轮偏转/高转速下的噪声远大于
-     * 真实平移，不抑制会产生与偏航力同量级的假力。
-     * yaw 通道用 PI：纯 P 留下与偏航阻力成正比的稳态误差（实测 w 漂移）。 */
-    ChassisForcePidEnsureInit();
-    vector3_t wrench;
-    wrench.x = LibPIDCalculate(&s_force_pid_vx, cmd->vx, twist_fb->x, ff_x, dt_s);
-    wrench.y = LibPIDCalculate(&s_force_pid_vy, cmd->vy, twist_fb->y, ff_y, dt_s);
-    wrench.z = LibPIDCalculate(&s_force_pid_w, cmd->w, twist_fb->z, ff_w, dt_s);
-    return wrench;
 }
 
 /*============================ 舵角：速度逆解 + 力投影 ============================*/
@@ -772,6 +647,13 @@ void AppChassisInit(void)
     };
     ChassisFeedbackInit(&feedback_cfg);
 
+    /* ---- 闭环：PID 反馈 + 前馈 ----
+     * 前馈系数引用全局配置，运行期仍可用调试器改。 */
+    const ChassisForceLoopCfg_s force_loop_cfg = {
+        .force_cfg = &g_chassis_force_cfg,
+    };
+    ChassisForceLoopInit(&force_loop_cfg);
+
     /* ---- 顶层状态机：上电从校准起，等两个光电门标定完再判在线/使能 ----
      * 迁移/计时/派发在 app_chassis_fsm.c，这里只提供条件采样与进入动作。 */
     const ChassisFsmCfg_s chassis_fsm_cfg = {
@@ -951,25 +833,28 @@ void AppChassisRun(float dt, uint64_t time_stamp)
     g_chassis_twist_fb = g_chassis_feedback.twist;
 
     /* 速度指令 → 广义力 → 舵角/轮向力矩。
-     * 只在 RUN（已校准且云台使能）计算，其余状态输出清零。
+     * 闭环在 app_chassis_force_loop.c：非 RUN 时模块内部清 PID 状态并输出 0，
+     * 但每拍仍记录指令供下一拍算惯性前馈。
      * 舵角：由 (vx,vy,w) 的速度逆解直接给出，力分配不再改变它；
      * 轮向：用目标舵向构造 J 的驱动行，把 3 个广义力投影到这两个方向上，
      *       只下发驱动行力矩，侧向力丢弃。结果见 g_chassis_cost_sel，
      *       下一拍由 RUN 分支下发。 */
+    const ChassisForceLoopInput_s force_loop_in = {
+        .cmd = {g_gimbal2chassis_data.vx, g_gimbal2chassis_data.vy, g_gimbal2chassis_data.w},
+        .twist_fb = g_chassis_twist_fb,
+        .dt = dt_s,
+    };
+    g_chassis_wrench = ChassisForceLoopUpdate(&force_loop_in, (uint8_t)(state == CHASSIS_STATE_RUN));
     if (state == CHASSIS_STATE_RUN)
     {
-        g_chassis_wrench = ChassisForceSolve(&g_gimbal2chassis_data, &g_chassis_twist_fb, dt_s);
         ChassisVelocitySteerSelect(&g_gimbal2chassis_data, &g_chassis_feedback.state, g_chassis_wrench);
     }
     else
     {
-        g_chassis_wrench = (vector3_t){0.0f, 0.0f, 0.0f};
         g_chassis_torque = (LibChassisTorque_s){0};
         /* 离开运行态即作废换向历史：下次使能重新决策（不沿用急停前的方案） */
         g_chassis_cost_sel = (ChassisCostSel_s){0};
-        ChassisForceReset(); // 三个速度环 PID 的积分/滤波状态都从 0 重新起
     }
-    g_chassis_cmd_prev = (vector3_t){g_gimbal2chassis_data.vx, g_gimbal2chassis_data.vy, g_gimbal2chassis_data.w};
 
     /* 实测速度回传云台（线协议方向与车体系一致：vx 前 / vy 左 / w 逆时针） */
     g_chassis2gimbal_data.vx = g_chassis_twist_fb.x;
