@@ -23,9 +23,13 @@
  *              方案开关
  *============================================*/
 /* 反馈方案：
- *   0 = 独立：IMU 给 yaw rate，轮速正解给 vx/vy（当前实现）
- *   1 = 融合：ESKF 融合 IMU + 轮速（预留，尚未实现，编译会报错提醒） */
+ *   0 = 独立：IMU 给 yaw rate，轮速正解给 vx/vy（默认）
+ *   1 = 融合：6 态 ESKF（vx/vy、加速度零偏、航向角、yaw rate 零偏）
+ *       IMU 加速度预测 + 轮速正解速度量测 + ZUPT/ZARU，见 app_chassis_eskf.c */
 #define CHASSIS_FEEDBACK_SCHEME 0
+#if CHASSIS_FEEDBACK_SCHEME == 1
+#error "不要用eskf，当前有bug，会失控"
+#endif
 
 /* 闭环方案：
  *   0 = PID 反馈 + 可配置前馈（当前实现；前馈系数默认全 0）
@@ -107,16 +111,125 @@
 #endif
 
 /*============================================
+ *              ESKF 融合参数（方案 1）
+ *============================================*/
+/* 6 态误差 [vx, vy, bax, bay, theta, bg]，量测 [vx, vy, yaw_rate - bg]。
+ * 全部给 #ifndef 守卫，便于局部覆盖（同 CHASSIS_IMU_ALPHA_* 的风格）。 */
+#ifndef CHASSIS_ESKF_G
+#define CHASSIS_ESKF_G 9.80665f // 重力加速度 (m/s²)
+#endif
+#ifndef CHASSIS_ESKF_DT_MAX_S
+#define CHASSIS_ESKF_DT_MAX_S 0.010f // 预测步长上限 (s)，防任务抖动导致大积分
+#endif
+
+/* 初始协方差 P0（误差态初值恒 0，这里只给不确定度） */
+#ifndef CHASSIS_ESKF_P0_VEL
+#define CHASSIS_ESKF_P0_VEL 0.25f // (m/s)²
+#endif
+#ifndef CHASSIS_ESKF_P0_ACC_BIAS
+#define CHASSIS_ESKF_P0_ACC_BIAS 0.04f // (m/s²)²
+#endif
+#ifndef CHASSIS_ESKF_P0_YAW
+#define CHASSIS_ESKF_P0_YAW 0.01f // rad²
+#endif
+#ifndef CHASSIS_ESKF_P0_GYRO_BIAS
+#define CHASSIS_ESKF_P0_GYRO_BIAS 1.0e-6f // (rad/s)²
+#endif
+
+/* 过程噪声密度：Q = diag(q·dt) */
+#ifndef CHASSIS_ESKF_Q_VEL
+#define CHASSIS_ESKF_Q_VEL 0.05f // m²/s³
+#endif
+#ifndef CHASSIS_ESKF_Q_ACC_BIAS
+#define CHASSIS_ESKF_Q_ACC_BIAS 1.0e-6f // (m/s²)²/s
+#endif
+#ifndef CHASSIS_ESKF_Q_YAW
+#define CHASSIS_ESKF_Q_YAW 1.0e-6f // rad²/s
+#endif
+#ifndef CHASSIS_ESKF_Q_GYRO_BIAS
+#define CHASSIS_ESKF_Q_GYRO_BIAS 1.0e-9f // (rad/s)²/s
+#endif
+#ifndef CHASSIS_ESKF_Q_NO_IMU_SCALE
+#define CHASSIS_ESKF_Q_NO_IMU_SCALE 100.0f // IMU 无效时速度/航向 Q 放大倍数
+#endif
+
+/* 量测噪声方差 */
+#ifndef CHASSIS_ESKF_R_WHEEL
+#define CHASSIS_ESKF_R_WHEEL 2.5e-3f // (m/s)²
+#endif
+#ifndef CHASSIS_ESKF_R_WHEEL_W
+#define CHASSIS_ESKF_R_WHEEL_W 4.0e-3f // (rad/s)²，轮速正解 yaw rate
+#endif
+#ifndef CHASSIS_ESKF_R_ZUPT
+#define CHASSIS_ESKF_R_ZUPT 1.0e-4f // (m/s)²
+#endif
+#ifndef CHASSIS_ESKF_R_ZARU
+#define CHASSIS_ESKF_R_ZARU 1.0e-6f // (rad/s)²，静止零角速度
+#endif
+
+/* 新息门控（卡方 2 自由度） */
+#ifndef CHASSIS_ESKF_NIS_INFLATE
+#define CHASSIS_ESKF_NIS_INFLATE 9.21f // 99%
+#endif
+#ifndef CHASSIS_ESKF_NIS_REJECT
+#define CHASSIS_ESKF_NIS_REJECT 13.82f // 99.9%
+#endif
+#ifndef CHASSIS_ESKF_R_INFLATE
+#define CHASSIS_ESKF_R_INFLATE 10.0f // 可疑帧的 R 放大倍数
+#endif
+
+/* 打滑判据：轮速正解 yaw rate 与 IMU 世界 yaw rate 的差 (rad/s) */
+#ifndef CHASSIS_ESKF_SLIP_W_DIFF
+#define CHASSIS_ESKF_SLIP_W_DIFF 0.5f
+#endif
+#ifndef CHASSIS_ESKF_SLIP_W_REJECT
+#define CHASSIS_ESKF_SLIP_W_REJECT 1.0f
+#endif
+
+/* 数据新鲜度 */
+#ifndef CHASSIS_ESKF_IMU_TIMEOUT_US
+#define CHASSIS_ESKF_IMU_TIMEOUT_US 20000u // 20ms
+#endif
+#ifndef CHASSIS_ESKF_WHEEL_TIMEOUT_US
+#define CHASSIS_ESKF_WHEEL_TIMEOUT_US 20000u // 20ms
+#endif
+
+/* ZUPT/ZARU 静止判据 */
+#ifndef CHASSIS_ESKF_ZUPT_WHEEL_EPS
+#define CHASSIS_ESKF_ZUPT_WHEEL_EPS 0.03f // 轮缘速度 (m/s)
+#endif
+#ifndef CHASSIS_ESKF_ZUPT_GYRO_EPS
+#define CHASSIS_ESKF_ZUPT_GYRO_EPS 0.05f // |yaw_rate - bg| (rad/s)
+#endif
+#ifndef CHASSIS_ESKF_ZUPT_ACC_EPS
+#define CHASSIS_ESKF_ZUPT_ACC_EPS 0.30f // |acc_lin.xy| (m/s²)
+#endif
+#ifndef CHASSIS_ESKF_ZUPT_ENTER_TICKS
+#define CHASSIS_ESKF_ZUPT_ENTER_TICKS 50u // 500Hz 下 100ms
+#endif
+
+/* velocity_valid 保持窗口：最后一次被接受的量测之后 */
+#ifndef CHASSIS_ESKF_VEL_HOLD_TICKS
+#define CHASSIS_ESKF_VEL_HOLD_TICKS 50u
+#endif
+#ifndef CHASSIS_ESKF_V_MAX
+#define CHASSIS_ESKF_V_MAX 5.0f // 输出速度兜底钳位 (m/s)
+#endif
+
+/*============================================
  *              类型
  *============================================*/
 /* IMU 量转到**底盘系**后的结果（旋转用安装矩阵，平移量见 pos） */
 typedef struct
 {
-    vector3_t gyro; // 底盘系角速度 (rad/s)
-    vector3_t acc;  // 底盘系比力 (m/s²)，已做杆臂补偿到 底盘中心
-    vector3_t pos;  // IMU 安装点在底盘系的位置 (m)，固定
-    float yaw_rate; // 底盘系绕竖直轴角速度 (rad/s)（world 系，与安装方向无关）
-    uint8_t valid;  // 1 = 本拍姿态可用（已播种/有数据）
+    vector3_t gyro;    // 底盘系角速度 (rad/s)
+    vector3_t acc;     // 底盘系比力 (m/s²)，已做杆臂补偿到 底盘中心
+    vector3_t acc_lin; // 底盘系线性加速度 (m/s²)：acc 按姿态扣除重力（方案 1）
+    euler_t euler;     // 驱动原始欧拉角 (rad)：roll/pitch/yaw（IMU 自身轴向）
+    vector3_t pos;     // IMU 安装点在底盘系的位置 (m)，固定
+    float yaw_rate;    // 世界系绕竖直轴角速度 (rad/s)（与安装方向无关）
+    uint8_t valid;     // 1 = 本拍姿态可用（已播种/有数据）
+    uint8_t fresh;     // 1 = 本拍消费到新的陀螺样本
 } AppChassisImu_s;
 
 /* 驱动轮反馈（已按 CHASSIS_WHEEL_x_DIR 换算到 app 正方向）。
@@ -130,11 +243,12 @@ typedef enum : uint8_t
 
 typedef struct
 {
-    float speed;        // 轮速 (rad/s)，app 正方向（沿当前舵角推动车体为正）
-    float torque;       // 电机轴力矩 (N·m)= iq×Kt，app 正方向（换向代价用）
-    float current;      // 电流 (A)
-    int8_t temperature; // 温度 (℃)
-    uint8_t error;      // 错误码（LK 为 echo，DJI 为 error）
+    float speed;           // 轮速 (rad/s)，app 正方向（沿当前舵角推动车体为正）
+    float torque;          // 电机轴力矩 (N·m)= iq×Kt，app 正方向（换向代价用）
+    float current;         // 电流 (A)
+    int8_t temperature;    // 温度 (℃)
+    uint8_t error;         // 错误码（LK 为 echo，DJI 为 error）
+    uint64_t timestamp_us; // CAN 帧到达时间戳 (us)，0 = 尚未收到（方案 1 去重用）
 } AppWheelFeedback_s;
 
 /*============================================

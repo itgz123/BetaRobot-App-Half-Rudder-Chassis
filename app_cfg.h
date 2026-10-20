@@ -31,6 +31,7 @@
 #define DRV_SBUS_USED                // SBUS 遥控器驱动
 #define LIB_MAHONY_USED              // Mahony 姿态解算
 #define LIB_LKF_USED                 // 通用卡尔曼滤波 (lib_lkf)
+#define LIB_ESKF_USED                // 通用误差状态卡尔曼滤波 (lib_eskf；反馈融合方案 1)
 #define DRVLIB_BMI088_KALMAN_USED    // BMI088 零偏标定 + 线性卡尔曼姿态（drv_bmi088 + lib_lkf 联合）
 #define DRVS_DJIMOTOR_BROADCAST_USED // DJI 电机驱动（drvs 纯协议版一拖四广播；舵向 2 个 M3508）
 #define DRVLIB_MOTOR_USED            // 三级级联 PID + 反馈后处理（drvs 之上；舵向位置/速度环）
@@ -53,7 +54,7 @@
  *   CH15   状态机状态
  *   CH16~17 左/右驱动轮出力比例 cos(目标−实际)，带符号 (−1~1)
  *   CH18~20 云台下发速度指令 vx/vy/w (m/s, m/s, rad/s)
- *   CH21~23 底盘实测速度反馈 vx/vy/w（vx/vy=轮速正解，w=IMU 底盘系）
+ *   CH21~23 底盘实测速度反馈 vx/vy/w（vx/vy=轮速正解或 ESKF 融合输出，w=IMU 底盘系）
  *   CH24~26 期望广义力 fx/fy/mw (N, N, N·m)（力控环输出，分配前）
  *   CH27~28 左/右驱动轮轮速 (rad/s，轮侧，app 正方向)
  * 每帧 (1+28)×4+4 = 120B，100Hz 下 12kB/s，921600 baud 余量很大。

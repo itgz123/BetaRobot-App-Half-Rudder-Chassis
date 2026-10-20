@@ -557,8 +557,10 @@ void AppChassisRun(float dt, uint64_t time_stamp)
     const ChassisFeedbackImuInput_s feedback_imu = {
         .gyro = {imu.gyro[0], imu.gyro[1], imu.gyro[2]},
         .acc = {imu.acc[0], imu.acc[1], imu.acc[2]},
+        .euler = {imu.euler.roll, imu.euler.pitch, imu.euler.yaw},
         .yaw_rate = imu.yaw_rate,
         .dt = imu.dt,
+        .timestamp_us = imu.time_stamp_g,
         .valid = imu.valid,
     };
     ChassisFeedbackUpdateImu(&feedback_imu, &g_chassis_feedback);
@@ -594,6 +596,7 @@ void AppChassisRun(float dt, uint64_t time_stamp)
                     .current = wheel_l_data.current,
                     .temperature = wheel_l_data.temperature,
                     .error = wheel_l_data.echo,
+                    .timestamp_us = wheel_l_data.timestamp_us,
                 },
             [APP_WHEEL_R] =
                 {
@@ -602,6 +605,7 @@ void AppChassisRun(float dt, uint64_t time_stamp)
                     .current = wheel_r_data.current,
                     .temperature = wheel_r_data.temperature,
                     .error = wheel_r_data.echo,
+                    .timestamp_us = wheel_r_data.timestamp_us,
                 },
         },
     };
@@ -705,7 +709,7 @@ void AppChassisRun(float dt, uint64_t time_stamp)
         [LIB_CHASSIS_HALF_RUDDER_L] = (float)rudder_l_ctrl.data.position,
         [LIB_CHASSIS_HALF_RUDDER_R] = (float)rudder_r_ctrl.data.position,
     };
-    ChassisFeedbackUpdateKinematics(steer_motor_pos, &g_chassis_feedback);
+    ChassisFeedbackUpdateKinematics(steer_motor_pos, dt_s, &g_chassis_feedback);
     g_chassis_twist_fb = g_chassis_feedback.twist;
 
     /* 速度指令 → 广义力 → 舵角/轮向力矩。
