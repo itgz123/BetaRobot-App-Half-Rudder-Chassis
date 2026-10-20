@@ -11,7 +11,7 @@
 #include "robot_def.h"
 
 #define BSP_SYS_STATUS_USED          // 系统状态计数（app 初始化错误 / FreeRTOS 任务超时）
-#define BSP_DWT_USED                 // DWT 高精度定时器（系统时钟基础）
+#define BSP_DWT_CYCCNT_USED          // DWT CYCCNT 微秒时基（系统时钟基础）
 #define BSP_GPIO_USED                // GPIO 管理 + EXTI 分发
 #define LIB_MATH_USED                // 数学库（向量/矩阵/四元数/三角函数）
 #define LIB_MATH_TRIG_LUT_USED       // 自研查表三角函数 Lib_Math_*LUT（不定义则表不编译、接口不可用）
