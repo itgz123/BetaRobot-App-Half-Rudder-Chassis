@@ -23,6 +23,7 @@
 #include "comm_media_can_idseq.h"
 #include "comm_proto_ext.h"
 #include "drv_vofa.h"
+#include "drv_super_cap_yq2027.h"
 
 #include <string.h>
 
@@ -127,6 +128,14 @@ DRVS_LKMOTOR_BROADCAST_GROUP_DEF(wheel_motor_group);
 // 舵向控制核：位置/速度两级级联（drvlib_motor 只算控制量，不碰协议）
 DRVLIB_MOTOR_INSTANCE_DEF(rudder_l_ctrl);
 DRVLIB_MOTOR_INSTANCE_DEF(rudder_r_ctrl);
+
+// 超级电容：YQ2027，CAN2，命令/新格式反馈都用 0x052
+SUPER_CAP_YQ2027_INSTANCE_DEF(super_cap);
+
+/* 超级电容最新反馈（每拍刷新，供调试器/后续功率策略使用） */
+SuperCapYq2027Data_s g_super_cap_data;
+/* 周期下发的使能命令：drv 不自动发送，内容在此固定 */
+static SuperCapYq2027Command_s s_super_cap_cmd;
 
 // 半舵运动学内核：正解（轮速+舵角 → vx/vy）与后续的力分配共用
 static LibChassisInstance_s s_chassis;
@@ -364,6 +373,29 @@ void AppChassisInit(void)
     BSP_ASSERT_APP_CALL(DrvsLKMotorBroadcastConfig(&wheel_l_motor, &wheel_l_cfg));
     BSP_ASSERT_APP_CALL(DrvsLKMotorBroadcastConfig(&wheel_r_motor, &wheel_r_cfg));
 
+    /* ---- 超级电容：YQ2027（CAN2，命令 0x061 / 反馈 0x052）----
+     * 2026-10-21 起只有这一套格式：主控发 0x061，超电固定回 0x052。 */
+    BSP_ASSERT_APP_CALL(SuperCapYq2027Register(&super_cap));
+
+    const SuperCapYq2027Config_s super_cap_cfg = {
+        .can_e = CAN_2,
+        .tx_id = SUPER_CAP_YQ2027_TX_ID_DEFAULT, // 0x061
+        .rx_id = SUPER_CAP_YQ2027_RX_ID_DEFAULT, // 0x052
+        .timeout_ms = 1,
+        .reload_count = 100,
+        .fault_action = DAEMON_FAULT_NONE,
+    };
+    BSP_ASSERT_APP_CALL(SuperCapYq2027Config(&super_cap, &super_cap_cfg));
+
+    s_super_cap_cmd = (SuperCapYq2027Command_s){
+        .enable_dcdc = 1,
+        .clear_error = 1,
+        .enable_active_charging_limit = 1,
+        .active_charging_limit_ratio = 255,
+        .referee_power_limit = CHASSIS_SUPER_CAP_REFEREE_POWER_LIMIT_W,
+        .referee_energy_buffer = 0,
+    };
+
     /* ---- 舵向控制核（drvlib_motor）：左右舵同参数 ----
      * loop_type   ANGLE|SPEED 两环都建（校准期临时收窄成 SPEED，进 RUN 时恢复）
      * 位置模式    WRAP 360°：窗口 ±π×减速比，跨度 = 舵轮整圈 2π（电机 16π）
@@ -588,26 +620,27 @@ void AppChassisRun(float dt, uint64_t time_stamp)
     const DrvsLKMotorBroadcastData_s wheel_l_data = DrvsLKMotorBroadcastGetData(&wheel_l_motor);
     const DrvsLKMotorBroadcastData_s wheel_r_data = DrvsLKMotorBroadcastGetData(&wheel_r_motor);
     const ChassisFeedbackWheelInput_s feedback_wheel = {
-        .wheel = {
-            [APP_WHEEL_L] =
-                {
-                    .speed = wheel_l_data.speed,
-                    .torque = wheel_l_data.torque,
-                    .current = wheel_l_data.current,
-                    .temperature = wheel_l_data.temperature,
-                    .error = wheel_l_data.echo,
-                    .timestamp_us = wheel_l_data.timestamp_us,
-                },
-            [APP_WHEEL_R] =
-                {
-                    .speed = wheel_r_data.speed,
-                    .torque = wheel_r_data.torque,
-                    .current = wheel_r_data.current,
-                    .temperature = wheel_r_data.temperature,
-                    .error = wheel_r_data.echo,
-                    .timestamp_us = wheel_r_data.timestamp_us,
-                },
-        },
+        .wheel =
+            {
+                [APP_WHEEL_L] =
+                    {
+                        .speed = wheel_l_data.speed,
+                        .torque = wheel_l_data.torque,
+                        .current = wheel_l_data.current,
+                        .temperature = wheel_l_data.temperature,
+                        .error = wheel_l_data.echo,
+                        .timestamp_us = wheel_l_data.timestamp_us,
+                    },
+                [APP_WHEEL_R] =
+                    {
+                        .speed = wheel_r_data.speed,
+                        .torque = wheel_r_data.torque,
+                        .current = wheel_r_data.current,
+                        .temperature = wheel_r_data.temperature,
+                        .error = wheel_r_data.echo,
+                        .timestamp_us = wheel_r_data.timestamp_us,
+                    },
+            },
     };
     ChassisFeedbackUpdateWheels(&feedback_wheel, &g_chassis_feedback);
 
@@ -732,10 +765,11 @@ void AppChassisRun(float dt, uint64_t time_stamp)
             .state = g_chassis_feedback.state,
             .wrench = g_chassis_wrench,
             /* 代价函数的力矩误差用实测轮缘力矩（app 正方向 → 舵轮侧） */
-            .wheel_torque_fb = {
-                [LIB_CHASSIS_HALF_RUDDER_L] = g_chassis_feedback.wheel[APP_WHEEL_L].torque * CHASSIS_DRIVE_REDUCTION,
-                [LIB_CHASSIS_HALF_RUDDER_R] = g_chassis_feedback.wheel[APP_WHEEL_R].torque * CHASSIS_DRIVE_REDUCTION,
-            },
+            .wheel_torque_fb =
+                {
+                    [LIB_CHASSIS_HALF_RUDDER_L] = g_chassis_feedback.wheel[APP_WHEEL_L].torque * CHASSIS_DRIVE_REDUCTION,
+                    [LIB_CHASSIS_HALF_RUDDER_R] = g_chassis_feedback.wheel[APP_WHEEL_R].torque * CHASSIS_DRIVE_REDUCTION,
+                },
         };
         ChassisOutputUpdate(&output_in, &g_chassis_output);
     }
@@ -765,6 +799,17 @@ void AppChassisRun(float dt, uint64_t time_stamp)
     /* 云台通信：每周期回一帧（vx/vy 来自轮速正解，w 来自 IMU，见上面回传段）。
      * 即使全 0 也必须发——云台侧靠这帧维持链路在线。 */
     CommSend(&gimbal_comm, (uint8_t *)&g_chassis2gimbal_data);
+
+    /* 超级电容：drv 不自动周期发送，这里按时间累计每 20ms 发一帧使能命令；
+     * 反馈每拍取一次最新帧，内容原样保存，不做功率限制。 */
+    g_super_cap_data = SuperCapYq2027GetData(&super_cap);
+    static float s_super_cap_accum_ms = 0.0f;
+    s_super_cap_accum_ms += dt;
+    if (s_super_cap_accum_ms >= (float)CHASSIS_SUPER_CAP_SEND_PERIOD_MS)
+    {
+        s_super_cap_accum_ms -= (float)CHASSIS_SUPER_CAP_SEND_PERIOD_MS;
+        (void)SuperCapYq2027Send(&super_cap, &s_super_cap_cmd);
+    }
 
     /*============================ VOFA 遥测：100Hz ============================*/
     /* 500Hz 任务按时间累计，每满 10ms 发一帧（不依赖任务周期整除）。
