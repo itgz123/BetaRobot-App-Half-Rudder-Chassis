@@ -53,9 +53,9 @@
  *   1 = 底盘调试布局：舵角 / 换向代价 / 期望广义力
  *
  * 两种布局共有：
- *   CH5    左轮 setref（含 wheel_align、app 正方向，N·m）
+ *   CH5    左轮 setref（含 wheel_align、功率限幅后、app 正方向，N·m）
  *   CH6    左轮实测力矩 (N·m)
- *   CH7    右轮 setref
+ *   CH7    右轮 setref（功率限幅后）
  *   CH8    右轮实测力矩
  *   CH15   状态机状态
  *   CH16~17 左/右驱动轮出力比例 cos(目标−实际)，带符号 (−1~1)
@@ -72,12 +72,15 @@
  *   CH36   gate_mask（bit=1 表示该门控通过，见 app_chassis_power.h）
  *
  * RLS 调参布局（CHASSIS_VOFA_DEBUG_CHASSIS=0）：
- *   CH1~4  0（保留槽位，帧长不变）
+ *   CH1    功率限幅生效上限 limit_eff (W)
+ *   CH2    限幅前模型功率 P_before (W)   ← 超限判据
+ *   CH3    限幅后模型功率 P_after (W)    ← 应 ≤ CH1；与 CH31 交叉校验
+ *   CH4    min(τ_out/τ_cmd)，1.0 = 本拍未削力矩
  *   CH9    Σ|ω| 低通 (rad/s)          ← φ0
  *   CH10   Στ² 低通 ((N·m)²)         ← φ1
  *   CH11   Σω² 低通 ((rad/s)²)       ← |ω| 与 ω² 两种摩擦模型的对比
  *   CH12   P_mech_lpf = g·LPF(Στω) (W) ← y 里减掉的那一项
- *   CH13   g（机械项增益，当前 1.0）
+ *   CH13   g（机械项增益，当前 0.723，见 CHASSIS_POWER_MECH_GAIN）
  *   CH14   RLS update_count
  *   CH24   Σ|ω| 瞬时 (rad/s)
  *   CH25   Στ² 瞬时 ((N·m)²)

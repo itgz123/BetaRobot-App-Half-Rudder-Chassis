@@ -105,6 +105,8 @@ vector3_t g_chassis_wrench;
 ChassisOutput_s g_chassis_output;
 /* 功率预测输出：只给 VOFA/调试，不参与任何控制计算 */
 ChassisPowerOutput_s g_chassis_power;
+/* 功率限幅输出：本拍诊断；tau_out 在驱动轮下发前写回 setref */
+ChassisPowerLimitOutput_s g_chassis_power_limit;
 
 /*---------------- 校准 ----------------*/
 
@@ -143,6 +145,18 @@ static SuperCapYq2027Command_s s_super_cap_cmd;
 
 // 半舵运动学内核：正解（轮速+舵角 → vx/vy）与后续的力分配共用
 static LibChassisInstance_s s_chassis;
+
+#if CHASSIS_POWER_LIMIT_ENABLE && (CHASSIS_POWER_LIMIT_SOURCE == CHASSIS_POWER_LIMIT_SOURCE_RULE)
+/**
+ * @brief 比赛功率上限来源（预留）
+ * TODO(比赛): 接裁判系统 0x0201 chassis_power_limit / 0x0202 buffer_energy，
+ *             或按 2027 规则表查表。2027 数值未定，v1 先返回固定值。
+ */
+static float Power_LimitFromRule(void)
+{
+    return CHASSIS_POWER_LIMIT_FIXED_W;
+}
+#endif
 
 /*============================ 光电门 ============================*/
 /* 左舵 PA0 → GPIO_PWM_1，右舵 PA2 → GPIO_PWM_2（DM_MC02 映射，见旧 app 的实机注释）。
@@ -400,9 +414,10 @@ void AppChassisInit(void)
         .referee_energy_buffer = 0,
     };
 
-#if CHASSIS_POWER_PREDICT_ENABLE
-    /* ---- 功率预测：RLS 只辨识 k1/k2（k3 需静态标定）----
-     * 只输出 P_fb / P_cmd 给遥测；不参与分配/限幅，见 app_chassis_power.h。 */
+#if CHASSIS_POWER_PREDICT_ENABLE || CHASSIS_POWER_LIMIT_ENABLE
+    /* ---- 功率预测 + 限幅：RLS 只辨识 k1/k2（k3 需静态标定）----
+     * 预测输出 P_fb/P_cmd 给遥测；限幅在驱动轮下发前裁 τ_cmd。
+     * 只开限幅时 RLS 初值即固定参数模型，见 app_chassis_power.h。 */
     const ChassisPowerCfg_s power_cfg = {
         .k3_w = CHASSIS_POWER_RLS_K3_W,
         .k1_init_nm = CHASSIS_POWER_RLS_K1_INIT_NM,
@@ -428,6 +443,10 @@ void AppChassisInit(void)
         .warmup_ticks = CHASSIS_POWER_RLS_WARMUP_TICKS,
         .reversal_holdoff_ticks = CHASSIS_POWER_RLS_REVERSAL_TICKS,
         .update_enable = CHASSIS_POWER_RLS_UPDATE_ENABLE,
+        .limit_fixed_w = CHASSIS_POWER_LIMIT_FIXED_W,
+        .limit_margin_w = CHASSIS_POWER_LIMIT_MARGIN_W,
+        .limit_min_w = CHASSIS_POWER_LIMIT_MIN_W,
+        .limit_tau_eps_nm = CHASSIS_POWER_LIMIT_TAU_EPS_NM,
     };
     BSP_ASSERT_APP_CALL(ChassisPowerInit(&power_cfg));
 #endif
@@ -821,10 +840,41 @@ void AppChassisRun(float dt, uint64_t time_stamp)
     g_chassis2gimbal_data.w = g_chassis_twist_fb.z;
 
     /*============================ 下发 ============================*/
+    /* 超电反馈快照（纯 getter、无副作用）：放在下发前，限幅/预测读同一帧。 */
+    g_super_cap_data = SuperCapYq2027GetData(&super_cap);
+
     // 舵向：drvs 纯协议。两个 SetRef 必须都在 GroupSend 之前完成（一帧组两台）。
     DrvsDJIMotorBroadcastSetRef(&rudder_l_motor, rudder_l_cmd);
     DrvsDJIMotorBroadcastSetRef(&rudder_r_motor, rudder_r_cmd);
     DrvsDJIMotorBroadcastGroupSend(&rudder_motor_group);
+
+#if CHASSIS_POWER_LIMIT_ENABLE
+    /* 功率限幅：驱动轮下发前裁 τ_cmd。非 RUN 直通（setref 已由状态机清零）。
+     * limit_w<=0 时走 def.h 的宏来源：FIXED 用 cfg.limit_fixed_w，RULE 查表（预留）。 */
+    const float limit_src_w =
+#if (CHASSIS_POWER_LIMIT_SOURCE == CHASSIS_POWER_LIMIT_SOURCE_RULE)
+        Power_LimitFromRule();
+#else
+        0.0f;
+#endif
+    const ChassisPowerLimitInput_s power_limit_in = {
+        .tau_cmd_nm =
+            {
+                [APP_WHEEL_L] = g_wheel_l_setref,
+                [APP_WHEEL_R] = g_wheel_r_setref,
+            },
+        .omega_radps =
+            {
+                [APP_WHEEL_L] = g_chassis_feedback.wheel[APP_WHEEL_L].speed,
+                [APP_WHEEL_R] = g_chassis_feedback.wheel[APP_WHEEL_R].speed,
+            },
+        .limit_w = limit_src_w,
+        .enabled = (uint8_t)(state == CHASSIS_STATE_RUN),
+    };
+    ChassisPowerLimitUpdate(&power_limit_in, &g_chassis_power_limit);
+    g_wheel_l_setref = g_chassis_power_limit.tau_out_nm[APP_WHEEL_L];
+    g_wheel_r_setref = g_chassis_power_limit.tau_out_nm[APP_WHEEL_R];
+#endif
 
     // 驱动轮：纯力矩协议，无使能开关。停机 = 每拍 SetRef(0) + GroupSend。
     // CHASSIS_WHEEL_x_DIR 是"app 正方向 → 电机原始方向"的力矩符号。
@@ -836,9 +886,7 @@ void AppChassisRun(float dt, uint64_t time_stamp)
      * 即使全 0 也必须发——云台侧靠这帧维持链路在线。 */
     CommSend(&gimbal_comm, (uint8_t *)&g_chassis2gimbal_data);
 
-    /* 超级电容：drv 不自动周期发送，这里按时间累计每 20ms 发一帧使能命令；
-     * 反馈每拍取一次最新帧，内容原样保存，不做功率限制。 */
-    g_super_cap_data = SuperCapYq2027GetData(&super_cap);
+    /* 超级电容：drv 不自动周期发送，这里按时间累计每 20ms 发一帧使能命令。 */
     static float s_super_cap_accum_ms = 0.0f;
     s_super_cap_accum_ms += dt;
     if (s_super_cap_accum_ms >= (float)CHASSIS_SUPER_CAP_SEND_PERIOD_MS)
@@ -849,8 +897,9 @@ void AppChassisRun(float dt, uint64_t time_stamp)
 
 #if CHASSIS_POWER_PREDICT_ENABLE
     /* 功率预测：只读本拍已下发的 setref 与最新超电帧，输出只给 VOFA。
-     * 放在控制下发之后，模块即使有 bug 也影响不到本拍控制量。
-     * τ_cmd 用 g_wheel_*_setref（已含 wheel_align、app 方向），不是分配级 wheel_torque。 */
+     * 放在下发之后，模块即使有 bug 也影响不到本拍控制量。
+     * τ_cmd 用 g_wheel_*_setref（已含 wheel_align、app 方向，且已过限幅），
+     * 不是分配级 wheel_torque。 */
     const ChassisPowerInput_s power_in = {
         .wheel_speed_radps =
             {
@@ -902,30 +951,31 @@ void AppChassisRun(float dt, uint64_t time_stamp)
         VofaSetChannel(3, Lib_Math_WrapAngleNegPIToPI(g_chassis_output.sel.angle_target[LIB_CHASSIS_HALF_RUDDER_R]) * r2d); // 右舵目标 (deg)
         VofaSetChannel(4, g_chassis_feedback.state.steer_angle[LIB_CHASSIS_HALF_RUDDER_R] * r2d);                           // 右舵实际 (deg)
 #else
-        VofaSetChannel(1, 0.0f);
-        VofaSetChannel(2, 0.0f);
-        VofaSetChannel(3, 0.0f);
-        VofaSetChannel(4, 0.0f);
+        /* 功率限幅诊断：CH3≈CH31 可交叉校验；CH4=1 表示本拍未削力矩 */
+        VofaSetChannel(1, g_chassis_power_limit.limit_eff_w); // 生效功率上限 (W)
+        VofaSetChannel(2, g_chassis_power_limit.p_before_w);  // 限幅前模型功率 (W)
+        VofaSetChannel(3, g_chassis_power_limit.p_after_w);   // 限幅后模型功率 (W)
+        VofaSetChannel(4, g_chassis_power_limit.scale_min);   // min(τ_out/τ_cmd)
 #endif
-        VofaSetChannel(5, g_wheel_l_setref);                                                       // 左轮 setref (N·m)
+        VofaSetChannel(5, g_wheel_l_setref);                                                       // 左轮 setref (N·m，限幅后)
         VofaSetChannel(6, g_chassis_feedback.wheel[APP_WHEEL_L].torque * CHASSIS_DRIVE_REDUCTION); // 左轮实测 (N·m)
-        VofaSetChannel(7, g_wheel_r_setref);                                                       // 右轮 setref (N·m)
+        VofaSetChannel(7, g_wheel_r_setref);                                                       // 右轮 setref (N·m，限幅后)
         VofaSetChannel(8, g_chassis_feedback.wheel[APP_WHEEL_R].torque * CHASSIS_DRIVE_REDUCTION); // 右轮实测 (N·m)
 #if CHASSIS_VOFA_DEBUG_CHASSIS
-        VofaSetChannel(9, (float)g_chassis_output.sel.combo);                    // 换向方案 0~3
-        VofaSetChannel(10, g_chassis_output.sel.cost[0]);                        // 组合代价 (s，方案 1)
+        VofaSetChannel(9, (float)g_chassis_output.sel.combo); // 换向方案 0~3
+        VofaSetChannel(10, g_chassis_output.sel.cost[0]);     // 组合代价 (s，方案 1)
         VofaSetChannel(11, g_chassis_output.sel.cost[1]);
         VofaSetChannel(12, g_chassis_output.sel.cost[2]);
         VofaSetChannel(13, g_chassis_output.sel.cost[3]);
-        VofaSetChannel(14, (float)g_chassis_output.sel.locked);                  // 无力向小力矩锁定（方案 1）
+        VofaSetChannel(14, (float)g_chassis_output.sel.locked); // 无力向小力矩锁定（方案 1）
 #else
         /* RLS 回归量：低通项就是 RLS 实际用的 φ，raw 项供 PC 核对低通重建 */
-        VofaSetChannel(9, g_chassis_power.sum_abs_omega_lpf);                    // Σ|ω| LPF (rad/s)
-        VofaSetChannel(10, g_chassis_power.sum_tau2_fb_lpf);                     // Στ² LPF ((N·m)²)
-        VofaSetChannel(11, g_chassis_power.sum_omega2_lpf);                      // Σω² LPF ((rad/s)²)
-        VofaSetChannel(12, g_chassis_power.p_mech_fb_lpf);                       // g·LPF(Στω) (W)
-        VofaSetChannel(13, g_chassis_power.mech_gain);                           // 机械项增益 g
-        VofaSetChannel(14, (float)g_chassis_power.update_count);                 // RLS 更新次数
+        VofaSetChannel(9, g_chassis_power.sum_abs_omega_lpf);    // Σ|ω| LPF (rad/s)
+        VofaSetChannel(10, g_chassis_power.sum_tau2_fb_lpf);     // Στ² LPF ((N·m)²)
+        VofaSetChannel(11, g_chassis_power.sum_omega2_lpf);      // Σω² LPF ((rad/s)²)
+        VofaSetChannel(12, g_chassis_power.p_mech_fb_lpf);       // g·LPF(Στω) (W)
+        VofaSetChannel(13, g_chassis_power.mech_gain);           // 机械项增益 g
+        VofaSetChannel(14, (float)g_chassis_power.update_count); // RLS 更新次数
 #endif
         VofaSetChannel(15, (float)state);                                                // 状态机状态
         VofaSetChannel(16, g_chassis_output.sel.wheel_align[LIB_CHASSIS_HALF_RUDDER_L]); // 左轮余弦优化系数

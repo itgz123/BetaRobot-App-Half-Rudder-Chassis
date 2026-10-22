@@ -1,14 +1,15 @@
 /**
  * @file app_chassis_power.c
- * @brief 驱动轮功率预测（RLS 辨识 k1/k2，仅预测不限幅），见 app_chassis_power.h
+ * @brief 驱动轮功率预测（RLS 辨识 k1/k2）+ 硬限幅，见 app_chassis_power.h
  *
- * 处理顺序：
+ * 预测顺序：
  *   1. 取驱动轮实测 τ/ω、本拍指令力矩、超电实测功率；
  *   2. 用同一低通滤 φ0/φ1/P_mech（与超电内部已低通的 P_meas 同相位）；
  *   3. 每 20ms 且门控全通过时做一次 RLS 更新；
  *   4. 每个 500Hz 周期都用最新 θ 输出 P_fb（实测口径）与 P_cmd（指令口径）。
  *
- * ⚠ 只读控制链数据，不写任何控制量。
+ * 限幅（ChassisPowerLimitUpdate）：超限时按功率占比给每轮分预算，
+ * 每轮独立解二次方程；只输出 tau_out，由 app 决定写回。返回前不改任何 setref。
  */
 
 #include "app_chassis_power.h"
@@ -28,6 +29,11 @@
 
 /* 输出保护上限（W）：只影响遥测显示，不改 RLS 状态。 */
 #define POWER_OUTPUT_LIMIT_W 1000.0f
+
+/* 限幅参数兜底：RLS 参数下限对应的 k2；配置异常时的默认值。 */
+#define POWER_LIMIT_K2_MIN 0.1f
+#define POWER_LIMIT_FIXED_FALLBACK_W 70.0f
+#define POWER_LIMIT_TAU_MAX_FALLBACK_NM 4.5f
 
 _Static_assert(APP_WHEEL_NUM == 2, "power model assumes exactly 2 drive wheels");
 
@@ -67,6 +73,15 @@ static struct
 static float Power_Abs(float v)
 {
     return (v >= 0.0f) ? v : -v;
+}
+
+/**
+ * @brief 从归一化 θ 反算物理 k1/k2（预测与限幅共用同一口径）
+ */
+static void Power_GetCoeffs(float *k1, float *k2)
+{
+    *k1 = s_power_rls.theta[0] * (POWER_POWER_SCALE / POWER_SPEED_SCALE);
+    *k2 = s_power_rls.theta[1] * (POWER_POWER_SCALE / POWER_TORQUE2_SCALE);
 }
 
 static uint8_t Power_IsFinite(float v)
@@ -174,6 +189,26 @@ int8_t ChassisPowerInit(const ChassisPowerCfg_s *cfg)
     {
         s_power.cfg.mech_gain = 1.0f;
     }
+    if ((Power_IsFinite(s_power.cfg.limit_fixed_w) == 0u) || (s_power.cfg.limit_fixed_w <= 0.0f))
+    {
+        s_power.cfg.limit_fixed_w = POWER_LIMIT_FIXED_FALLBACK_W;
+    }
+    if ((Power_IsFinite(s_power.cfg.limit_margin_w) == 0u) || (s_power.cfg.limit_margin_w < 0.0f))
+    {
+        s_power.cfg.limit_margin_w = 0.0f;
+    }
+    if ((Power_IsFinite(s_power.cfg.limit_min_w) == 0u) || (s_power.cfg.limit_min_w < 0.0f))
+    {
+        s_power.cfg.limit_min_w = 0.0f;
+    }
+    if ((Power_IsFinite(s_power.cfg.limit_tau_eps_nm) == 0u) || (s_power.cfg.limit_tau_eps_nm <= 0.0f))
+    {
+        s_power.cfg.limit_tau_eps_nm = 0.02f;
+    }
+    if ((Power_IsFinite(s_power.cfg.cmd_torque_limit_nm) == 0u) || (s_power.cfg.cmd_torque_limit_nm <= 0.0f))
+    {
+        s_power.cfg.cmd_torque_limit_nm = POWER_LIMIT_TAU_MAX_FALLBACK_NM;
+    }
 
     /* 物理量 → 归一化 θ：θ0 = k1·S_w/S_p，θ1 = k2·S_t/S_p */
     const float theta_init[2] = {
@@ -236,8 +271,9 @@ void ChassisPowerUpdate(const ChassisPowerInput_s *in, ChassisPowerOutput_s *out
     const uint8_t run = (uint8_t)(in->run != 0u);
 
     /* 本拍预测用的参数（更新成功后下一拍才生效） */
-    const float k1 = s_power_rls.theta[0] * (POWER_POWER_SCALE / POWER_SPEED_SCALE);
-    const float k2 = s_power_rls.theta[1] * (POWER_POWER_SCALE / POWER_TORQUE2_SCALE);
+    float k1 = 0.0f;
+    float k2 = 0.0f;
+    Power_GetCoeffs(&k1, &k2);
     out->k1_nm = k1;
     out->k2_w_per_nm2 = k2;
     out->update_count = s_power_rls.update_count;
@@ -443,4 +479,268 @@ void ChassisPowerUpdate(const ChassisPowerInput_s *in, ChassisPowerOutput_s *out
             s_power.reversal_ticks_left--;
         }
     }
+}
+
+/*============================ 功率限幅 ============================*/
+
+/**
+ * @brief 单轮二次方程求解：给定功率预算，求同号、最近、不超过指令幅值的力矩
+ *
+ * a  = k2
+ * b  = g·ω
+ * c0 = k1·|ω| + k3/N
+ * k2·τ² + b·τ + (c0 − budget) = 0
+ *
+ * Δ<=0 取顶点（预算低于最小可达功率）；Δ>0 只在**与 τ_cmd 同号**的根里取
+ * 离 τ_cmd 最近的一个，两个都不同号则输出 0（绝不为限功率而反向出力）。
+ */
+static float Power_SolveWheelTorque(float tau_cmd, float omega, float budget, float k1, float k2, float k3_each, float g, float tau_max)
+{
+    const float a = k2;
+    const float b = g * omega;
+    const float c0 = k1 * Power_Abs(omega) + k3_each;
+    const float disc = b * b - 4.0f * a * (c0 - budget);
+    float tau;
+
+    if (disc <= 0.0f)
+    {
+        tau = -b / (2.0f * a);
+    }
+    else
+    {
+        const float s = sqrtf(disc);
+        const float r_hi = (-b + s) / (2.0f * a);
+        const float r_lo = (-b - s) / (2.0f * a);
+        const uint8_t hi_ok = (uint8_t)((tau_cmd >= 0.0f) ? (r_hi >= 0.0f) : (r_hi <= 0.0f));
+        const uint8_t lo_ok = (uint8_t)((tau_cmd >= 0.0f) ? (r_lo >= 0.0f) : (r_lo <= 0.0f));
+
+        if ((hi_ok != 0u) && (lo_ok != 0u))
+        {
+            tau = (Power_Abs(r_hi - tau_cmd) <= Power_Abs(r_lo - tau_cmd)) ? r_hi : r_lo;
+        }
+        else if (hi_ok != 0u)
+        {
+            tau = r_hi;
+        }
+        else if (lo_ok != 0u)
+        {
+            tau = r_lo;
+        }
+        else
+        {
+            tau = 0.0f;
+        }
+    }
+
+    /* 符号保护：限功率不能把驱动方向翻成反向 */
+    if (((tau_cmd > 0.0f) && (tau < 0.0f)) || ((tau_cmd < 0.0f) && (tau > 0.0f)))
+    {
+        tau = 0.0f;
+    }
+    /* 不放大指令幅值（数值兜底） */
+    if (Power_Abs(tau) > Power_Abs(tau_cmd))
+    {
+        tau = tau_cmd;
+    }
+    return Lib_Math_Clamp(tau, -tau_max, tau_max);
+}
+
+void ChassisPowerLimitUpdate(const ChassisPowerLimitInput_s *in, ChassisPowerLimitOutput_s *out)
+{
+    if ((in == NULL) || (out == NULL))
+    {
+        return;
+    }
+
+    *out = (ChassisPowerLimitOutput_s){0};
+    out->scale_min = 1.0f;
+    for (uint8_t i = 0u; i < (uint8_t)APP_WHEEL_NUM; i++)
+    {
+        out->tau_out_nm[i] = in->tau_cmd_nm[i];
+        out->scale[i] = 1.0f;
+    }
+
+    if (s_power.initialized == 0u)
+    {
+        return;
+    }
+
+    float k1 = 0.0f;
+    float k2 = 0.0f;
+    Power_GetCoeffs(&k1, &k2);
+    if ((Power_IsFinite(k1) == 0u) || (Power_IsFinite(k2) == 0u) || (k2 < POWER_LIMIT_K2_MIN))
+    {
+        /* 模型参数坏了就直通，避免突然削力矩 */
+        return;
+    }
+    if (k1 < 0.0f)
+    {
+        k1 = 0.0f;
+    }
+
+    const ChassisPowerCfg_s *cfg = &s_power.cfg;
+    const float g = cfg->mech_gain;
+    const float k3_each = cfg->k3_w / (float)APP_WHEEL_NUM;
+    const float eps = cfg->limit_tau_eps_nm;
+    const float tau_max = cfg->cmd_torque_limit_nm;
+
+    float limit_src = ((Power_IsFinite(in->limit_w) != 0u) && (in->limit_w > 0.0f)) ? in->limit_w : cfg->limit_fixed_w;
+    if ((Power_IsFinite(limit_src) == 0u) || (limit_src <= 0.0f))
+    {
+        return;
+    }
+    float limit_eff = limit_src - cfg->limit_margin_w;
+    if (limit_eff < cfg->limit_min_w)
+    {
+        limit_eff = cfg->limit_min_w;
+    }
+    out->limit_eff_w = limit_eff;
+
+    float tau_cmd[APP_WHEEL_NUM];
+    float omega[APP_WHEEL_NUM];
+    float p[APP_WHEEL_NUM];
+    float p_before = 0.0f;
+
+    for (uint8_t i = 0u; i < (uint8_t)APP_WHEEL_NUM; i++)
+    {
+        if ((Power_IsFinite(in->tau_cmd_nm[i]) == 0u) || (Power_IsFinite(in->omega_radps[i]) == 0u))
+        {
+            /* fail-open：有限指令原样保留，非有限指令清 0 */
+            for (uint8_t j = 0u; j < (uint8_t)APP_WHEEL_NUM; j++)
+            {
+                out->tau_out_nm[j] = (Power_IsFinite(in->tau_cmd_nm[j]) != 0u) ? in->tau_cmd_nm[j] : 0.0f;
+            }
+            return;
+        }
+
+        tau_cmd[i] = in->tau_cmd_nm[i];
+        omega[i] = in->omega_radps[i];
+        p[i] = k2 * tau_cmd[i] * tau_cmd[i] + g * omega[i] * tau_cmd[i] + k1 * Power_Abs(omega[i]) + k3_each;
+        p_before += p[i];
+    }
+    out->p_before_w = p_before;
+    out->valid = 1u;
+
+    if ((in->enabled == 0u) || (p_before <= limit_eff))
+    {
+        out->p_after_w = p_before;
+        return;
+    }
+
+    /* 分类：零指令轮保持 0 并扣固定损耗；回馈轮保持指令并把负功率加回池；
+     * 其余正功率轮按 P_i 占比分配预算。 */
+    float pool = limit_eff;
+    float drive_sum = 0.0f;
+    uint8_t drive[APP_WHEEL_NUM] = {0u};
+    uint8_t n_drive = 0u;
+
+    for (uint8_t i = 0u; i < (uint8_t)APP_WHEEL_NUM; i++)
+    {
+        if (Power_Abs(tau_cmd[i]) < eps)
+        {
+            if (p[i] > 0.0f)
+            {
+                pool -= p[i];
+                out->p_fixed_w += p[i];
+            }
+            out->tau_out_nm[i] = 0.0f;
+        }
+        else if (p[i] <= 0.0f)
+        {
+            pool -= p[i]; // p<0：回馈，增加可分配池
+            out->p_regen_w += -p[i];
+        }
+        else
+        {
+            drive[i] = 1u;
+            n_drive++;
+            drive_sum += p[i];
+        }
+    }
+    out->pool_w = pool;
+
+    if ((n_drive != 0u) && (drive_sum > 0.0f))
+    {
+        if (pool <= 0.0f)
+        {
+            for (uint8_t i = 0u; i < (uint8_t)APP_WHEEL_NUM; i++)
+            {
+                if (drive[i] != 0u)
+                {
+                    out->tau_out_nm[i] = 0.0f;
+                }
+            }
+        }
+        else
+        {
+            /* 每轮在“保持指令符号”的可行域内的最小功率点：
+             * 顶点同号且不超出指令幅值 ⇒ 顶点；否则 τ=0。
+             * 预算分不到这个最小值时，解出的根在可行域外只能输出 0，
+             * 反而固定多耗 k1|ω|+k3/N ⇒ 先垫底，再按“高于垫底的部分”分剩余预算。 */
+            float p_min[APP_WHEEL_NUM] = {0.0f};
+            float min_sum = 0.0f;
+            float headroom_sum = 0.0f;
+
+            for (uint8_t i = 0u; i < (uint8_t)APP_WHEEL_NUM; i++)
+            {
+                if (drive[i] == 0u)
+                {
+                    continue;
+                }
+                const float b = g * omega[i];
+                const float c0 = k1 * Power_Abs(omega[i]) + k3_each;
+                const float vertex = -b / (2.0f * k2);
+                const uint8_t vertex_ok =
+                    (uint8_t)(((tau_cmd[i] >= 0.0f) ? (vertex >= 0.0f) : (vertex <= 0.0f)) && (Power_Abs(vertex) <= Power_Abs(tau_cmd[i])));
+                float pmin = (vertex_ok != 0u) ? (c0 - b * b / (4.0f * k2)) : c0;
+                if (pmin > p[i])
+                {
+                    pmin = p[i];
+                }
+                p_min[i] = pmin;
+                min_sum += pmin;
+                headroom_sum += p[i] - pmin;
+            }
+
+            for (uint8_t i = 0u; i < (uint8_t)APP_WHEEL_NUM; i++)
+            {
+                if (drive[i] == 0u)
+                {
+                    continue;
+                }
+                float budget;
+                if ((min_sum > pool) || (headroom_sum <= 0.0f))
+                {
+                    /* 预算连各轮最小值都覆盖不了：各自只到最小功率点（尽力而为） */
+                    budget = p_min[i];
+                }
+                else
+                {
+                    budget = p_min[i] + (pool - min_sum) * (p[i] - p_min[i]) / headroom_sum;
+                }
+                out->budget_w[i] = budget;
+                out->tau_out_nm[i] = Power_SolveWheelTorque(tau_cmd[i], omega[i], budget, k1, k2, k3_each, g, tau_max);
+            }
+        }
+    }
+
+    /* 限幅后功率与缩放诊断 */
+    float p_after = 0.0f;
+    for (uint8_t i = 0u; i < (uint8_t)APP_WHEEL_NUM; i++)
+    {
+        const float tau = out->tau_out_nm[i];
+        p_after += k2 * tau * tau + g * omega[i] * tau + k1 * Power_Abs(omega[i]) + k3_each;
+
+        if ((drive[i] != 0u) && (Power_Abs(tau_cmd[i]) >= eps))
+        {
+            const float s = out->tau_out_nm[i] / tau_cmd[i];
+            out->scale[i] = s;
+            if (s < out->scale_min)
+            {
+                out->scale_min = s;
+            }
+        }
+    }
+    out->p_after_w = p_after;
+    out->active = 1u;
 }

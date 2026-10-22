@@ -51,12 +51,12 @@
 #define CHASSIS_SUPER_CAP_REFEREE_POWER_LIMIT_W 70
 
 /*============================================
- *              功率预测（RLS，仅预测不限幅）
+ *              功率预测（RLS）+ 硬限幅
  *============================================*/
 /* 2027 规则舵向不计功率，模型只含 2 个驱动轮：
  *   P = g·Στ_iω_i + k1·Σ|ω_i| + k2·Στ_i² + k3
  * k3 必须静态标定（驱动失能、静止、DCDC 使能时 chassis_power_w 的均值）。
- * 本模块只输出 P_fb / P_cmd，不参与分配/限幅。 */
+ * 预测输出 P_fb / P_cmd；限幅按功率占比给每轮分预算、独立解二次方程。 */
 #define CHASSIS_POWER_PREDICT_ENABLE 1
 #define CHASSIS_POWER_RLS_UPDATE_ENABLE 1 // 0 = 只预测不更新（固定参数影子模式）
 
@@ -101,6 +101,24 @@
 
 #define CHASSIS_POWER_RLS_WARMUP_TICKS 150u  // RUN 上升沿后 300ms
 #define CHASSIS_POWER_RLS_REVERSAL_TICKS 50u // 换向后 100ms 不更新
+
+/*============================================
+ *              功率限制（v1 固定值硬限幅）
+ *============================================*/
+/* 上限来源用宏切换：
+ *   FIXED = 调试固定值；RULE = 比赛规则查表（v1 只留壳，数值未定不编造）。
+ * 运行时动态值（裁判 0x0201 / 超电）从 ChassisPowerLimitInput_s.limit_w 进，
+ * >0 时覆盖这里；v1 传 0。超电命令的 referee_power_limit 仍独立发 70W。
+ * 生效上限 = max(来源值 − MARGIN, MIN_W)，余量给模型误差和舵向功率兜底。 */
+#define CHASSIS_POWER_LIMIT_ENABLE 1
+#define CHASSIS_POWER_LIMIT_SOURCE_FIXED 0
+#define CHASSIS_POWER_LIMIT_SOURCE_RULE 1 // 预留：接裁判 chassis_power_limit / buffer_energy
+#define CHASSIS_POWER_LIMIT_SOURCE CHASSIS_POWER_LIMIT_SOURCE_FIXED
+
+#define CHASSIS_POWER_LIMIT_FIXED_W 70.0f
+#define CHASSIS_POWER_LIMIT_MARGIN_W 1.0f    // 生效上限 = 70 - 1 = 69 W
+#define CHASSIS_POWER_LIMIT_MIN_W 5.0f       // 下限；k3≈4W，再低物理不可达
+#define CHASSIS_POWER_LIMIT_TAU_EPS_NM 0.02f // |τ_cmd| 小于它按“零指令轮”处理
 
 /*============================================
  *              校准/整定参数

@@ -1,18 +1,25 @@
 /**
  * @file app_chassis_power.h
- * @brief 驱动轮功率预测：RLS 在线辨识 k1/k2，仅输出 P_fb / P_cmd，不限幅
+ * @brief 驱动轮功率：RLS 在线辨识 k1/k2，输出 P_fb / P_cmd，并提供硬限幅
  *
  * 模型（只有两个 LK MF7015 驱动轮，舵向按 2027 规则不计入功率）：
- *   P = τ_L·ω_L + τ_R·ω_R + k1·(|ω_L| + |ω_R|) + k2·(τ_L² + τ_R²) + k3
+ *   P = g·(τ_L·ω_L + τ_R·ω_R) + k1·(|ω_L| + |ω_R|) + k2·(τ_L² + τ_R²) + k3
  *
  * 回归量（固定尺度归一化，两个 θ 共用同一参数区间）：
  *   φ0 = (|ω_L| + |ω_R|) / 100
  *   φ1 = (τ_L² + τ_R²)   / 1
- *   y  = (P_meas − P_mech − k3) / 10
+ *   y  = (P_meas − g·Στω − k3) / 10
  *   θ0 = k1·10, θ1 = k2·0.1
  *
- * ⚠ 本模块只读控制链数据、只写自己的输出：
- *   不修改 wheel_torque / setref / 分配 / PID / 超电命令，这一版不做功率限幅。
+ * 职责边界：
+ *   - ChassisPowerUpdate() 只读控制链数据、只写预测输出（不改任何控制量）；
+ *   - ChassisPowerLimitUpdate() 也**不直接写 setref**，只给出 tau_out，
+ *     由 app 决定是否写回，保证限幅逻辑与调用顺序显式可见。
+ *
+ * 限幅口径（v1）：预测总功率超上限时，回馈轮保持指令并把负功率计入预算池，
+ * 零指令轮保持 0 并扣除其固定损耗，其余正功率轮按功率占比分预算，
+ * 每轮独立解 k2·τ² + g·ω·τ + (k1|ω| + k3/2 − budget) = 0。
+ * 上限来源用宏切换（固定 / 规则查表预留），不做能量环、不做反馈修正。
  *
  * 单位约定：τ 为电机轴 N·m（iq×Kt），ω 为电机轴 rad/s，均为 app 正方向；
  *           P 单位为 W，正=从超电取电，负=回馈。
@@ -53,8 +60,8 @@ typedef struct
     float k2_init_w_per_nm2;
 
     /* 机械项增益：P_mech 用 mech_gain·Στω。
-     * 正常为 1.0；若确认 LK 力矩常数刻度有问题，在这里补偿（不动控制链）。
-     * 实测（2026-10-22 跑车日志）Στω 系数约 0.738，待第二轮数据确认后再改。 */
+     * 1.0 = 不补偿；实测三份日志 g≈0.723（LK Kt/iq 刻度偏大 ~38%），
+     * 只补偿功率模型，不动 LK 驱动的 torque_constant（见 def.h 说明）。 */
     float mech_gain;
 
     /* lib_rls 配置（归一化 θ 空间） */
@@ -76,7 +83,13 @@ typedef struct
     float meas_max_w;           // 编码量程上限
     float motion_min_sum_radps; // |ω_L| + |ω_R| 下限
     float torque_gate_max_nm;   // 实测/指令力矩上限
-    float cmd_torque_limit_nm;  // τ_cmd 进入 P_cmd 前的钳位
+    float cmd_torque_limit_nm;  // τ_cmd 进入 P_cmd 前的钳位；限幅求解后也用它钳位
+
+    /* 功率限幅（v1 固定值硬限幅） */
+    float limit_fixed_w;    // 固定上限（CHASSIS_POWER_LIMIT_FIXED_W）
+    float limit_margin_w;   // 生效上限先减余量
+    float limit_min_w;      // 生效上限下限
+    float limit_tau_eps_nm; // |τ_cmd| 小于它按“零指令轮”处理
 
     uint64_t wheel_timeout_us;
     uint64_t supercap_timeout_us;
@@ -144,6 +157,36 @@ typedef struct
     uint8_t updated; // 本拍执行了 RLS 更新
 } ChassisPowerOutput_s;
 
+/*============================================
+ *              功率限幅（v1 硬限幅）
+ *============================================*/
+
+typedef struct
+{
+    float tau_cmd_nm[APP_WHEEL_NUM];  // 本拍待下发，app 正方向，已含 wheel_align
+    float omega_radps[APP_WHEEL_NUM]; // 实测轮速，app 正方向
+    float limit_w;                    // >0 运行时覆盖；<=0 用 cfg.limit_fixed_w
+    uint8_t enabled;                  // 0 = 直通（非 RUN 由 app 传 0）
+} ChassisPowerLimitInput_s;
+
+typedef struct
+{
+    float limit_eff_w; // 生效上限（已扣余量、已下限）
+    float p_before_w;  // ΣP_i(τ_cmd)，含 k3
+    float p_after_w;   // ΣP_i(τ_out)
+    float p_regen_w;   // 回馈信用（≥0）
+    float p_fixed_w;   // 零指令轮固定损耗（≥0）
+    float pool_w;      // 驱动轮可分配池
+
+    float tau_out_nm[APP_WHEEL_NUM];
+    float budget_w[APP_WHEEL_NUM];
+    float scale[APP_WHEEL_NUM]; // τ_out/τ_cmd（零指令轮记 1）
+    float scale_min;            // 驱动轮最小值；无驱动轮时 1.0
+
+    uint8_t active; // 1 = 本拍超限并执行了限幅
+    uint8_t valid;  // 1 = 输入/参数有效
+} ChassisPowerLimitOutput_s;
+
 /**
  * @brief 初始化（配置 + RLS 初值）
  * @retval 0  成功
@@ -161,5 +204,12 @@ void ChassisPowerReset(void);
  * @note 不修改任何控制量；输出只给遥测/调试。
  */
 void ChassisPowerUpdate(const ChassisPowerInput_s *in, ChassisPowerOutput_s *out);
+
+/**
+ * @brief 500 Hz 调用（在驱动轮下发之前）：按预测功率裁 τ_cmd
+ * @note 纯函数：不写 setref、不改任何控制量，由调用方决定是否写回 tau_out。
+ * @note 必须在 ChassisPowerInit 之后调用；未初始化/输入非法/enabled=0 时直通。
+ */
+void ChassisPowerLimitUpdate(const ChassisPowerLimitInput_s *in, ChassisPowerLimitOutput_s *out);
 
 #endif // !__APP_CHASSIS_POWER_H
