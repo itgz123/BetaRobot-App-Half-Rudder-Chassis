@@ -11,17 +11,14 @@
             "id": "1f25ec37d87c5e80",
             "type": "leaf",
             "state": {
-              "type": "canvas",
+              "type": "markdown",
               "state": {
-                "file": "方案/思路.canvas",
-                "viewState": {
-                  "x": -1580,
-                  "y": -880.5,
-                  "zoom": -0.07114545738506349
-                }
+                "file": "方案/rls功率控制.md",
+                "mode": "source",
+                "source": false
               },
-              "icon": "lucide-layout-dashboard",
-              "title": "思路"
+              "icon": "lucide-file",
+              "title": "rls功率控制"
             }
           }
         ]
@@ -86,7 +83,7 @@
       }
     ],
     "direction": "horizontal",
-    "width": 211.91015625
+    "width": 263.26171875
   },
   "right": {
     "id": "be4dc253a6c3f95f",
@@ -193,18 +190,27 @@
   },
   "active": "1f25ec37d87c5e80",
   "lastOpenFiles": [
+    "方案/rls辨识.md",
+    "方案/思路.canvas",
+    "方案/rls功率控制.md",
+    "方案/输出.md",
+    "底盘属性.md",
+    "方案/闭环.md",
+    "方案/反馈处理.md",
+    "方案/命令.md",
+    "其他.md",
+    "check_list.md",
+    "方案/rls辨识.md.tmp.18785.05a8a898b668",
+    "方案/rls辨识.md.tmp.18785.676e6bbfe64d",
+    "方案/rls辨识.md.tmp.18785.8f14ee7b0407",
+    "方案/rls辨识.md.tmp.18785.d956261191ac",
+    "方案/rls辨识.md.tmp.18785.e9c5684889e8",
+    "方案/rls辨识.md.tmp.18785.825fb185b453",
+    "方案/rls辨识.md.tmp.18785.15bfde51fd97",
+    "方案/rls辨识.md.tmp.18785.761890c5391f",
     "方案/rls辨识.md.tmp.18785.6505709cdebb",
     "方案/rls辨识.md.tmp.18785.06e78b225035",
-    "方案/rls辨识.md.tmp.18785.196864b218ad",
-    "方案/反馈处理.md",
     "方案/反馈.md",
-    "方案/思路.canvas",
-    "方案/闭环.md",
-    "方案/命令.md",
-    "方案/输出.md",
-    "方案/rls辨识.md",
-    "方案/check_list.md",
-    "其他.md",
     "简化方案/简化方案.canvas",
     "简化方案/rls功率控制.md",
     "简化方案/命令.md",
@@ -214,7 +220,6 @@
     "简化方案/反馈.md",
     "简化方案/舵向转向方案.md",
     "简化方案/闭环.md",
-    "方案",
     "未命名 1.md",
     "简化方案优化/简化方案.canvas",
     "简化方案优化/垃圾转向方案.md",
@@ -222,11 +227,6 @@
     "简化方案优化/反馈.md",
     "简化方案优化/舵向转向方案.md",
     "简化方案优化/闭环.md",
-    "舵轮策略.md",
-    "简化方案优化/命令.md",
-    "简化方案优化/rls功率控制.md",
-    "简化方案优化",
-    "完整方案",
-    "简化方案"
+    "舵轮策略.md"
   ]
 }

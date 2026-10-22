@@ -2,11 +2,11 @@
 	"nodes":[
 		{"id":"5719d851434ec1e9","type":"file","file":"方案/闭环.md","x":-2340,"y":-729,"width":721,"height":369,"color":"5"},
 		{"id":"1935869e0e418f12","type":"file","file":"方案/反馈处理.md","x":-2340,"y":-1240,"width":721,"height":387,"color":"5"},
-		{"id":"a6c33c9adf6588ec","type":"file","file":"方案/rls辨识.md","x":-1580,"y":-1240,"width":760,"height":387,"color":"5"},
+		{"id":"a6c33c9adf6588ec","type":"file","file":"方案/rls功率控制.md","x":-1580,"y":-1240,"width":760,"height":387,"color":"5"},
 		{"id":"71020c631205a21c","type":"file","file":"方案/输出.md","x":-1580,"y":-729,"width":760,"height":369,"color":"5"},
 		{"id":"b903ab00a38def59","type":"file","file":"方案/命令.md","x":-2220,"y":-820,"width":175,"height":50},
 		{"id":"0acf8555ab0c9c57","type":"file","file":"方案/反馈.md","x":-2061,"y":-1388,"width":163,"height":102},
-		{"id":"f7d2a94070bce0d9","x":-1320,"y":-1401,"width":500,"height":128,"color":"1","type":"text","text":"###### 标为绿色需要使用宏定义切换\n1. 不同方案切换\n2. 复杂方案需要可以切换只测量/预测或者接入反馈/限制功率"}
+		{"id":"f7d2a94070bce0d9","type":"text","text":"###### 标为绿色需要使用宏定义切换\n1. 不同方案切换\n2. 复杂方案需要可以切换只测量/预测或者接入反馈/限制功率","x":-1320,"y":-1401,"width":500,"height":128,"color":"1"}
 	],
 	"edges":[
 		{"id":"10f91fdd2936b542","fromNode":"0acf8555ab0c9c57","fromSide":"bottom","toNode":"1935869e0e418f12","toSide":"top"},
