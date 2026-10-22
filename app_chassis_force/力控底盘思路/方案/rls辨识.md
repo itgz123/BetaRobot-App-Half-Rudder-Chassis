@@ -277,10 +277,12 @@ app_chassis_force  模型定义、门控、摩擦/功率前馈、加权/约束�
 
 ---
 
-## 7. 半舵功率 RLS 模块（只预测、不限幅）
+## 7. 半舵功率 RLS 模块（预测 + 硬限幅）
 
-实现：`app_chassis_force/app_chassis_power.{h,c}`；开关 `CHASSIS_POWER_PREDICT_ENABLE`；
-`app_cfg.h` 打开 `LIB_RLS_USED`。本版**只输出预测**，不参与分配、限幅、PID 或超电命令。
+实现：`app_chassis_force/app_chassis_power.{h,c}`；开关 `CHASSIS_POWER_PREDICT_ENABLE`
+（预测/RLS）与 `CHASSIS_POWER_LIMIT_ENABLE`（限幅，见 §7.12）；
+`app_cfg.h` 打开 `LIB_RLS_USED`。预测本身不参与分配、PID 或超电命令；
+限幅只在驱动轮下发前裁 `τ_cmd`，不碰舵向、换向与力分配。
 
 ### 7.1 前提与边界
 
@@ -461,3 +463,86 @@ g 有两个自洽的解释，对**功率预测**没有区别，但对将来的**
 若是第 2 种（功率读数偏小），**将来用 `chassis_power_w` 做功率限幅会超功率 38%**，
 必须改用裁判系统功率或对读数乘 1/g 修正。这也是目前不建议直接改 LK `torque_constant`
 的另一个理由：改了也无法排除传感器口径问题，反而把控制链一起改掉。
+
+### 7.12 功率限制（v1 硬限幅，固定 70 W）
+
+**参考方案**（用户指定的 3 个项目）：
+
+| 项目 | 限制方式 | 本车采用 |
+|---|---|---|
+| RM2024-PowerModule | 每电机 `P_i=τω+k1|ω|+k2τ²+k3/n`；回馈轮保持指令、负功率加回预算池；正功率轮按权重分预算；逐轮解 `k2τ²+ωτ+(k1|ω|+k3/n−budget)=0`，按指令符号取根，Δ<0 取顶点；另有 √能量 PD 环 | 模型结构、回馈记池、逐轮二次方程、k3/n |
+| YunQian 半舵 | 同样的逐轮二次方程；舵向组先拿 80%；裁判上限扣 1 W 余量；非比赛固定 70 W | 70 W 固定档、1 W 余量、超电 DCDC 仍做最终兜底 |
+| basic_framework_mc02 | 只有 `LimitChassisOutput()` 占位 | 不参考 |
+
+本车没有逐轮速度设定值，RM2024 的“速度误差置信度”权重无法计算 ⇒ v1 只用**功率占比**
+分配（等价于其 errorConfidence=0 分支）。**不做能量环/爆发、不做反馈修正。**
+
+**宏（`app_chassis_force_def.h`）**
+
+```c
+#define CHASSIS_POWER_LIMIT_ENABLE 1
+#define CHASSIS_POWER_LIMIT_SOURCE_FIXED 0
+#define CHASSIS_POWER_LIMIT_SOURCE_RULE  1   // 比赛规则查表（预留，v1 返回固定值）
+#define CHASSIS_POWER_LIMIT_SOURCE CHASSIS_POWER_LIMIT_SOURCE_FIXED
+
+#define CHASSIS_POWER_LIMIT_FIXED_W 70.0f
+#define CHASSIS_POWER_LIMIT_MARGIN_W 1.0f    // 生效上限 = 69 W
+#define CHASSIS_POWER_LIMIT_MIN_W 5.0f       // k3≈4 W，再低物理不可达
+#define CHASSIS_POWER_LIMIT_TAU_EPS_NM 0.02f // 小于它按“零指令轮”
+```
+
+生效上限 `limit_eff = max(来源值 − MARGIN, MIN_W)`。运行时动态值从
+`ChassisPowerLimitInput_s.limit_w`（>0 覆盖）进；v1 传 0。
+
+**分配流程**（`ChassisPowerLimitUpdate`，每拍 500 Hz，在驱动轮 `SetRef` 之前）：
+
+1. 每轮 `P_i = g·τ_iω_i + k1|ω_i| + k2τ_i² + k3/2`，`P_total=ΣP_i`；
+   `P_total <= limit_eff` 或 `enabled=0` ⇒ 原样直通（**不钳位**，关开关行为不变）。
+2. 分类：
+   - 零指令轮 `|τ_cmd|<eps`：保持 0，正功率从池中扣掉（`p_fixed`）；
+   - 回馈轮 `P_i<=0`：保持指令，`−P_i` 加回池（`p_regen`）；
+   - 其余正功率轮：进入分配，`drive_sum += P_i`。
+3. `pool = limit_eff − Σ固定 + Σ回馈`；`pool<=0` ⇒ 驱动轮力矩置 0。
+4. 先给每轮垫底 `p_min_i`（保持指令符号的可行域内的最小功率：顶点同号且不超指令幅值
+   取顶点，否则 `τ=0` 的 `k1|ω|+k3/2`），剩余预算按 `P_i−p_min_i` 占比分配：
+
+```text
+pool >= Σp_min  → budget_i = p_min_i + (pool−Σp_min)·(P_i−p_min_i)/Σ(P_k−p_min_k)
+pool <  Σp_min  → budget_i = p_min_i（尽力而为）
+```
+
+不垫底时，分到“比该轮最小功率还小”的预算会解出可行域外的根、只能输出 0，
+反而固定多耗 `k1|ω|+k3/2`，导致总功率超上限（随机工况扫描最多超 ~10 W）。
+垫底后 2 万组随机 τ/ω 扫描：无超限、无反号、无放大。
+5. 逐轮解二次方程：
+
+```text
+b = g·ω, c0 = k1|ω| + k3/2
+Δ = b² − 4k2(c0 − budget)
+Δ<=0 → τ = −b/(2k2)（顶点，低速极小预算）
+Δ> 0 → 在与 τ_cmd 同号的根里取离 τ_cmd 最近的；都不同号 ⇒ 0
+```
+
+选根用“同号最近根”而不是“按指令符号取根”：正常驱动象限两者一致；制动象限
+（τ_cmd 与 ω 反号）按符号取根可能选到更远的根，同号最近根等价于留在指令所在分支。
+限幅分支内再加：反号 ⇒ 0、`|τ|>|τ_cmd|` ⇒ 回退指令、钳 `±cmd_torque_limit_nm`。
+
+**失败与边界**
+
+- RLS 参数非有限或 `k2<0.1`、模块未初始化、输入非有限 ⇒ **直通（fail-open）**，
+  由超电 70 W DCDC 兜底；不采用“坏帧停车”。
+- `k1/k2` 直接读 RLS 当前 θ（与预测同一组）；限幅在预测更新之前调用也只用上一拍值，
+  RLS 50 Hz，最坏滞后 20 ms。
+- 逐轮独立缩放会改变 `τ_L/τ_R` 比例，理论上引入横摆；用 CH21~23 验证。
+
+**遥测**（RLS 布局）：CH1 `limit_eff`、CH2 `P_before`、CH3 `P_after`、CH4 `scale_min`；
+CH5/7 为限幅后 setref，CH31 (`P_cmd`) 应与 CH3 基本一致。
+
+**验证**：`chassis_power_calib.py --limit-check` 输出超限比例、`scale_min` 分布、
+`P_after` 是否 ≤ 上限、`P_after`/`P_cmd` 一致性、限幅段 `P_meas` 对账。
+台架静态核对：一轮 `τ_cmd=0`、`ω=0`、`limit_eff=69` 时
+`τ≈sqrt((69−4.03)/13.7)≈2.18 N·m`；两轮都给 4.5 时预算各半 ⇒ `τ≈1.54 N·m`。
+
+**已知风险**：模型 RMS 1.4~2.9 W，70 W 减 1 W 余量仍可能瞬时超出；若超电
+`chassis_power_w` 实际含舵向功率，限幅后 `P_meas` 会高于 `P_after`；g 的物理归因
+（§7.11）未台架确认，若超电读数偏小则真实母线功率等比例偏大。v1 不做反馈修正。
