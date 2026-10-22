@@ -14,7 +14,7 @@ void function_in_main_c(void);
  *   线上帧 = [0xA5][seq][汉明编码区 E][CRC8][0x5A]，N = sizeof(结构体)）
  *============================================*/
 #pragma pack(push, 1)
-/* 云台→底盘（13B）与底盘→云台（12B）各一结构体；两端 app.h 的定义须字节对齐
+/* 云台→底盘（14B）与底盘→云台（12B）各一结构体；两端 app.h 的定义须字节对齐
  * （COMM_DEF 内 _Static_assert 校验 sizeof == 约定线长）。 */
 typedef enum : uint8_t
 {
@@ -31,6 +31,7 @@ typedef struct
     float vx;
     float vy;
     float w;
+    uint8_t power_boost_enable; // 1 = 在基础功率上限上加一段额外功率（云台侧遥控 ch5）
 } gimbal2chassis_data_t;
 typedef struct
 {

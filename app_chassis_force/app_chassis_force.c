@@ -44,7 +44,7 @@ LOG_INSTANCE_DEF(g_chassis_log, "chassis", 20);
 /* CAN1 / IDSEQ / PROTO_EXT。底盘 tx_id=0x110 段、rx_id=0x100 段（云台侧对调）；
  * 线上帧 = [0xA5][seq][汉明编码区 E][CRC8][0x5A]，payload 就是下面两个业务结构体。
  * CAN1 上还有经典 CAN 的 RS05，故介质必须 CLASSIC，不能开 FD。 */
-COMM_DEF(gimbal_comm, MEDIA_CAN_IDSEQ, EXT, EXT, gimbal2chassis_data_t, 13, chassis2gimbal_data_t, 12, UNPACK_IN_ISR);
+COMM_DEF(gimbal_comm, MEDIA_CAN_IDSEQ, EXT, EXT, gimbal2chassis_data_t, 14, chassis2gimbal_data_t, 12, UNPACK_IN_ISR);
 
 gimbal2chassis_data_t g_gimbal2chassis_data = {0};      // 云台→底盘：速度指令 + 档位
 volatile robot_mode g_gimbal_mode_rx = robot_mode_stop; // 接收回调写的档位原始副本
@@ -850,13 +850,29 @@ void AppChassisRun(float dt, uint64_t time_stamp)
 
 #if CHASSIS_POWER_LIMIT_ENABLE
     /* 功率限幅：驱动轮下发前裁 τ_cmd。非 RUN 直通（setref 已由状态机清零）。
-     * limit_w<=0 时走 def.h 的宏来源：FIXED 用 cfg.limit_fixed_w，RULE 查表（预留）。 */
-    const float limit_src_w =
+     * 上限 = 来源（FIXED 固定值 / RULE 裁判查表，预留）
+     *      + 超电开关加成（云台 ch5：是否在基础上限上再放一段额外功率）
+     *      再与超电反馈的"当前可用功率"取 min（超电是最终瓶颈）。
+     * 超电帧过期/从未收到时只用来源上限，不拿陈旧值锁死底盘。 */
+    float limit_src_w =
 #if (CHASSIS_POWER_LIMIT_SOURCE == CHASSIS_POWER_LIMIT_SOURCE_RULE)
         Power_LimitFromRule();
 #else
-        0.0f;
+        CHASSIS_POWER_LIMIT_FIXED_W;
 #endif
+    if ((GimbalCommIsOnline() != 0u) && (g_gimbal2chassis_data.power_boost_enable != 0u))
+    {
+        limit_src_w += CHASSIS_POWER_LIMIT_BOOST_W;
+    }
+    {
+        const uint64_t now_us = DWT_GetTimeUs();
+        const float avail_w = (float)g_super_cap_data.chassis_power_limit_w;
+        if ((g_super_cap_data.timestamp_us != 0u) && (now_us >= g_super_cap_data.timestamp_us) &&
+            ((now_us - g_super_cap_data.timestamp_us) < (uint64_t)CHASSIS_POWER_LIMIT_AVAIL_TIMEOUT_US) && (avail_w > 0.0f) && (avail_w < limit_src_w))
+        {
+            limit_src_w = avail_w;
+        }
+    }
     const ChassisPowerLimitInput_s power_limit_in = {
         .tau_cmd_nm =
             {
@@ -886,7 +902,9 @@ void AppChassisRun(float dt, uint64_t time_stamp)
      * 即使全 0 也必须发——云台侧靠这帧维持链路在线。 */
     CommSend(&gimbal_comm, (uint8_t *)&g_chassis2gimbal_data);
 
-    /* 超级电容：drv 不自动周期发送，这里按时间累计每 20ms 发一帧使能命令。 */
+    /* 超级电容：drv 不自动周期发送，这里按时间累计每 20ms 发一帧使能命令。
+     * 使能位与裁判上限保持 Init 时的固定值（遥控 ch5 只影响上面的功率上限加成，
+     * 不是 DCDC 开关）。 */
     static float s_super_cap_accum_ms = 0.0f;
     s_super_cap_accum_ms += dt;
     if (s_super_cap_accum_ms >= (float)CHASSIS_SUPER_CAP_SEND_PERIOD_MS)

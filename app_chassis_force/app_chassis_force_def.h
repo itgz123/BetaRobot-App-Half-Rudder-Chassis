@@ -107,16 +107,26 @@
  *============================================*/
 /* 上限来源用宏切换：
  *   FIXED = 调试固定值；RULE = 比赛规则查表（v1 只留壳，数值未定不编造）。
- * 运行时动态值（裁判 0x0201 / 超电）从 ChassisPowerLimitInput_s.limit_w 进，
- * >0 时覆盖这里；v1 传 0。超电命令的 referee_power_limit 仍独立发 70W。
- * 生效上限 = max(来源值 − MARGIN, MIN_W)，余量给模型误差和舵向功率兜底。 */
+ *
+ * 最终生效上限（app 侧组装，见 app_chassis_force.c 下发段）：
+ *   1) base = FIXED 固定值 / RULE 裁判查表；
+ *   2) 云台遥控 ch5（power_boost_enable）= 1 时 base += BOOST_W；
+ *   3) 再与超电反馈 0x052 的"当前可用功率" chassis_power_limit_w 取 min
+ *      （超电是最终瓶颈；帧过期/未收到时跳过，只用 base）。
+ * 限幅模块内部再扣 MARGIN 并钳 MIN_W。
+ * 超电命令里的 referee_power_limit 仍是独立的上游预算，不随 ch5 变化。 */
 #define CHASSIS_POWER_LIMIT_ENABLE 1
 #define CHASSIS_POWER_LIMIT_SOURCE_FIXED 0
 #define CHASSIS_POWER_LIMIT_SOURCE_RULE 1 // 预留：接裁判 chassis_power_limit / buffer_energy
 #define CHASSIS_POWER_LIMIT_SOURCE CHASSIS_POWER_LIMIT_SOURCE_FIXED
 
-#define CHASSIS_POWER_LIMIT_FIXED_W 70.0f
-#define CHASSIS_POWER_LIMIT_MARGIN_W 1.0f    // 生效上限 = 70 - 1 = 69 W
+#define CHASSIS_POWER_LIMIT_FIXED_W 75.0f
+/* 超电开关加成 (W)：开 = 在基础上限上再放这么多（拿电容缓冲换机动性）。
+ * TODO 数值待定：按超电容量/战术整定；最终仍被超电反馈可用功率钳住。 */
+#define CHASSIS_POWER_LIMIT_BOOST_W 100.0f
+/* 超电反馈的新鲜度窗口 (us)：超过它就不采信 chassis_power_limit_w。 */
+#define CHASSIS_POWER_LIMIT_AVAIL_TIMEOUT_US 100000u
+#define CHASSIS_POWER_LIMIT_MARGIN_W 1.0f    // 生效上限 = 来源值 - 1 W
 #define CHASSIS_POWER_LIMIT_MIN_W 5.0f       // 下限；k3≈4W，再低物理不可达
 #define CHASSIS_POWER_LIMIT_TAU_EPS_NM 0.02f // |τ_cmd| 小于它按“零指令轮”处理
 

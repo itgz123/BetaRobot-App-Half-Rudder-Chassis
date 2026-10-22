@@ -464,7 +464,7 @@ g 有两个自洽的解释，对**功率预测**没有区别，但对将来的**
 必须改用裁判系统功率或对读数乘 1/g 修正。这也是目前不建议直接改 LK `torque_constant`
 的另一个理由：改了也无法排除传感器口径问题，反而把控制链一起改掉。
 
-### 7.12 功率限制（v1 硬限幅，固定 70 W）
+### 7.12 功率限制（v1 硬限幅，固定 70 W + 超电开关加成）
 
 **参考方案**（用户指定的 3 个项目）：
 
@@ -486,13 +486,28 @@ g 有两个自洽的解释，对**功率预测**没有区别，但对将来的**
 #define CHASSIS_POWER_LIMIT_SOURCE CHASSIS_POWER_LIMIT_SOURCE_FIXED
 
 #define CHASSIS_POWER_LIMIT_FIXED_W 70.0f
-#define CHASSIS_POWER_LIMIT_MARGIN_W 1.0f    // 生效上限 = 69 W
+#define CHASSIS_POWER_LIMIT_BOOST_W 20.0f      // 云台 ch5 打开时的额外功率（待整定）
+#define CHASSIS_POWER_LIMIT_AVAIL_TIMEOUT_US 100000u // 超电可用功率新鲜度窗口
+#define CHASSIS_POWER_LIMIT_MARGIN_W 1.0f    // 生效上限 = 来源值 - 1 W
 #define CHASSIS_POWER_LIMIT_MIN_W 5.0f       // k3≈4 W，再低物理不可达
 #define CHASSIS_POWER_LIMIT_TAU_EPS_NM 0.02f // 小于它按“零指令轮”
 ```
 
-生效上限 `limit_eff = max(来源值 − MARGIN, MIN_W)`。运行时动态值从
-`ChassisPowerLimitInput_s.limit_w`（>0 覆盖）进；v1 传 0。
+**上限组装**（`app_chassis_force.c` 下发段，每拍）：
+
+```text
+base = FIXED ? 70 W : RULE 查表
+base += (云台在线 && ch5 power_boost_enable) ? BOOST_W : 0
+若超电帧新鲜(≤100ms) 且 chassis_power_limit_w > 0：
+    base = min(base, 超电反馈可用功率)
+limit_eff = max(base − MARGIN, MIN_W)
+```
+
+即 `rls功率控制.md` 的两种模式：ch5 关 = `min(超电可用功率, 固定上限)`；
+ch5 开 = `min(超电可用功率, 固定上限 + 加成)`。**ch5 不是 DCDC 使能开关**——
+超电命令的 `enable_dcdc` 与 `referee_power_limit` 保持 Init 固定值。
+超电帧过期/从未收到时只用 `base`，避免陈旧值锁死底盘。
+组装后的值通过 `ChassisPowerLimitInput_s.limit_w`（>0 覆盖）送进限幅模块。
 
 **分配流程**（`ChassisPowerLimitUpdate`，每拍 500 Hz，在驱动轮 `SetRef` 之前）：
 
