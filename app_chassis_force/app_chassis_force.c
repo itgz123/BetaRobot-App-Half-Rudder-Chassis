@@ -5,12 +5,14 @@
 #include "app_chassis_fsm.h"
 #include "app_chassis_force_loop.h"
 #include "app_chassis_output.h"
+#include "app_chassis_power.h"
 //
 #include "app.h"       // gimbal2chassis_data_t / chassis2gimbal_data_t / robot_mode
 #include "robot_def.h" // IMU 安装方向与位置宏
 #include "lib_math.h"
 #include "bsp_sys_status.h"
 #include "bsp_gpio.h"
+#include "bsp_dwt.h"
 #include "bsp_log.h"
 #include "drvs_djimotor_broadcast.h"
 #include "drvs_lkmotor_broadcast.h"
@@ -101,6 +103,8 @@ vector3_t g_chassis_wrench;
 /* 输出：速度逆解目标、±180° 分支状态、轮缘力矩分配结果。
  * 几何/分配计算在 app_chassis_output.c，这里只保存结果供下发与遥测。 */
 ChassisOutput_s g_chassis_output;
+/* 功率预测输出：只给 VOFA/调试，不参与任何控制计算 */
+ChassisPowerOutput_s g_chassis_power;
 
 /*---------------- 校准 ----------------*/
 
@@ -395,6 +399,38 @@ void AppChassisInit(void)
         .referee_power_limit = CHASSIS_SUPER_CAP_REFEREE_POWER_LIMIT_W,
         .referee_energy_buffer = 0,
     };
+
+#if CHASSIS_POWER_PREDICT_ENABLE
+    /* ---- 功率预测：RLS 只辨识 k1/k2（k3 需静态标定）----
+     * 只输出 P_fb / P_cmd 给遥测；不参与分配/限幅，见 app_chassis_power.h。 */
+    const ChassisPowerCfg_s power_cfg = {
+        .k3_w = CHASSIS_POWER_RLS_K3_W,
+        .k1_init_nm = CHASSIS_POWER_RLS_K1_INIT_NM,
+        .k2_init_w_per_nm2 = CHASSIS_POWER_RLS_K2_INIT_W_PER_NM2,
+        .mech_gain = CHASSIS_POWER_MECH_GAIN,
+        .lambda = CHASSIS_POWER_RLS_LAMBDA,
+        .p_init = CHASSIS_POWER_RLS_P_INIT,
+        .p_min = CHASSIS_POWER_RLS_P_MIN,
+        .p_max = CHASSIS_POWER_RLS_P_MAX,
+        .param_min = CHASSIS_POWER_RLS_PARAM_MIN,
+        .param_max = CHASSIS_POWER_RLS_PARAM_MAX,
+        .innovation_limit_w = CHASSIS_POWER_RLS_INNOV_LIMIT_W,
+        .lpf_rc_s = CHASSIS_POWER_RLS_LPF_RC_S,
+        .rls_period_s = CHASSIS_POWER_RLS_PERIOD_S,
+        .meas_min_abs_w = CHASSIS_POWER_RLS_MEAS_MIN_ABS_W,
+        .meas_min_w = CHASSIS_POWER_RLS_MEAS_MIN_W,
+        .meas_max_w = CHASSIS_POWER_RLS_MEAS_MAX_W,
+        .motion_min_sum_radps = CHASSIS_POWER_RLS_MOTION_MIN_RADPS,
+        .torque_gate_max_nm = CHASSIS_POWER_RLS_TORQUE_GATE_NM,
+        .cmd_torque_limit_nm = CHASSIS_POWER_RLS_CMD_TORQUE_LIMIT_NM,
+        .wheel_timeout_us = CHASSIS_POWER_RLS_WHEEL_TIMEOUT_US,
+        .supercap_timeout_us = CHASSIS_POWER_RLS_SUPERCAP_TIMEOUT_US,
+        .warmup_ticks = CHASSIS_POWER_RLS_WARMUP_TICKS,
+        .reversal_holdoff_ticks = CHASSIS_POWER_RLS_REVERSAL_TICKS,
+        .update_enable = CHASSIS_POWER_RLS_UPDATE_ENABLE,
+    };
+    BSP_ASSERT_APP_CALL(ChassisPowerInit(&power_cfg));
+#endif
 
     /* ---- 舵向控制核（drvlib_motor）：左右舵同参数 ----
      * loop_type   ANGLE|SPEED 两环都建（校准期临时收窄成 SPEED，进 RUN 时恢复）
@@ -811,6 +847,43 @@ void AppChassisRun(float dt, uint64_t time_stamp)
         (void)SuperCapYq2027Send(&super_cap, &s_super_cap_cmd);
     }
 
+#if CHASSIS_POWER_PREDICT_ENABLE
+    /* 功率预测：只读本拍已下发的 setref 与最新超电帧，输出只给 VOFA。
+     * 放在控制下发之后，模块即使有 bug 也影响不到本拍控制量。
+     * τ_cmd 用 g_wheel_*_setref（已含 wheel_align、app 方向），不是分配级 wheel_torque。 */
+    const ChassisPowerInput_s power_in = {
+        .wheel_speed_radps =
+            {
+                [APP_WHEEL_L] = g_chassis_feedback.wheel[APP_WHEEL_L].speed,
+                [APP_WHEEL_R] = g_chassis_feedback.wheel[APP_WHEEL_R].speed,
+            },
+        .wheel_torque_nm =
+            {
+                [APP_WHEEL_L] = g_chassis_feedback.wheel[APP_WHEEL_L].torque,
+                [APP_WHEEL_R] = g_chassis_feedback.wheel[APP_WHEEL_R].torque,
+            },
+        .wheel_torque_cmd_nm =
+            {
+                [APP_WHEEL_L] = g_wheel_l_setref,
+                [APP_WHEEL_R] = g_wheel_r_setref,
+            },
+        .wheel_timestamp_us =
+            {
+                [APP_WHEEL_L] = g_chassis_feedback.wheel[APP_WHEEL_L].timestamp_us,
+                [APP_WHEEL_R] = g_chassis_feedback.wheel[APP_WHEEL_R].timestamp_us,
+            },
+        .meas_power_w = g_super_cap_data.chassis_power_w,
+        .meas_timestamp_us = g_super_cap_data.timestamp_us,
+        .meas_protocol_valid = g_super_cap_data.protocol_valid,
+        .meas_dcdc_enabled = g_super_cap_data.dcdc_enabled,
+        .meas_fault_level = (uint8_t)g_super_cap_data.fault_level,
+        .dt_s = dt_s, // ⚠ AppChassisRun 的 dt 是 ms，功率模块要秒
+        .now_us = DWT_GetTimeUs(),
+        .run = (uint8_t)(state == CHASSIS_STATE_RUN),
+    };
+    ChassisPowerUpdate(&power_in, &g_chassis_power);
+#endif
+
     /*============================ VOFA 遥测：100Hz ============================*/
     /* 500Hz 任务按时间累计，每满 10ms 发一帧（不依赖任务周期整除）。
      * 通道布局见 app_cfg.h；IMU 自己的 VOFA 已关（通道只够一方）。 */
@@ -820,6 +893,7 @@ void AppChassisRun(float dt, uint64_t time_stamp)
     {
         s_vofa_accum_ms -= 10.0f;
 
+#if CHASSIS_VOFA_DEBUG_CHASSIS
         const float r2d = 180.0f / M_PI;
         /* 目标角内部是连续表达（可能 >180°），遥测统一折到 (−180°,180°] 与实测同系；
          * 遥控判换向时看角度差即可（wrap 差），不要直接减。 */
@@ -827,33 +901,63 @@ void AppChassisRun(float dt, uint64_t time_stamp)
         VofaSetChannel(2, g_chassis_feedback.state.steer_angle[LIB_CHASSIS_HALF_RUDDER_L] * r2d);                           // 左舵实际 (deg)
         VofaSetChannel(3, Lib_Math_WrapAngleNegPIToPI(g_chassis_output.sel.angle_target[LIB_CHASSIS_HALF_RUDDER_R]) * r2d); // 右舵目标 (deg)
         VofaSetChannel(4, g_chassis_feedback.state.steer_angle[LIB_CHASSIS_HALF_RUDDER_R] * r2d);                           // 右舵实际 (deg)
-        VofaSetChannel(5, g_chassis_output.sel.wheel_torque[LIB_CHASSIS_HALF_RUDDER_L]);                                    // 左轮目标 (N·m)
-        VofaSetChannel(6, g_chassis_feedback.wheel[APP_WHEEL_L].torque * CHASSIS_DRIVE_REDUCTION);                          // 左轮实测 (N·m)
-        VofaSetChannel(7, g_chassis_output.sel.wheel_torque[LIB_CHASSIS_HALF_RUDDER_R]);                                    // 右轮目标 (N·m)
-        VofaSetChannel(8, g_chassis_feedback.wheel[APP_WHEEL_R].torque * CHASSIS_DRIVE_REDUCTION);                          // 右轮实测 (N·m)
-        VofaSetChannel(9, (float)g_chassis_output.sel.combo);                                                               // 换向方案 0~3
-        VofaSetChannel(10, g_chassis_output.sel.cost[0]);                                                                   // 组合代价 (s，方案 1)
+#else
+        VofaSetChannel(1, 0.0f);
+        VofaSetChannel(2, 0.0f);
+        VofaSetChannel(3, 0.0f);
+        VofaSetChannel(4, 0.0f);
+#endif
+        VofaSetChannel(5, g_wheel_l_setref);                                                       // 左轮 setref (N·m)
+        VofaSetChannel(6, g_chassis_feedback.wheel[APP_WHEEL_L].torque * CHASSIS_DRIVE_REDUCTION); // 左轮实测 (N·m)
+        VofaSetChannel(7, g_wheel_r_setref);                                                       // 右轮 setref (N·m)
+        VofaSetChannel(8, g_chassis_feedback.wheel[APP_WHEEL_R].torque * CHASSIS_DRIVE_REDUCTION); // 右轮实测 (N·m)
+#if CHASSIS_VOFA_DEBUG_CHASSIS
+        VofaSetChannel(9, (float)g_chassis_output.sel.combo);                    // 换向方案 0~3
+        VofaSetChannel(10, g_chassis_output.sel.cost[0]);                        // 组合代价 (s，方案 1)
         VofaSetChannel(11, g_chassis_output.sel.cost[1]);
         VofaSetChannel(12, g_chassis_output.sel.cost[2]);
         VofaSetChannel(13, g_chassis_output.sel.cost[3]);
-        VofaSetChannel(14, (float)g_chassis_output.sel.locked);                          // 无力向小力矩锁定（方案 1）
+        VofaSetChannel(14, (float)g_chassis_output.sel.locked);                  // 无力向小力矩锁定（方案 1）
+#else
+        /* RLS 回归量：低通项就是 RLS 实际用的 φ，raw 项供 PC 核对低通重建 */
+        VofaSetChannel(9, g_chassis_power.sum_abs_omega_lpf);                    // Σ|ω| LPF (rad/s)
+        VofaSetChannel(10, g_chassis_power.sum_tau2_fb_lpf);                     // Στ² LPF ((N·m)²)
+        VofaSetChannel(11, g_chassis_power.sum_omega2_lpf);                      // Σω² LPF ((rad/s)²)
+        VofaSetChannel(12, g_chassis_power.p_mech_fb_lpf);                       // g·LPF(Στω) (W)
+        VofaSetChannel(13, g_chassis_power.mech_gain);                           // 机械项增益 g
+        VofaSetChannel(14, (float)g_chassis_power.update_count);                 // RLS 更新次数
+#endif
         VofaSetChannel(15, (float)state);                                                // 状态机状态
         VofaSetChannel(16, g_chassis_output.sel.wheel_align[LIB_CHASSIS_HALF_RUDDER_L]); // 左轮余弦优化系数
         VofaSetChannel(17, g_chassis_output.sel.wheel_align[LIB_CHASSIS_HALF_RUDDER_R]); // 右轮余弦优化系数
-        /* CH18~28：命令 / 反馈 / 力控中间量。换向乱转的定位关键是
-         * "期望力方向为什么转" —— 对比 CH18~20（指令）与 CH21~23（反馈），
-         * 再看 CH24~26 是否跟着转，就能区分指令在转、反馈在转还是分配在转。 */
-        VofaSetChannel(18, g_gimbal2chassis_data.vx);                                              // 指令 vx (m/s)
-        VofaSetChannel(19, g_gimbal2chassis_data.vy);                                              // 指令 vy (m/s)
-        VofaSetChannel(20, g_gimbal2chassis_data.w);                                               // 指令 w (rad/s)
-        VofaSetChannel(21, g_chassis_twist_fb.x);                                                  // 反馈 vx (m/s，轮速正解)
-        VofaSetChannel(22, g_chassis_twist_fb.y);                                                  // 反馈 vy (m/s，轮速正解)
-        VofaSetChannel(23, g_chassis_twist_fb.z);                                                  // 反馈 w (rad/s，IMU)
-        VofaSetChannel(24, g_chassis_wrench.x);                                                    // 期望力 fx (N)
-        VofaSetChannel(25, g_chassis_wrench.y);                                                    // 期望力 fy (N)
-        VofaSetChannel(26, g_chassis_wrench.z);                                                    // 期望力矩 mw (N·m)
+        /* CH18~23：指令 / 反馈速度，直线/自旋分段靠它们。 */
+        VofaSetChannel(18, g_gimbal2chassis_data.vx); // 指令 vx (m/s)
+        VofaSetChannel(19, g_gimbal2chassis_data.vy); // 指令 vy (m/s)
+        VofaSetChannel(20, g_gimbal2chassis_data.w);  // 指令 w (rad/s)
+        VofaSetChannel(21, g_chassis_twist_fb.x);     // 反馈 vx (m/s，轮速正解)
+        VofaSetChannel(22, g_chassis_twist_fb.y);     // 反馈 vy (m/s，轮速正解)
+        VofaSetChannel(23, g_chassis_twist_fb.z);     // 反馈 w (rad/s，IMU)
+#if CHASSIS_VOFA_DEBUG_CHASSIS
+        VofaSetChannel(24, g_chassis_wrench.x); // 期望力 fx (N)
+        VofaSetChannel(25, g_chassis_wrench.y); // 期望力 fy (N)
+        VofaSetChannel(26, g_chassis_wrench.z); // 期望力矩 mw (N·m)
+#else
+        VofaSetChannel(24, g_chassis_power.sum_abs_omega_raw); // Σ|ω| 瞬时 (rad/s)
+        VofaSetChannel(25, g_chassis_power.sum_tau2_fb_raw);   // Στ² 瞬时 ((N·m)²)
+        VofaSetChannel(26, g_chassis_power.p_mech_fb_raw);     // Στω 瞬时 (W)
+#endif
         VofaSetChannel(27, g_chassis_feedback.wheel[APP_WHEEL_L].speed / CHASSIS_DRIVE_REDUCTION); // 左驱动轮轮速 (rad/s)
         VofaSetChannel(28, g_chassis_feedback.wheel[APP_WHEEL_R].speed / CHASSIS_DRIVE_REDUCTION); // 右驱动轮轮速 (rad/s)
+        /* CH29~36：功率预测（只预测不限幅）。P_meas 与 P_fb_lpf 同相位口径；
+         * P_cmd 是指令口径；gate_mask 位定义见 app_chassis_power.h。 */
+        VofaSetChannel(29, g_chassis_power.p_meas_w);         // 超电实测功率 (W)
+        VofaSetChannel(30, g_chassis_power.p_fb_lpf_w);       // 实测口径模型估计 (W)
+        VofaSetChannel(31, g_chassis_power.p_cmd_w);          // 指令口径预测 (W)
+        VofaSetChannel(32, g_chassis_power.p_fb_raw_w);       // 瞬时估计 (W)
+        VofaSetChannel(33, g_chassis_power.k1_nm);            // k1 (N·m)
+        VofaSetChannel(34, g_chassis_power.k2_w_per_nm2);     // k2 (W/(N·m)²)
+        VofaSetChannel(35, g_chassis_power.innovation_w);     // RLS 新息 (W)
+        VofaSetChannel(36, (float)g_chassis_power.gate_mask); // 门控掩码
         VofaSend();
     }
 }

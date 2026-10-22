@@ -51,6 +51,58 @@
 #define CHASSIS_SUPER_CAP_REFEREE_POWER_LIMIT_W 70
 
 /*============================================
+ *              功率预测（RLS，仅预测不限幅）
+ *============================================*/
+/* 2027 规则舵向不计功率，模型只含 2 个驱动轮：
+ *   P = g·Στ_iω_i + k1·Σ|ω_i| + k2·Στ_i² + k3
+ * k3 必须静态标定（驱动失能、静止、DCDC 使能时 chassis_power_w 的均值）。
+ * 本模块只输出 P_fb / P_cmd，不参与分配/限幅。 */
+#define CHASSIS_POWER_PREDICT_ENABLE 1
+#define CHASSIS_POWER_RLS_UPDATE_ENABLE 1 // 0 = 只预测不更新（固定参数影子模式）
+
+#define CHASSIS_POWER_RLS_K3_W 4.03f // 2026-10-22 静止 90.7s 实测均值（std 0.66W, n=9069）
+/* 初值取 3 份跑车日志的批量拟合值：k1≈0.01（几乎不可辨识）、k2≈13.7。
+ * 若 k1 落在下限 0.001，说明该速度项在本车激励下确实接近 0，属正常。 */
+#define CHASSIS_POWER_RLS_K1_INIT_NM 0.02f
+#define CHASSIS_POWER_RLS_K2_INIT_W_PER_NM2 13.70f
+
+/* 机械项增益：P_mech = g·Στω。
+ * 2026-10-22 三份日志（直线往返+自旋 / 直线+旋转 / 随机运动）批量拟合：
+ *   g = 0.736 / 0.7233 / 0.7235，按转速/力矩/前进倒车/制动分箱均在 0.69~0.75，
+ *   交叉项 g1 不显著（随机运动）或只有 +0.015%/rad/s（直线+旋转）⇒ 基本是恒定刻度。
+ * 最可能原因：LK 力矩常数（或 iq 刻度）偏大 ~38%，与多支战队反馈一致。
+ * ⚠ 只放在功率模型里补偿，不动 LK 驱动的 torque_constant：否则控制链力矩一起变，
+ *   且 k2 = R/Kt² 需按 1/g² 重标（约 13.7 → 26.2），容易漏改。
+ * 1.0f = 不补偿。只影响功率预测，不改控制链力矩。 */
+#define CHASSIS_POWER_MECH_GAIN 0.723f
+
+/* lib_rls 配置（θ 为归一化值：θ0 = 10·k1，θ1 = 0.1·k2） */
+#define CHASSIS_POWER_RLS_LAMBDA 0.999f
+#define CHASSIS_POWER_RLS_P_INIT 1.0f
+#define CHASSIS_POWER_RLS_P_MIN 1.0e-6f
+#define CHASSIS_POWER_RLS_P_MAX 100.0f
+#define CHASSIS_POWER_RLS_PARAM_MIN 0.01f
+#define CHASSIS_POWER_RLS_PARAM_MAX 5.0f
+#define CHASSIS_POWER_RLS_INNOV_LIMIT_W 20.0f
+
+/* 滤波与降频 */
+#define CHASSIS_POWER_RLS_LPF_RC_S 0.05f
+#define CHASSIS_POWER_RLS_PERIOD_S 0.02f
+
+/* 采样门控 */
+#define CHASSIS_POWER_RLS_MEAS_MIN_ABS_W 5.0f
+#define CHASSIS_POWER_RLS_MEAS_MIN_W (-250.0f)
+#define CHASSIS_POWER_RLS_MEAS_MAX_W 700.0f
+#define CHASSIS_POWER_RLS_MOTION_MIN_RADPS 2.0f
+#define CHASSIS_POWER_RLS_TORQUE_GATE_NM 4.0f
+#define CHASSIS_POWER_RLS_CMD_TORQUE_LIMIT_NM 4.5f
+#define CHASSIS_POWER_RLS_WHEEL_TIMEOUT_US 50000u
+#define CHASSIS_POWER_RLS_SUPERCAP_TIMEOUT_US 100000u
+
+#define CHASSIS_POWER_RLS_WARMUP_TICKS 150u  // RUN 上升沿后 300ms
+#define CHASSIS_POWER_RLS_REVERSAL_TICKS 50u // 换向后 100ms 不更新
+
+/*============================================
  *              校准/整定参数
  *============================================*/
 /* 舵向位置环 WRAP 窗口 = 舵轮整圈 360°（电机侧 ±π×减速比，跨度 16π = 舵轮 2π）。
