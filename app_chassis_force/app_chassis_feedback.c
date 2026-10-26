@@ -3,7 +3,7 @@
  * @brief 底盘反馈处理实现（方案 0 独立 / 方案 1 ESKF 融合）
  *
  * 处理顺序：
- *   1. IMU：安装矩阵旋转 → 底盘系、角加速度差分+低通、杆臂补偿到质心；
+ *   1. IMU：lib_imu_transform 把陀螺/加速度旋转到底盘系并做杆臂补偿；
  *      方案 1 另按姿态扣重力得到 acc_lin，并用时间戳判数据新鲜度；
  *   2. 轮向：协议原始量 × CHASSIS_WHEEL_x_DIR → app 正方向（带帧时间戳）；
  *   3. 正解：舵角/轮速换到舵轮侧 → LibChassisForward → vx/vy，
@@ -14,6 +14,8 @@
 #include "app_chassis_feedback.h"
 
 #include "app_chassis_force_def.h" // CHASSIS_IMU_ALPHA_* / CHASSIS_FEEDBACK_SCHEME
+#include "bsp_sys_status.h"
+#include "lib_imu_transform.h"
 #include "lib_math.h"
 
 #if (CHASSIS_FEEDBACK_SCHEME != 0) && (CHASSIS_FEEDBACK_SCHEME != 1)
@@ -32,16 +34,27 @@ _Static_assert((int)LIB_CHASSIS_HALF_RUDDER_R == (int)APP_WHEEL_R, "wheel order 
 static struct
 {
     ChassisFeedbackCfg_s cfg;
-    vector3_t imu_pos;        // IMU 安装点在底盘系的位置 (m)，固定
-    vector3_t gyro_prev;      // 上一有效陀螺样本（底盘系）
-    vector3_t alpha_lpf;      // 低通后的角加速度（底盘系）
-    uint8_t gyro_prev_valid;  // 0 = 还没有上一样本（首拍/复位后）
+    LibImuTransform_Instance_s imu_tf; // IMU 系→底盘系 + 杆臂补偿（差分/滤波状态在模块内）
 } s_feedback;
 
 void ChassisFeedbackInit(const ChassisFeedbackCfg_s *cfg)
 {
     s_feedback.cfg = *cfg;
-    s_feedback.imu_pos = Lib_Math_Mat4MulPoint(*cfg->imu_to_chassis, (vector3_t){0.0f, 0.0f, 0.0f});
+
+    /* 从 4x4 齐次变换提取：
+     *   平移 t          = IMU 原点在底盘系的位置；
+     *   左上 3x3 的三列 = IMU x/y/z 轴在底盘系的方向（原样取用，不转置）。 */
+    const matrix4_t imu_to_chassis = *cfg->imu_to_chassis;
+    const LibImuTransform_Config_s tf_cfg = {
+        .pos = Lib_Math_Mat4MulPoint(imu_to_chassis, (vector3_t){0.0f, 0.0f, 0.0f}),
+        .x_axis = (vector3_t){imu_to_chassis.data[0][0], imu_to_chassis.data[1][0], imu_to_chassis.data[2][0]},
+        .y_axis = (vector3_t){imu_to_chassis.data[0][1], imu_to_chassis.data[1][1], imu_to_chassis.data[2][1]},
+        .z_axis = (vector3_t){imu_to_chassis.data[0][2], imu_to_chassis.data[1][2], imu_to_chassis.data[2][2]},
+        .alpha_lpf_rc = CHASSIS_IMU_ALPHA_LPF_RC,
+        .alpha_limit = CHASSIS_IMU_ALPHA_LIMIT,
+    };
+    BSP_ASSERT_APP_CALL(LibImuTransformInit(&s_feedback.imu_tf, &tf_cfg));
+
 #if CHASSIS_FEEDBACK_SCHEME == 1
     ChassisEskfInit();
 #endif
@@ -50,9 +63,7 @@ void ChassisFeedbackInit(const ChassisFeedbackCfg_s *cfg)
 
 void ChassisFeedbackReset(void)
 {
-    s_feedback.gyro_prev = (vector3_t){0.0f, 0.0f, 0.0f};
-    s_feedback.alpha_lpf = (vector3_t){0.0f, 0.0f, 0.0f};
-    s_feedback.gyro_prev_valid = 0u;
+    LibImuTransformReset(&s_feedback.imu_tf);
 #if CHASSIS_FEEDBACK_SCHEME == 1
     ChassisEskfReset();
 #endif
@@ -60,54 +71,33 @@ void ChassisFeedbackReset(void)
 
 void ChassisFeedbackUpdateImu(const ChassisFeedbackImuInput_s *in, ChassisFeedback_s *out)
 {
-    const matrix4_t imu_to_chassis = *s_feedback.cfg.imu_to_chassis;
+    /* IMU 系 → 底盘系、角加速度差分/限幅/低通、杆臂补偿统一由 lib_imu_transform 完成。 */
+    const LibImuTransform_Input_s tf_in = {
+        .gyro = in->gyro,
+        .acc = in->acc,
+        .dt = in->dt,
+        .valid = in->valid,
+    };
+    LibImuTransform_Output_s tf_out;
+    (void)LibImuTransformUpdate(&s_feedback.imu_tf, &tf_in, &tf_out);
 
-    /* IMU 系 → 底盘系（方向量，不带平移） */
-    const vector3_t gyro = Lib_Math_Mat4MulDir(imu_to_chassis, in->gyro);
-    const vector3_t acc_chassis = Lib_Math_Mat4MulDir(imu_to_chassis, in->acc);
-
-    out->imu.gyro = gyro;
+    out->imu.gyro = tf_out.gyro;
+    out->imu.acc = tf_out.acc;
     out->imu.euler = in->euler;
     out->imu.yaw_rate = in->yaw_rate; // world 竖直轴，与安装方向无关
-    out->imu.fresh = (uint8_t)((in->dt > 0.0f) && (in->valid != 0u));
+    out->imu.fresh = tf_out.fresh;
+    out->imu.pos = tf_out.pos;
 #if CHASSIS_FEEDBACK_SCHEME == 1
     /* 方案 1：数据超时也判无效，避免冻结的陀螺样本被当作真值 */
     {
         const uint64_t now_us = DWT_GetTimeUs();
         const uint8_t stale =
             (uint8_t)((in->timestamp_us == 0u) || (now_us < in->timestamp_us) || ((now_us - in->timestamp_us) >= (uint64_t)CHASSIS_ESKF_IMU_TIMEOUT_US));
-        out->imu.valid = (uint8_t)((in->valid != 0u) && (stale == 0u));
+        out->imu.valid = (uint8_t)((tf_out.valid != 0u) && (stale == 0u));
     }
 #else
-    out->imu.valid = in->valid;
+    out->imu.valid = tf_out.valid;
 #endif
-    out->imu.pos = s_feedback.imu_pos;
-
-    /* 角加速度：只在有新陀螺样本时差分（dt == 0 = 本拍没新样本，保持上次 α）。
-     * 直接差分噪声大，先限幅再做一阶低通；RC 见 CHASSIS_IMU_ALPHA_LPF_RC。 */
-    if (in->dt > 0.0f)
-    {
-        if (s_feedback.gyro_prev_valid != 0u)
-        {
-            const float dt_a = in->dt;
-            vector3_t alpha = Lib_Math_Vec3Scale(Lib_Math_Vec3Sub(gyro, s_feedback.gyro_prev), 1.0f / dt_a);
-            alpha.x = Lib_Math_Clamp(alpha.x, -CHASSIS_IMU_ALPHA_LIMIT, CHASSIS_IMU_ALPHA_LIMIT);
-            alpha.y = Lib_Math_Clamp(alpha.y, -CHASSIS_IMU_ALPHA_LIMIT, CHASSIS_IMU_ALPHA_LIMIT);
-            alpha.z = Lib_Math_Clamp(alpha.z, -CHASSIS_IMU_ALPHA_LIMIT, CHASSIS_IMU_ALPHA_LIMIT);
-
-            const float k = dt_a / (CHASSIS_IMU_ALPHA_LPF_RC + dt_a);
-            s_feedback.alpha_lpf.x += (alpha.x - s_feedback.alpha_lpf.x) * k;
-            s_feedback.alpha_lpf.y += (alpha.y - s_feedback.alpha_lpf.y) * k;
-            s_feedback.alpha_lpf.z += (alpha.z - s_feedback.alpha_lpf.z) * k;
-        }
-        s_feedback.gyro_prev = gyro;
-        s_feedback.gyro_prev_valid = 1u;
-    }
-
-    /* 杆臂补偿：a_center = a_imu − α×r − ω×(ω×r) */
-    const vector3_t centripetal = Lib_Math_Vec3Cross(gyro, Lib_Math_Vec3Cross(gyro, s_feedback.imu_pos));
-    const vector3_t tangential = Lib_Math_Vec3Cross(s_feedback.alpha_lpf, s_feedback.imu_pos);
-    out->imu.acc = Lib_Math_Vec3Sub(Lib_Math_Vec3Sub(acc_chassis, tangential), centripetal);
 
 #if CHASSIS_FEEDBACK_SCHEME == 1
     /* 姿态去重力：世界 +z 在 IMU 系 = (−sin p, cos p·sin r, cos p·cos r)，
@@ -117,7 +107,7 @@ void ChassisFeedbackUpdateImu(const ChassisFeedbackImuInput_s *in, ChassisFeedba
         Lib_Math_SinCos(in->euler.roll, &sr, &cr);
         Lib_Math_SinCos(in->euler.pitch, &sp, &cp);
         const vector3_t up_imu = {-sp, cp * sr, cp * cr};
-        const vector3_t up_chassis = Lib_Math_Mat4MulDir(imu_to_chassis, up_imu);
+        const vector3_t up_chassis = Lib_Math_Mat4MulDir(*s_feedback.cfg.imu_to_chassis, up_imu);
         out->imu.acc_lin = Lib_Math_Vec3Sub(out->imu.acc, Lib_Math_Vec3Scale(up_chassis, CHASSIS_ESKF_G));
     }
 #else

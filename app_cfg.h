@@ -17,6 +17,7 @@
 #define LIB_MATH_TRIG_LUT_USED       // 自研查表三角函数 Lib_Math_*LUT（不定义则表不编译、接口不可用）
 #define LIB_MATH_TRIG_LUT_SPEED 1    // LUT 速度：0=四分之一表(省flash/象限映射) 1=2π全周期表(无象限映射/更快)
 #define LIB_MATH_TRIG_LUT_PREC 3     // LUT 精度：0=低 1=中 2=高 3=满精度(误差<ε=2^-23)
+#define LIB_IMU_TRANSFORM_USED       // IMU 系→目标系变换 + 加速度计杆臂补偿
 #define BSP_FREERTOS_USED            // FreeRTOS 静态创建封装
 #define BSP_FREERTOS_STATUS_USED     // FreeRTOS 运行状态（钩子 + 空闲任务状态快照，调试器读 bsp_freertos_status）
 #define BSP_SPI_USED                 // SPI (BMI088 / LCD)
