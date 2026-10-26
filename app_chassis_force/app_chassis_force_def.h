@@ -440,14 +440,16 @@ typedef struct
  *   ±0.005 rad/s，P 项贡献 ±0.01 N·m，不加死区即可。
  * ⚠ 平动的死区同样会在死区内把前馈一起清零；当前三组前馈系数为 0，
  *   标定摩擦/重力前馈时须重新评估（可改为只对误差扣减的死区）。 */
-#define CHASSIS_FORCE_VX_KP (50.0f)       // N/(m/s)
-#define CHASSIS_FORCE_VY_KP (50.0f)       // N/(m/s)
-#define CHASSIS_FORCE_XY_DEADBAND (0.02f) // m/s，平移速度误差死区
-#define CHASSIS_FORCE_XY_LPF_RC (0.020f)  // s，输出一阶低通
+#define CHASSIS_FORCE_XY_KP (200.0f)            // N/(m/s)
+#define CHASSIS_FORCE_VY_KP (200.0f)            // N/(m/s)
+#define CHASSIS_FORCE_VY_KI (10.0f)             //
+#define CHASSIS_FORCE_VY_INTEGRAL_LIMIT (10.0f) //
+#define CHASSIS_FORCE_XY_DEADBAND (0.02f)       // m/s，平移速度误差死区
+#define CHASSIS_FORCE_XY_LPF_RC (0.020f)        // s，输出一阶低通
 
-#define CHASSIS_FORCE_W_KP (6.0f)             // N·m/(rad/s)
-#define CHASSIS_FORCE_W_KI (12.0f)            // N·m/(rad/s)/s（每秒累积，与调用频率无关）
-#define CHASSIS_FORCE_W_INTEGRAL_LIMIT (0.6f) // N·m，积分限幅（实测偏航阻力约 0.35 N·m）
+#define CHASSIS_FORCE_W_KP (12.0f)              // N·m/(rad/s)
+#define CHASSIS_FORCE_W_KI (6.0f)               // N·m/(rad/s)/s（每秒累积，与调用频率无关）
+#define CHASSIS_FORCE_W_INTEGRAL_LIMIT (0.005f) // N·m，积分限幅（实测偏航阻力约 0.35 N·m）
 /* mw 输出低通：30 → 70 ms。
  * 纯 vy 日志实测 yaw 环在 ~4 Hz 自持（舵 ±90° 时 ∂φ/∂Mw ≈ 20~35°/N·m），
  * 30 ms 对 4 Hz 只衰减到 0.80，几乎没作用；70 ms 衰减到 ~0.50。

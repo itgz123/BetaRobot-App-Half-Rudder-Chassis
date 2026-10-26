@@ -35,18 +35,20 @@ static struct
 } s_loop;
 
 static const PID_Init_Config_s s_pid_cfg_vx = {
-    .kp = CHASSIS_FORCE_VX_KP,
-    .ki = 0.0f,
+    .kp = CHASSIS_FORCE_XY_KP,
+    .ki = CHASSIS_FORCE_VY_KI,
     .kd = 0.0f,
+    .integral_limit = CHASSIS_FORCE_VY_INTEGRAL_LIMIT,
     .deadband = CHASSIS_FORCE_XY_DEADBAND,
     .out_lpf_rc = CHASSIS_FORCE_XY_LPF_RC,
     .config_mask = PID_ENABLE_DEADBAND | PID_ENABLE_OUTPUT_FILTER,
 };
 
 static const PID_Init_Config_s s_pid_cfg_vy = {
-    .kp = CHASSIS_FORCE_VY_KP,
-    .ki = 0.0f,
+    .kp = CHASSIS_FORCE_XY_KP,
+    .ki = CHASSIS_FORCE_VY_KI,
     .kd = 0.0f,
+    .integral_limit = CHASSIS_FORCE_VY_INTEGRAL_LIMIT,
     .deadband = CHASSIS_FORCE_XY_DEADBAND,
     .out_lpf_rc = CHASSIS_FORCE_XY_LPF_RC,
     .config_mask = PID_ENABLE_DEADBAND | PID_ENABLE_OUTPUT_FILTER,
