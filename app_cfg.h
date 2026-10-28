@@ -7,6 +7,9 @@
 #ifndef __APP_CFG_H
 #define __APP_CFG_H
 
+/* 锁定 BetaRobot 主仓库版本；未定义或版本不匹配时 BetaRobot_version.h 会 #error */
+#define APP_LOCKED_BETAROBOT_VERSION 20261028191341
+
 #include "bsp_map.h"
 #include "robot_def.h"
 
