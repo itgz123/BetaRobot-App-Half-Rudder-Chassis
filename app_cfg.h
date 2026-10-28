@@ -8,7 +8,7 @@
 #define __APP_CFG_H
 
 /* 锁定 BetaRobot 主仓库版本；未定义或版本不匹配时 BetaRobot_version.h 会 #error */
-#define APP_LOCKED_BETAROBOT_VERSION 20261028191341
+#define APP_LOCKED_BETAROBOT_VERSION 20261028195746
 
 #include "bsp_map.h"
 #include "robot_def.h"
@@ -38,12 +38,9 @@
 #define LIB_LKF_USED                 // 通用卡尔曼滤波 (lib_lkf)
 #define LIB_ESKF_USED                // 通用误差状态卡尔曼滤波 (lib_eskf；反馈融合方案 1)
 #define DRVLIB_BMI088_KALMAN_USED    // BMI088 零偏标定 + 线性卡尔曼姿态（drv_bmi088 + lib_lkf 联合）
-#define DRVS_DJIMOTOR_BROADCAST_USED // DJI 电机驱动（drvs 纯协议版一拖四广播；舵向 2 个 M3508）
-#define DRVLIB_MOTOR_USED            // 三级级联 PID + 反馈后处理（drvs 之上；舵向位置/速度环）
-#define DRV_DMMOTOR_USED             // DM 电机驱动
-#define DRV_RSMOTOR_USED             // RS05 电机驱动（灵足时代，MIT 协议）
-#define DRV_LKMOTOR_USED             // LK MF 一对一协议驱动
-#define DRVS_LKMOTOR_BROADCAST_USED  // LK 电机驱动（drvs 纯协议版一拖四广播；驱动 2 个 MF7015，力控）
+#define DRV_DJIMOTOR_BROADCAST_USED // DJI 电机驱动（drv 纯协议版一拖四广播；舵向 2 个 M3508）
+#define DRVLIB_MOTOR_USED            // 三级级联 PID + 反馈后处理（drv 之上；舵向位置/速度环）
+#define DRV_LKMOTOR_BROADCAST_USED  // LK 电机驱动（drv 纯协议版一拖四广播；驱动 2 个 MF7015，力控）
 #define DRV_AXIS_MIT_LITE_USED       // 单轴 MIT 关节控制
 #define LIB_CHASSIS_HALF_RUDDER_USED // 底盘运动学内核（半舵封装：2 组舵轮正/逆解）
 #define LIB_FSM_TABLE_USED           // 表驱动状态机（底盘顶层状态机：校准/故障/失能/运行）

@@ -14,8 +14,8 @@
 #include "bsp_gpio.h"
 #include "bsp_dwt.h"
 #include "bsp_log.h"
-#include "drvs_djimotor_broadcast.h"
-#include "drvs_lkmotor_broadcast.h"
+#include "drv_djimotor_broadcast.h"
+#include "drv_lkmotor_broadcast.h"
 #include "drvlib_bmi088_kalman.h"
 #include "drvlib_motor.h"
 #include "lib_chassis.h" // LibChassisInstance_s / 半舵几何
@@ -122,14 +122,14 @@ float g_wheel_r_setref;
 
 /*============================ 电机实例 ============================*/
 // 舵向：DJI M3508（C620），id2 / id4，共用 0x200 广播帧
-DRVS_DJIMOTOR_BROADCAST_INSTANCE_DEF(rudder_l_motor);
-DRVS_DJIMOTOR_BROADCAST_INSTANCE_DEF(rudder_r_motor);
-DRVS_DJIMOTOR_BROADCAST_GROUP_DEF(rudder_motor_group);
+DRV_DJIMOTOR_BROADCAST_INSTANCE_DEF(rudder_l_motor);
+DRV_DJIMOTOR_BROADCAST_INSTANCE_DEF(rudder_r_motor);
+DRV_DJIMOTOR_BROADCAST_GROUP_DEF(rudder_motor_group);
 
 // 驱动轮：LK MF7015 直驱，id1 / id2，共用 0x280 转矩广播帧
-DRVS_LKMOTOR_BROADCAST_INSTANCE_DEF(wheel_l_motor);
-DRVS_LKMOTOR_BROADCAST_INSTANCE_DEF(wheel_r_motor);
-DRVS_LKMOTOR_BROADCAST_GROUP_DEF(wheel_motor_group);
+DRV_LKMOTOR_BROADCAST_INSTANCE_DEF(wheel_l_motor);
+DRV_LKMOTOR_BROADCAST_INSTANCE_DEF(wheel_r_motor);
+DRV_LKMOTOR_BROADCAST_GROUP_DEF(wheel_motor_group);
 
 // 舵向控制核：位置/速度两级级联（drvlib_motor 只算控制量，不碰协议）
 DRVLIB_MOTOR_INSTANCE_DEF(rudder_l_ctrl);
@@ -340,37 +340,37 @@ void AppChassisInit(void)
     ChassisOutputInit(&output_cfg);
 
     /* ---- 舵向：DJI 广播 ---- */
-    BSP_ASSERT_APP_CALL(DrvsDJIMotorBroadcastRegister(&rudder_l_motor));
-    BSP_ASSERT_APP_CALL(DrvsDJIMotorBroadcastRegister(&rudder_r_motor));
+    BSP_ASSERT_APP_CALL(DrvDJIMotorBroadcastRegister(&rudder_l_motor));
+    BSP_ASSERT_APP_CALL(DrvDJIMotorBroadcastRegister(&rudder_r_motor));
 
-    DrvsDJIMotorBroadcastConfig_s rudder_l_cfg = {
+    DrvDJIMotorBroadcastConfig_s rudder_l_cfg = {
         .group = &rudder_motor_group,
         .can_e = CAN_2,
-        .model = DRVS_DJI_MODEL_M3508,
+        .model = DRV_DJI_MODEL_M3508,
         .motor_id = 2,
         .torque_constant = 1, // 待标定
         .reload_count = 100,
         .fault_action = DAEMON_FAULT_NONE,
         .timeout_ms = 1,
     };
-    DrvsDJIMotorBroadcastConfig_s rudder_r_cfg = {
+    DrvDJIMotorBroadcastConfig_s rudder_r_cfg = {
         .group = &rudder_motor_group,
         .can_e = CAN_2,
-        .model = DRVS_DJI_MODEL_M3508,
+        .model = DRV_DJI_MODEL_M3508,
         .motor_id = 4,
         .torque_constant = 1, // 待标定
         .reload_count = 100,
         .fault_action = DAEMON_FAULT_NONE,
         .timeout_ms = 1,
     };
-    BSP_ASSERT_APP_CALL(DrvsDJIMotorBroadcastConfig(&rudder_l_motor, &rudder_l_cfg));
-    BSP_ASSERT_APP_CALL(DrvsDJIMotorBroadcastConfig(&rudder_r_motor, &rudder_r_cfg));
+    BSP_ASSERT_APP_CALL(DrvDJIMotorBroadcastConfig(&rudder_l_motor, &rudder_l_cfg));
+    BSP_ASSERT_APP_CALL(DrvDJIMotorBroadcastConfig(&rudder_r_motor, &rudder_r_cfg));
 
     /* ---- 驱动轮：LK 广播（纯转矩，力控由 app 直接给） ---- */
-    BSP_ASSERT_APP_CALL(DrvsLKMotorBroadcastRegister(&wheel_l_motor));
-    BSP_ASSERT_APP_CALL(DrvsLKMotorBroadcastRegister(&wheel_r_motor));
+    BSP_ASSERT_APP_CALL(DrvLKMotorBroadcastRegister(&wheel_l_motor));
+    BSP_ASSERT_APP_CALL(DrvLKMotorBroadcastRegister(&wheel_r_motor));
 
-    DrvsLKMotorBroadcastConfig_s wheel_l_cfg = {
+    DrvLKMotorBroadcastConfig_s wheel_l_cfg = {
         .group = &wheel_motor_group,
         .can_e = CAN_2,
         .motor_id = 1,
@@ -379,7 +379,7 @@ void AppChassisInit(void)
         .fault_action = DAEMON_FAULT_NONE,
         .timeout_ms = 1,
     };
-    DrvsLKMotorBroadcastConfig_s wheel_r_cfg = {
+    DrvLKMotorBroadcastConfig_s wheel_r_cfg = {
         .group = &wheel_motor_group,
         .can_e = CAN_2,
         .motor_id = 2,
@@ -388,8 +388,8 @@ void AppChassisInit(void)
         .fault_action = DAEMON_FAULT_NONE,
         .timeout_ms = 1,
     };
-    BSP_ASSERT_APP_CALL(DrvsLKMotorBroadcastConfig(&wheel_l_motor, &wheel_l_cfg));
-    BSP_ASSERT_APP_CALL(DrvsLKMotorBroadcastConfig(&wheel_r_motor, &wheel_r_cfg));
+    BSP_ASSERT_APP_CALL(DrvLKMotorBroadcastConfig(&wheel_l_motor, &wheel_l_cfg));
+    BSP_ASSERT_APP_CALL(DrvLKMotorBroadcastConfig(&wheel_r_motor, &wheel_r_cfg));
 
     /* ---- 超级电容：YQ2027（CAN2，命令 0x061 / 反馈 0x052）----
      * 2026-10-21 起只有这一套格式：主控发 0x061，超电固定回 0x052。 */
@@ -657,8 +657,8 @@ void AppChassisRun(float dt, uint64_t time_stamp)
      * 多圈累加与真实位置脱节，再使能的第一拍位置会跳。
      * 方向：反馈一律先取协议原始量，舵向由 drvlib 的 feedback_direction 统一修正；
      *       驱动轮不走 drvlib，由 feedback 模块按 CHASSIS_WHEEL_x_DIR 换算到 app 正方向。 */
-    const DrvsDJIMotorBroadcastData_s rudder_l_data = DrvsDJIMotorBroadcastGetData(&rudder_l_motor);
-    const DrvsDJIMotorBroadcastData_s rudder_r_data = DrvsDJIMotorBroadcastGetData(&rudder_r_motor);
+    const DrvDJIMotorBroadcastData_s rudder_l_data = DrvDJIMotorBroadcastGetData(&rudder_l_motor);
+    const DrvDJIMotorBroadcastData_s rudder_r_data = DrvDJIMotorBroadcastGetData(&rudder_r_motor);
     const DrvlibMotorFeedback_s rudder_l_fb = {
         .position = rudder_l_data.position,
         .speed = rudder_l_data.speed,
@@ -672,8 +672,8 @@ void AppChassisRun(float dt, uint64_t time_stamp)
         .timestamp_us = rudder_r_data.timestamp_us,
     };
 
-    const DrvsLKMotorBroadcastData_s wheel_l_data = DrvsLKMotorBroadcastGetData(&wheel_l_motor);
-    const DrvsLKMotorBroadcastData_s wheel_r_data = DrvsLKMotorBroadcastGetData(&wheel_r_motor);
+    const DrvLKMotorBroadcastData_s wheel_l_data = DrvLKMotorBroadcastGetData(&wheel_l_motor);
+    const DrvLKMotorBroadcastData_s wheel_r_data = DrvLKMotorBroadcastGetData(&wheel_r_motor);
     const ChassisFeedbackWheelInput_s feedback_wheel = {
         .wheel =
             {
@@ -843,10 +843,10 @@ void AppChassisRun(float dt, uint64_t time_stamp)
     /* 超电反馈快照（纯 getter、无副作用）：放在下发前，限幅/预测读同一帧。 */
     g_super_cap_data = SuperCapYq2027GetData(&super_cap);
 
-    // 舵向：drvs 纯协议。两个 SetRef 必须都在 GroupSend 之前完成（一帧组两台）。
-    DrvsDJIMotorBroadcastSetRef(&rudder_l_motor, rudder_l_cmd);
-    DrvsDJIMotorBroadcastSetRef(&rudder_r_motor, rudder_r_cmd);
-    DrvsDJIMotorBroadcastGroupSend(&rudder_motor_group);
+    // 舵向：drv 纯协议。两个 SetRef 必须都在 GroupSend 之前完成（一帧组两台）。
+    DrvDJIMotorBroadcastSetRef(&rudder_l_motor, rudder_l_cmd);
+    DrvDJIMotorBroadcastSetRef(&rudder_r_motor, rudder_r_cmd);
+    DrvDJIMotorBroadcastGroupSend(&rudder_motor_group);
 
 #if CHASSIS_POWER_LIMIT_ENABLE
     /* 功率限幅：驱动轮下发前裁 τ_cmd。非 RUN 直通（setref 已由状态机清零）。
@@ -894,9 +894,9 @@ void AppChassisRun(float dt, uint64_t time_stamp)
 
     // 驱动轮：纯力矩协议，无使能开关。停机 = 每拍 SetRef(0) + GroupSend。
     // CHASSIS_WHEEL_x_DIR 是"app 正方向 → 电机原始方向"的力矩符号。
-    DrvsLKMotorBroadcastSetRef(&wheel_l_motor, g_wheel_l_setref * (float)CHASSIS_WHEEL_L_DIR);
-    DrvsLKMotorBroadcastSetRef(&wheel_r_motor, g_wheel_r_setref * (float)CHASSIS_WHEEL_R_DIR);
-    DrvsLKMotorBroadcastGroupSend(&wheel_motor_group);
+    DrvLKMotorBroadcastSetRef(&wheel_l_motor, g_wheel_l_setref * (float)CHASSIS_WHEEL_L_DIR);
+    DrvLKMotorBroadcastSetRef(&wheel_r_motor, g_wheel_r_setref * (float)CHASSIS_WHEEL_R_DIR);
+    DrvLKMotorBroadcastGroupSend(&wheel_motor_group);
 
     /* 云台通信：每周期回一帧（vx/vy 来自轮速正解，w 来自 IMU，见上面回传段）。
      * 即使全 0 也必须发——云台侧靠这帧维持链路在线。 */

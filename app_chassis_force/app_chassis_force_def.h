@@ -8,7 +8,7 @@
  *   - 跨函数共享的 plain struct / enum 类型。
  *
  * ⚠ 电机/IMU/通信的驱动实例仍在 app_chassis_force.c：
- *   Drvs*_INSTANCE_DEF / BMI088_KALMAN_INSTANCE_DEF 展开的是 static 对象，
+ *   Drv*_INSTANCE_DEF / BMI088_KALMAN_INSTANCE_DEF 展开的是 static 对象，
  *   头文件里无法 extern 给别的编译单元用，只能用在使用它的那个 .c 里。
  */
 
