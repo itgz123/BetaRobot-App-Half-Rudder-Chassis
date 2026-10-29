@@ -579,7 +579,7 @@ void AppChassisInit(void)
     CommConfig_s gimbal_comm_cfg = {
         .media_cfg = &gimbal_comm_media_cfg,
         .on_frame = GimbalRecvOnFrame,
-        .daemon_fault = DAEMON_FAULT_BUZZER_SHORT,
+        .daemon_fault = DAEMON_FAULT_BUZZER_MINOR,
         .daemon_reload = 10, /* 对端每 2ms 发一帧，超 10ms 判离线 */
     };
     BSP_ASSERT_APP_CALL(CommRegister(&gimbal_comm));

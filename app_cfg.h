@@ -8,7 +8,7 @@
 #define __APP_CFG_H
 
 /* 锁定 BetaRobot 主仓库版本；未定义或版本不匹配时 BetaRobot_version.h 会 #error */
-#define APP_LOCKED_BETAROBOT_VERSION 20261029175747
+#define APP_LOCKED_BETAROBOT_VERSION 20261029230120
 
 #include "bsp_map.h"
 #include "robot_def.h"
@@ -30,6 +30,7 @@
 #define BSP_CAN_LIST_LUT_USED        // CAN 接收中断标准ID LIST模式按ID查表加速（不定义则回退循环判断）
 #define LIB_PID_USED                 // PID 控制器
 #define LIB_MIT_USED                 // MIT PD 控制器
+#define LIB_MUSIC_USED               // 音频脉冲数组（音效/曲谱数据，drv_buzzer_simple 依赖）
 #define DRV_BMI088_USED              // BMI088 IMU 驱动
 #define DRV_DBUS_USED                // DBUS 遥控器驱动
 #define DRV_SBUS_USED                // SBUS 遥控器驱动
@@ -45,6 +46,7 @@
 #define LIB_CHASSIS_HALF_RUDDER_USED // 底盘运动学内核（半舵封装：2 组舵轮正/逆解）
 #define LIB_FSM_TABLE_USED           // 表驱动状态机（底盘顶层状态机：校准/故障/失能/运行）
 #define DAEMON_USED                  // Daemon 看门狗
+#define DRV_BUZZER_USED              // 蜂鸣器驱动（PWM 节拍/音调/音量 + 报警与音乐仲裁）
 #define VOFA_USED                    // VOFA+ JustFloat 遥测
 /* 用户通道数（覆盖 drv_vofa.h 的默认 25）。
  * 当前用于底盘遥测（app 自写，100Hz）；CSV 第 k 列 = CHk，第 0 列是时间戳。
