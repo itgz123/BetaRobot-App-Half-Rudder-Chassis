@@ -12,6 +12,7 @@
 #include "lib_math.h"
 #include "bsp_sys_status.h"
 #include "bsp_gpio.h"
+#include "hal_gpio.h" // 光电门引脚运行期切成输入（CubeMX 里是 PWM 复用脚）
 #include "bsp_dwt.h"
 #include "bsp_log.h"
 #include "drv_djimotor_broadcast.h"
@@ -159,10 +160,26 @@ static float Power_LimitFromRule(void)
 #endif
 
 /*============================ 光电门 ============================*/
-/* 左舵 PA0 → GPIO_PWM_1，右舵 PA2 → GPIO_PWM_2（DM_MC02 映射，见旧 app 的实机注释）。
- * 回调置 NULL，在控制任务里轮询（不占 EXTI 分发）；取 1→0 下降沿作零点。 */
+/* DJI_C：左舵 PI6（TIM8_CH2）→ GPIO_PWM_6，右舵 PI7（TIM8_CH3）→ GPIO_PWM_7。
+ * 这两脚在 CubeMX 里配成 TIM8 的 AF_PP 复用输出，TIM8 没启动时引脚被推挽拉低，
+ * 光电门电平读不出来 ⇒ 初始化时用 hal_gpio 切成输入（不配中断，控制任务轮询）。
+ * 回调置 NULL，不占 EXTI 分发；取 1→0 下降沿作零点。 */
 GPIO_INSTANCE_DEF(rudder_l_gate_io);
 GPIO_INSTANCE_DEF(rudder_r_gate_io);
+
+/**
+ * @brief 把光电门引脚从 CubeMX 的 TIM8 复用输出切成浮空输入
+ * @param gpio_e 板载 GPIO 枚举（GPIO_PWM_6/7，映射见 bsp_map）
+ * @note 光电门自己推挽驱动，故 NOPULL；若改用开漏传感器要改成 GPIO_PULLUP。
+ */
+static void ChassisGatePinInit(BoardGPIO_e gpio_e)
+{
+    GPIO_InitTypeDef gate_pin = {0};
+    gate_pin.Mode = GPIO_MODE_INPUT;
+    gate_pin.Pull = GPIO_NOPULL;
+    gate_pin.Speed = GPIO_SPEED_FREQ_LOW;
+    BSP_ASSERT_APP_CALL(HalGpioReconfigure(gpio_map[gpio_e].port, gpio_map[gpio_e].pin, &gate_pin));
+}
 
 /*============================ 云台↔底盘通信 ============================*/
 /* 实例、收发数据与类型都在本文件/def.h；
@@ -530,17 +547,20 @@ void AppChassisInit(void)
     BSP_ASSERT_APP_CALL(DrvlibMotorConfig(&rudder_r_ctrl, &rudder_ctrl_cfg));
 
     /* ---- 光电门（控制任务轮询：回调 NULL，不占 EXTI 分发） ---- */
+    /* 先把 PI6/PI7 从 TIM8 AF 输出切成输入，否则读到的是被拉低的固定电平 */
+    ChassisGatePinInit(GPIO_PWM_6);
+    ChassisGatePinInit(GPIO_PWM_7);
     rudder_l_gate_io.parent = &rudder_l_motor; // parent 仅作身份绑定，轮询不用它
     rudder_r_gate_io.parent = &rudder_r_motor;
     BSP_ASSERT_APP_CALL(GPIORegister(&rudder_l_gate_io));
     BSP_ASSERT_APP_CALL(GPIORegister(&rudder_r_gate_io));
 
     GPIO_Config_s gate_l_cfg = {
-        .gpio_e = GPIO_PWM_1, // PA0 —— 左舵光电门
+        .gpio_e = GPIO_PWM_6, // PI6 (TIM8_CH2) —— 左舵光电门
         .callback = NULL,
     };
     GPIO_Config_s gate_r_cfg = {
-        .gpio_e = GPIO_PWM_2, // PA2 —— 右舵光电门
+        .gpio_e = GPIO_PWM_7, // PI7 (TIM8_CH3) —— 右舵光电门
         .callback = NULL,
     };
     BSP_ASSERT_APP_CALL(GPIOConfig(&rudder_l_gate_io, &gate_l_cfg));

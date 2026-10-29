@@ -39,21 +39,25 @@
 // 底盘系：前x左y上w（俯视逆时针w>0）
 // imu系中心在底盘系坐标(-117.0,-95.3,0)(mm)
 // imu系的方向在底盘方向
-// imu系x轴方向向量(-1,1,0)
-// imu系y轴方向向量(1,1,0)
-// imu系z轴方向向量(0,0,-1)
-// 即 R_chassis<-imu 的三列 = [(-1,1,0)/√2, (1,1,0)/√2, (0,0,-1)]
+// 名义安装：x=(1,1,0)/√2、y=(1,−1,0)/√2、z=(0,0,−1)（z 朝下）
+// 倾角实测标定（2026-10-29，静态 VOFA 录 85.6s，工具
+// drvlib/drvlib_bmi088_calib/bmi088_mount_calib.py）：
+//   roll −179.468°、pitch +1.003° ⇒ 相对名义值合倾角 1.135°（帧间散布 0.197°）
+//   注意：地面不水平会整段计入，且 acc 零偏未扣，这两项都在 1° 量级
+// yaw = 45° 由机械安装方向给定：重力只约束 2 个自由度，绕竖直轴的偏航不可观测，
+//   脚本无法标（R→Rz(α)·R 对任何 α 都满足重力约束），必须外部输入。
+// 即 R_chassis<-imu = Rz(45°)·Ry(1.003°)·Rx(−179.468°)
 // （app 里用这些宏构造 4x4 齐次变换，一次把旋转 + 平移都带上）
 /* IMU 各轴单位方向在底盘系中的分量：第一列 = IMU x 轴，第二列 = y 轴，第三列 = z 轴 */
-#define CHASSIS_IMU_X_AXIS_X (-0.70710678f) // IMU x 轴在底盘 x 上的分量
-#define CHASSIS_IMU_X_AXIS_Y (0.70710678f)  // IMU x 轴在底盘 y 上的分量
-#define CHASSIS_IMU_X_AXIS_Z (0.0f)         // IMU x 轴在底盘 z 上的分量
-#define CHASSIS_IMU_Y_AXIS_X (0.70710678f)  // IMU y 轴在底盘 x 上的分量
-#define CHASSIS_IMU_Y_AXIS_Y (0.70710678f)  // IMU y 轴在底盘 y 上的分量
-#define CHASSIS_IMU_Y_AXIS_Z (0.0f)         // IMU y 轴在底盘 z 上的分量
-#define CHASSIS_IMU_Z_AXIS_X (0.0f)         // IMU z 轴在底盘 x 上的分量
-#define CHASSIS_IMU_Z_AXIS_Y (0.0f)         // IMU z 轴在底盘 y 上的分量
-#define CHASSIS_IMU_Z_AXIS_Z (-1.0f)        // IMU z 轴在底盘 z 上的分量
+#define CHASSIS_IMU_X_AXIS_X (0.70699855f)  // IMU x 轴在底盘 x 上的分量
+#define CHASSIS_IMU_X_AXIS_Y (0.70699855f)  // IMU x 轴在底盘 y 上的分量
+#define CHASSIS_IMU_X_AXIS_Z (-0.01749600f) // IMU x 轴在底盘 z 上的分量
+#define CHASSIS_IMU_Y_AXIS_X (0.70696135f)  // IMU y 轴在底盘 x 上的分量
+#define CHASSIS_IMU_Y_AXIS_Y (-0.70719120f) // IMU y 轴在底盘 y 上的分量
+#define CHASSIS_IMU_Y_AXIS_Z (-0.00928800f) // IMU y 轴在底盘 z 上的分量
+#define CHASSIS_IMU_Z_AXIS_X (-0.01893962f) // IMU z 轴在底盘 x 上的分量
+#define CHASSIS_IMU_Z_AXIS_Y (-0.00580239f) // IMU z 轴在底盘 y 上的分量
+#define CHASSIS_IMU_Z_AXIS_Z (-0.99980379f) // IMU z 轴在底盘 z 上的分量
 
 #define CHASSIS_IMU_POS_X (-0.117f)  // IMU 中心在底盘系的 x (m)
 #define CHASSIS_IMU_POS_Y (-0.0953f) // IMU 中心在底盘系的 y (m)

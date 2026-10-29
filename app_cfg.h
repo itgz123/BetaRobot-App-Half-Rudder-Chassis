@@ -8,7 +8,7 @@
 #define __APP_CFG_H
 
 /* 锁定 BetaRobot 主仓库版本；未定义或版本不匹配时 BetaRobot_version.h 会 #error */
-#define APP_LOCKED_BETAROBOT_VERSION 20261028195746
+#define APP_LOCKED_BETAROBOT_VERSION 20261029175747
 
 #include "bsp_map.h"
 #include "robot_def.h"
@@ -38,9 +38,9 @@
 #define LIB_LKF_USED                 // 通用卡尔曼滤波 (lib_lkf)
 #define LIB_ESKF_USED                // 通用误差状态卡尔曼滤波 (lib_eskf；反馈融合方案 1)
 #define DRVLIB_BMI088_KALMAN_USED    // BMI088 零偏标定 + 线性卡尔曼姿态（drv_bmi088 + lib_lkf 联合）
-#define DRV_DJIMOTOR_BROADCAST_USED // DJI 电机驱动（drv 纯协议版一拖四广播；舵向 2 个 M3508）
+#define DRV_DJIMOTOR_BROADCAST_USED  // DJI 电机驱动（drv 纯协议版一拖四广播；舵向 2 个 M3508）
 #define DRVLIB_MOTOR_USED            // 三级级联 PID + 反馈后处理（drv 之上；舵向位置/速度环）
-#define DRV_LKMOTOR_BROADCAST_USED  // LK 电机驱动（drv 纯协议版一拖四广播；驱动 2 个 MF7015，力控）
+#define DRV_LKMOTOR_BROADCAST_USED   // LK 电机驱动（drv 纯协议版一拖四广播；驱动 2 个 MF7015，力控）
 #define DRV_AXIS_MIT_LITE_USED       // 单轴 MIT 关节控制
 #define LIB_CHASSIS_HALF_RUDDER_USED // 底盘运动学内核（半舵封装：2 组舵轮正/逆解）
 #define LIB_FSM_TABLE_USED           // 表驱动状态机（底盘顶层状态机：校准/故障/失能/运行）
@@ -109,16 +109,16 @@
 #define GENERATE_DISASSEMBLY // 生成反汇编文件 .lst
 #define GENERATE_READELF     // 生成 readelf 输出文件
 #define DRV_SUPER_CAP_YQ2027_USED
-#define DEVELOPMENT_BOARD DM_MC02
-#define HAL_CONFIG_NAME DM_MC02_HALF_RUDDER
+#define DEVELOPMENT_BOARD DJI_C
+#define HAL_CONFIG_NAME DJI_C
 
 // UART 选择
 #if DEVELOPMENT_BOARD == DM_MC02
 #define VOFA_UART UART_7
 // #define LOG_UART UART_7
 #elif DEVELOPMENT_BOARD == DJI_C // UART_1:4pin,UART_6:3pin
-// #define VOFA_UART
-#define LOG_UART UART_6
+#define VOFA_UART UART_1
+// #define LOG_UART UART_6
 #elif DEVELOPMENT_BOARD == DJI_A
 // #define VOFA_UART
 // #define LOG_UART
