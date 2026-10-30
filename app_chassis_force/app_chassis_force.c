@@ -868,6 +868,19 @@ void AppChassisRun(float dt, uint64_t time_stamp)
     DrvDJIMotorBroadcastSetRef(&rudder_r_motor, rudder_r_cmd);
     DrvDJIMotorBroadcastGroupSend(&rudder_motor_group);
 
+    /* 云台 ch5（功率加成开关）的提示音：升沿从头播 See You Again，降沿只停音乐。
+     * 播放请求交给 daemon 任务（AppMusicRequest），原因见 app.h；这里只做边沿判定，
+     * 每拍无条件调会每 2ms 重启一遍曲子。
+     * "不关闭报错提示音"由 BuzzerStopMusic 保证：停的是 LOW 音乐，HIGH 报警照响。 */
+    static uint8_t s_power_boost_prev = 0u;
+    const uint8_t power_boost_on =
+        (uint8_t)((GimbalCommIsOnline() != 0u) && (g_gimbal2chassis_data.power_boost_enable != 0u));
+    if (power_boost_on != s_power_boost_prev)
+    {
+        AppMusicRequest(power_boost_on);
+        s_power_boost_prev = power_boost_on;
+    }
+
 #if CHASSIS_POWER_LIMIT_ENABLE
     /* 功率限幅：驱动轮下发前裁 τ_cmd。非 RUN 直通（setref 已由状态机清零）。
      * 上限 = 来源（FIXED 固定值 / RULE 裁判查表，预留）

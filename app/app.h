@@ -9,6 +9,17 @@
 void function_in_main_c(void);
 
 /*============================================
+ *              内置音乐请求
+ *============================================*/
+/**
+ * @brief 请求播放 / 停止内置音乐（See You Again）
+ * @param play 非 0 = 从头播放；0 = 停止音乐（正在播的报警不受影响）
+ * @note 只置一个请求位，真正的 BuzzerPlay/BuzzerStopMusic 在 daemon 任务里执行：
+ *       drv_buzzer_simple 不加锁，所有蜂鸣器调用必须在同一任务上下文（daemon 任务）。
+ */
+void AppMusicRequest(uint8_t play);
+
+/*============================================
  *            底盘-云台 CAN 通信数据结构
  *   （CAN1 / idseq / PROTO_EXT：payload 即业务结构体，先过扩展汉明码再算 CRC，
  *   线上帧 = [0xA5][seq][汉明编码区 E][CRC8][0x5A]，N = sizeof(结构体)）
