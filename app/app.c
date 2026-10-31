@@ -10,11 +10,13 @@
 //
 #include "drv_daemon.h"
 #include "drv_buzzer_simple.h"
+#include "music_custom.h"
 #include "drv_vofa.h"
 //
 #include "app_chassis_force.h"
 #include "twinkle_star.h"
-#include "see_you_again.h"
+#include "happy_birthday.h"
+#include "see_you_again_guitar.h"
 
 /* 日志实例定义 */
 LOG_INSTANCE_DEF(g_app_log, "app", 255); // app 层日志实例
@@ -28,27 +30,27 @@ BUZZER_INSTANCE_DEF(g_buzzer);
  * （daemon 离线期间每拍都调，自然变成循环报警）。 */
 static void AlarmMinor(void)
 {
-    (void)BuzzerPlay(&g_buzzer, MUSIC_EFFECT_ERR_MINOR, MUSIC_PULSE_COUNT(MUSIC_EFFECT_ERR_MINOR), BUZZER_PRIO_HIGH, 1.0f);
+    (void)BuzzerPlay(&g_buzzer, &MUSIC_EFFECT_ERR_MINOR, BUZZER_PRIO_HIGH, 1.0f);
 }
 
 static void AlarmMajor(void)
 {
-    (void)BuzzerPlay(&g_buzzer, MUSIC_EFFECT_ERR_MAJOR, MUSIC_PULSE_COUNT(MUSIC_EFFECT_ERR_MAJOR), BUZZER_PRIO_HIGH, 1.0f);
+    (void)BuzzerPlay(&g_buzzer, &MUSIC_EFFECT_ERR_MAJOR, BUZZER_PRIO_HIGH, 1.0f);
 }
 
 static void AlarmCritical(void)
 {
-    (void)BuzzerPlay(&g_buzzer, MUSIC_EFFECT_ERR_CRITICAL, MUSIC_PULSE_COUNT(MUSIC_EFFECT_ERR_CRITICAL), BUZZER_PRIO_HIGH, 1.0f);
+    (void)BuzzerPlay(&g_buzzer, &MUSIC_EFFECT_ERR_CRITICAL, BUZZER_PRIO_HIGH, 1.0f);
 }
 
 static void AlarmFatal(void)
 {
-    (void)BuzzerPlay(&g_buzzer, MUSIC_EFFECT_ERR_FATAL, MUSIC_PULSE_COUNT(MUSIC_EFFECT_ERR_FATAL), BUZZER_PRIO_HIGH, 1.0f);
+    (void)BuzzerPlay(&g_buzzer, &MUSIC_EFFECT_ERR_FATAL, BUZZER_PRIO_HIGH, 1.0f);
 }
 
 static void AlarmEmergency(void)
 {
-    (void)BuzzerPlay(&g_buzzer, MUSIC_EFFECT_ERR_EMERGENCY, MUSIC_PULSE_COUNT(MUSIC_EFFECT_ERR_EMERGENCY), BUZZER_PRIO_HIGH, 1.0f);
+    (void)BuzzerPlay(&g_buzzer, &MUSIC_EFFECT_ERR_EMERGENCY, BUZZER_PRIO_HIGH, 1.0f);
 }
 
 /* daemon 故障动作表：表必须静态存储期（DaemonInit 只保存指针） */
@@ -103,8 +105,7 @@ static void AppBuzzerRun(void)
     }
     else if (s_music_applied == 0u)
     {
-        /* 先用《小星星》验证音高/衰减；听感确认后换回 MUSIC_SEE_YOU_AGAIN */
-        if (BuzzerPlay(&g_buzzer, MUSIC_TWINKLE_STAR, MUSIC_TWINKLE_STAR_COUNT, BUZZER_PRIO_LOW, 1.2f) != 0u)
+        if (BuzzerPlay(&g_buzzer, &MUSIC_SEE_YOU_AGAIN_GUITAR, BUZZER_PRIO_LOW, 1.0f) != 0u)
             s_music_applied = 1u;
     }
 }
